@@ -1,0 +1,116 @@
+# Inventory Scraping Playbook
+
+This document captures the conventions and brand-specific notes for the denim inventory scrapers maintained in this repository. It is intended to let a new contributor ramp quickly, understand where each CSV field comes from, and avoid breaking the existing data paths.
+
+## Shared conventions
+
+- **Runtime environment**: All scrapers use Python 3.11+ with `requests` and, when needed, `beautifulsoup4`. We standardize on a single `requests.Session` per run with a desktop User-Agent and exponential backoff around transient HTTP errors (429/5xx).Log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) in the command prompt while the script is running.
+- **Output layout**: Every script defines `BASE_DIR = Path(__file__).resolve().parent`, `OUTPUT_DIR = BASE_DIR / "Output"`, and a brand-specific `LOG_PATH`. `OUTPUT_DIR` is created up front and all exports are timestamped `BRAND_YYYY-MM-DD_HH-MM-SS.csv` (24-hour clock). Logs append to `[brand]_run.log` in the same directory and gracefully falls back if the preferred path is unavailable.
+- **CSV schema**: Start from the baseline schema
+  `Style Id, Handle, Published At, Product, Style Name, Product Type, Tags,
+  Vendor, Description, Variant Title, Color, Size, Rise, Inseam, Leg Opening,
+  Price, Compare at Price, Available for Sale, Quantity Available, Quantity of
+  style, SKU - Shopify, SKU - Brand, Barcode, Image URL, SKU URL` and adjust per
+  brand instructions. Depending on the information available more headers may be added and some maybe deleted. Where the information for each of these headers can be sourced is detailed in the prompt for when scraping a new brand. The format of the mapping is pasted as a table in prompt. The layout goes:
+Header for CSV: this is what should be put as the label in the csv output. This will change from brand to brand so pay attention to what is an isn’t listed in the mapping
+Label in Data/json/html: this is usually the word to look for in order to find the data that should be scraped. This will change from brand to brand so pay attention to what is listed in the mapping.
+Example: show an example of the type and formatting of the information that should be pulled in 
+Where found: the URL or name of page for where the information can be found. This will change from brand to brand so pay attention to the source.
+Where Found (details): additional help in the event the information may be difficult to find, has specific rules for what should/shouldn’t be pulled, or requires additional formatting details. This may not always be filled. What is/isn’t filled and what instructions are given  will change from brand to brand so pay attention to the mapping in the prompt.
+
+- **Logging**: Log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) and any retries so production runs can be audited.
+- **Retry policy**: Treat 429/5xx as transient, sleep with exponential backoff, log successful fallbacks, and rotate through host fallbacks by adding alternate domain (e.g., amodenim.com vs www.amodenim.com).
+- **Do not regress working code**: When adding features, leave the validated inventory path untouched. New behavior should sit behind clearly documented flags or separate functions.
+- **Pre-emptive fixes**: Refer to each brand's **Edits made to fix repeated scraping failures** to implement preventative fixes when writing new code
+
+
+## Brand notes
+
+### Haikure (`haikure_inventory.py`)
+- **Catalog source**: Shopify collection feed `https://haikure.com/collections/denim/products.json?limit=250&page=n` for all style-level fields (Style Id, Handle, Published At, Product, Product Type, Tags, Vendor, Variant Title, Size seed, Price, Compare at Price, Available for Sale, SKU - Shopify, Image URL, SKU URL).
+- **PDP parsing**: Fetch `view-source:https://haikure.com/products/<handle>` once per style. We pull:
+  - Description block (HTML cleaned to text) and Color bullet list.
+  - `window.inventories` script for per-variant `quantity`, `incoming`, and `next_incoming_date`; aggregate `Quantity Available`, `Next Shipment`, and style-level totals.
+  - Sixth list item of the description bullet for the 18-character `SKU - Brand`; skip if the token does not match the alphanumeric length requirement.
+- **Barcode**: `https://haikure.com/products/<handle>.json` (Shopify product
+  JSON) still exposes `variants[].barcode`.
+- **Sizing**: Use Shopify `option1` only as a fallback; some drops encode sizes in brand SKU strings.
+- **Measurements**: parse Rise/Back Rise/Inseam/Leg Opening from the PDP description list.
+- **Outputs**: Keep `Quantity Price Breaks` and other legacy columns even when empty to preserve downstream workbook formulas.
+
+### Paige (`paige_inventory.py`)
+- **Catalog & metadata**: Algolia Search API (`production_products` index). One pass with `distinct=true` and `filters=collections:women-denim` for style-level hits (Style Id, Handle, Product, Style Name via `styleGroup`, Product Type via `clothingType`, Tags, Vendor, Description (`body_html_safe`), Price/Compare at Price/Range, Quantity of style, Product Line, Image URL, SKU URL, Jean Style (`fit`), Inseam Label (`length` + `sizeType`), Rise Label (`rise`), Color fields (`wash`, `colorCategory`), Country Produced (`country` tag), Stretch, Production Cost, Site Exclusive).
+- **Variant detail**: For each style id, issue a second query with `distinct=false` and `filters=id=<style>` to retrieve every variant. Pull Variant Title, Size (from `options.size`), Color, Published At, Availability, Quantity Available, Google Analytics Purchases, SKU - Brand, Barcode, and the Shopify variant id for `SKU - Shopify`.
+- **Measurements**: Paige’s PDP measurements were unreliable behind bot protection; we removed Rise/Inseam/Leg Opening columns entirely to keep exports stable.
+- **Output flow**: Build all Algolia-driven rows first, then (optionally) hydrate extra PDP fields in a second pass. Logging is suppressed when the PDP fetch fails so the main CSV still completes.
+
+### Pistola (`pistola_inventory.py`)
+- **Catalog**: Shopify collection feed `collections/all-denim/products.json?limit=250&page=n` to enumerate variants, published dates, tags, vendor, compare-at pricing, availability, images, and product handles. Deduplicate handles when the same style appears in multiple pages.
+- **Nosto GraphQL**: The category page exposes `accountId` and `categoryId` in the embedded script payload. Query `https://search.nosto.com/v1/graphql` with those ids to retrieve:
+  - Style metadata: description copy, price, price range, ss facets (Fit, Length, Rise, Wash, Stretch), product line items.
+  - Variant-level fields inside `skus[]`: Shopify variant id (`id`), SKU, barcode (`customFields.gtin`), color (`customFields.color`), size (`customFields.size`), `inventoryLevel` (Quantity Available).
+  - `product` level `inventoryLevel` gives Quantity of style.
+  - De-duplicate handles when merging the two feeds.
+- **Measurements**: Parse `info-tab1` strings returned in Nosto metadata (Rise, Inseam, Leg Opening) using a fraction-aware helper.
+- **Shopify-specific**: Because the Shopify feed keeps `product_type` blank for some products, we normalize using Nosto `CATEGORY` tags.
+- **Sizes**: normalize size strings (strip trailing `P`, set inseam label to `Petite` when applicable).
+- **Edits made to fix repeated scraping failures**: Logging initialization originally pointed at a locked OneDrive file, raising `PermissionError` before scraping started. Configuration lives at the top of the file; logging now targets the base directory and gracefully falls back if the preferred path is unavailable.
+
+
+### RE/DONE (`redone_inventory.py`)
+- **Catalog union**: Merge the standard and sale Shopify collection feeds (`https://shopredone.com/collections/denim/products.json?limit=250&page=n` and `https://shopredone.com/collections/sale-denim-all/products.json?limit=250&page=n`). Drop duplicate handles but preserve the earliest Published At date.
+- **Searchspring**: Call `https://w7x7sx.a.searchspring.io/api/search/search.json` with both `bgfilter.collection_handle=denim` and `sale-denim-all` to collect Searchspring product payloads. Each hit supplies:
+  - Product Type via `tags_sub_class` / `product_type_unigram` mapping.
+  - Quantity of style (`ss_inventory_count`).
+  - Jean Style, Inseam Label, Rise Label, color groupings, and Stretch via the various `tags_*` lists (see `determine_product_type`, `derive_jean_style`, `derive_inseam_label`).
+  - `ss_size_json` contains per-variant `id` (Shopify variant id) and `available` quantity—use this as the authoritative `Quantity Available` to avoid the 50-unit cap in the PDP JSON.
+- **Barcodes**: Shopify product JSON `products/<handle>.json` furnishes variant barcodes and quantities but note the 50-unit cap—Searchspring is the primary quantity source.
+- **Variant basics**: Pull SKU - Brand, barcode, etc. from Shopify `variants[]`, and use `clean_html` to flatten `body_html` into Description text.
+- **Edits made to fix repeated scraping failures**: Logging initialization originally pointed at a locked OneDrive file, raising `PermissionError` before scraping started. The logger now prefers a base-directory log file, only falling back to the output directory if necessary.
+
+### AG Jeans (`agjeans_inventory.py`)
+- **Catalog**: Shopify women’s jeans collection feed  (`https://www.agjeans.com/collections/womens-jeans/products.json?limit=250&page=n`)
+for Style Id, Handle, Published At, Product, Tags, Vendor, Variant Title (Product + variant title), base options, Price/Compare at Price, Available for Sale, SKU - Shopify, image gallery, and SKU URL.
+- **Algolia**:  Query the Search API to find the index (`shopify_main_products`). Use the `shopify_main_products` index via `https://ao8siisku6-dsn.algolia.net/1/indexes/.../query` to pull style-level metadata (Style Name via `product`, Product Type via `named_tags.Category`, Price Range, inventory aggregates, Jean Style, Hem Style, Inseam/Rise labels, Wash/Fabric/Stretch tags, barcodes, quantity counts). Filter to the women-denim collection and page with `page=0..N`.
+- **Variants**: For each handle, issue `distinct=false` Algolia queries to collect per-SKU inventory and GA metrics. Match entries by SKU - Brand to populate the variant rows.
+- **Measurements**: Fallback to PDP HTML (`view-source`) for Rise and Leg Opening when not exposed in Algolia’s `info-tab1` data. Convert fractions to decimals.
+- **Variant title**: combine product title and size (`name` + size) as instructed.
+
+### Mother Denim (`motherdenim_inventory.py`)
+- **Catalog**: Merge `collections/denim/products.json` and `collections/denim-sale/products.json` (Shopify). Keep unique handles and prefer the earliest `published_at`. Columns: Style Id, Handle, Published At, Product, Tags, Vendor, Description, Variant Title, Color/Size, Price, Compare at Price, Available for Sale, SKU - Shopify, SKU - Brand, Image URL, SKU URL.
+- **Searchspring**: Use `https://00svms.a.searchspring.io/api/search/autocomplete.json?siteId=00svms&resultsPerPage=400&q=$jeans&q=$womens&page=n` to collect style metadata (Style Name, Product Type, Rise/Inseam/Leg Opening, GA purchases, Quantity of style, Jean/Hem/Inseam/Rise labels, price range) and inventory. `variant_id` strings map to Shopify variant ids; when counts are missing, parse the `variants` JSON and `ss_bundle_variants` block for `quantity` per SKU. Metafields can backfill missing inventory quantities.
+- **Barcode**: `/products/<handle>.json` per variant.
+- **Measurements**: style-level Rise/Inseam/Leg Opening come from Searchspring’s `mfield_product_details`, converting fractions to decimals.
+- **Quantity Available**: Preference order is `ss_bundle_variants.quantity` → Searchspring `variants` inventory → cached metafield JSON → PDP fallback. The script merges these into a per-variant map before writing rows.
+- **Edits made to fix repeated scraping failures**: Encountered repeated DNS failures for `www.motherdenim.com`. Enhanced retry logic now swaps between `www.motherdenim.com` and `motherdenim.com`, logging successful fallbacks.
+
+
+### Ramy Brook (`ramybrook_pants_inventory.py`)
+- **Catalog**: Shopify collection feed filtered to denim pants (see script for the `products.json?limit` pagination). Pull baseline fields plus published date conversion.
+- **Inventory & metadata**: Parse PDP HTML for `window.BARREL.product`. It contains `variants[].inventoryQuantity`, `nextIncomingDate`, size/color option text, and measurement copy. A regex fallback scans script blobs for `"inventoryQuantity"` when BARREL is missing.
+- **Measurements**: Look inside `body_html` / PDP detail sections for Front/Back Rise, Inseam, Leg Opening.
+- **Barcode**: `/products/<handle>.json` keyed by variant id.
+- **Style totals**: sum variant quantities once per product.
+- **Logging**: Writes inside `Output/ramybrook_run.log`; consider aligning with the shared pattern on future refactors.
+
+### Staud (`staud_inventory.py`)
+- **Catalog**: Shopify women’s jeans collection feed (`collections/staud-jeans/products.json?limit=250&page=n`). Provides Style Id, Handle, Published At, Product, Style Name (derived from title before " |"), Product Type, Tags, Vendor, Description, Variant Title, Color, Size, Inseam, Price, Compare at Price, Available for Sale, SKUs, image links.
+- **Variant enrichment**: `/products/<handle>.json` yields Quantity Price Breaks, Quantity Available (current and previous), style totals, barcodes, image URLs. Map by variant id to the collection feed entries.
+- **Measurements**: Inseam, Rise labels are already present as variant options—no PDP scraping required.
+- **Inventory handling**: Trust Shopify’s `inventory_quantity`/`old_inventory_quantity` per variant; sum totals once per product for the style-level quantity column.
+- **Edits made to fix repeated scraping failures**: DNS lookups for `staud.clothing` were failing, causing complete run aborts. Request helper iterates between `staud.clothing` and `www.staud.clothing`, capturing and reporting fallback successes.
+
+### AMO (`amo_inventory.py`)
+- **Edits made to fix repeated scraping failures**: Previously failed when `amodenim.com` DNS lookups broke, and partial runs left product rows missing details. Now uses a shared requests session with fallback host handling, centralized retry logging, and writes CSV output plus a run log resolved from the script directory.
+
+## Maintenance checklist
+
+- Always sanity-check the latest CSV to ensure all values are filled.
+- If a network vendor blocks scripted access, capture raw JSON (e.g., from DevTools) so we can build offline fixtures.
+- When adding a new brand, replicate the shared directory/log scaffolding and document the mapping in this file.
+- If a site migrates or the API schema changes, update the relevant section here so future maintainers know which fallbacks exist and what was tried previously.
+- **Data cleanliness**: Whenever a source provides fractions (e.g., `10 3/4`), use the shared helper to convert to decimal (10.75). Normalize price fields to plain numbers without currency symbols. Always compute style totals outside the variant loop and reuse the value for each row.
+
+Keep this handbook synchronized with future scraper additions so new teammates can get up to speed quickly.
+
+
