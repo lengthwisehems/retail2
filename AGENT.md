@@ -22,6 +22,7 @@ Where Found (details): additional help in the event the information may be diffi
 - **Retry policy**: Treat 429/5xx as transient, sleep with exponential backoff, log successful fallbacks, and rotate through host fallbacks by adding alternate domain (e.g., amodenim.com vs www.amodenim.com).
 - **Do not regress working code**: When adding features, leave the validated inventory path untouched. New behavior should sit behind clearly documented flags or separate functions.
 - **Pre-emptive fixes**: Refer to each brand's **Edits made to fix repeated scraping failures** to implement preventative fixes when writing new code
+- **Timeout Errors"**: If a brand keeps getting time out errors while trying to visit the HTTP site, create 2 files: brand_inventory_with_measurements.py and brand_inventory.py. brand_inventory_with_measurements includes values that can only come from the HTML like Rise, Inseam, and Leg Opening. brand_inventory.py does not pull values that can only come from the HTML like Rise, Inseam, and Leg Opening but does keep the headers on the csv output for layout consistency. brand_inventory.py is run every day with the outputfile name of `BRAND_YYYY-MM-DD_HH-MM-SS.csv` while brand_inventory_with_measurements.py is run monthly with a file output name of `BRAND_Measurements_YYYY-MM-DD_HH-MM-SS.csv`
 
 
 ## Brand notes
@@ -75,6 +76,7 @@ for Style Id, Handle, Published At, Product, Tags, Vendor, Variant Title (Produc
 - **Variants**: For each handle, issue `distinct=false` Algolia queries to collect per-SKU inventory and GA metrics. Match entries by SKU - Brand to populate the variant rows.
 - **Measurements**: Fallback to PDP HTML (`view-source`) for Rise and Leg Opening when not exposed in Algolia’s `info-tab1` data. Convert fractions to decimals.
 - **Variant title**: combine product title and size (`name` + size) as instructed.
+- - **2 versions** As we kept getting errors during the scrape like "GET https://www.agjeans.com/products/<handle> (ConnectionError(MaxRetryError("HTTPSConnectionPool(host='www.agjeans.com', port=443): Max retries exceeded with url: /products/<handle> (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F599F0BA10>: Failed to establish a new connection: [WinError 10051] A socket operation was attempted to an unreachable network'))"))) -> sleep" We will create 2 codes: agjeans_inventory_with_measurements.py and agjeans_inventory.py. agjeans_inventory_with_measurements includes values for Rise, Inseam, and Leg Opening. agjeans_inventory.py does not pull values for Rise, Inseam, and Leg Opening but does keep the headers on the csv output for layout consistency. agjeans_inventory.py is run every day with the outputfile name of `AGJEANS_YYYY-MM-DD_HH-MM-SS.csv` while agjeans_inventory_with_measurements.py is run monthly with a file output name of `AGJEANS_Measurements_YYYY-MM-DD_HH-MM-SS.csv`
 
 ### Mother Denim (`motherdenim_inventory.py`)
 - **Catalog**: Merge `collections/denim/products.json` and `collections/denim-sale/products.json` (Shopify). Keep unique handles and prefer the earliest `published_at`. Columns: Style Id, Handle, Published At, Product, Tags, Vendor, Description, Variant Title, Color/Size, Price, Compare at Price, Available for Sale, SKU - Shopify, SKU - Brand, Image URL, SKU URL.
@@ -102,6 +104,8 @@ for Style Id, Handle, Published At, Product, Tags, Vendor, Variant Title (Produc
 
 ### AMO (`amo_inventory.py`)
 - **Edits made to fix repeated scraping failures**: Previously failed when `amodenim.com` DNS lookups broke, and partial runs left product rows missing details. Now uses a shared requests session with fallback host handling, centralized retry logging, and writes CSV output plus a run log resolved from the script directory.
+- **2 versions** As we kept getting errors during the scrape like "(HTTPSConnectionPool(host='amodenim.com', port=443): Max retries exceeded with url: /products/<handle> (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000002012714A210>: Failed to resolve 'amodenim.com' ([Errno 11001] getaddrinfo failed)"))); sleeping" We will create 2 codes: amo_inventory_with_measurements.py and amo_inventory.py. amo_inventory_with_measurements includes values for Rise, Back Rise, Inseam, and Leg Opening. amo_inventory.py does not pull values for Rise, Back Rise, Inseam, and Leg Opening but does keep the headers on the csv output for layout consistency. amo_inventory.py is run every day with the outputfile name of `AMO_YYYY-MM-DD_HH-MM-SS.csv` while amo_inventory_with_measurements.py is run monthly with a file output name of `AMO_Measurements_YYYY-MM-DD_HH-MM-SS.csv`
+
 
 ## Maintenance checklist
 
