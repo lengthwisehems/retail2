@@ -12,7 +12,6 @@ from html import unescape
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.agjeans.com"
 COLLECTION_PATH = "/collections/womens-jeans/products.json"
