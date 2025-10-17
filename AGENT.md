@@ -6,6 +6,7 @@ This document captures the conventions and brand-specific notes for the denim in
 
 - **Runtime environment**: All scrapers use Python 3.11+ with `requests` and, when needed, `beautifulsoup4`. We standardize on a single `requests.Session` per run with a desktop User-Agent and exponential backoff around transient HTTP errors (429/5xx).Log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) in the command prompt while the script is running.
 - **Output layout**: Every script defines `BASE_DIR = Path(__file__).resolve().parent`, `OUTPUT_DIR = BASE_DIR / "Output"`, and a brand-specific `LOG_PATH`. `OUTPUT_DIR` is created up front and all exports are timestamped `BRAND_YYYY-MM-DD_HH-MM-SS.csv` (24-hour clock). Logs append to `[brand]_run.log` in the same directory and gracefully falls back if the preferred path is unavailable.
+- **Logging fallbacks**: When configuring logging handlers, always attempt to open the primary log file inside a try/except block and fall back to `OUTPUT_DIR / "[brand]_run.log"` (or stream-only logging) if the primary path is locked. Emit a warning so the automation log explains which destination is active. Apply this pattern to every new scraper.
 - **CSV schema**: Start from the baseline schema
   `Style Id, Handle, Published At, Product, Style Name, Product Type, Tags,
   Vendor, Description, Variant Title, Color, Size, Rise, Inseam, Leg Opening,

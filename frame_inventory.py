@@ -18,18 +18,50 @@ from requests.adapters import HTTPAdapter, Retry
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
 LOG_PATH = BASE_DIR / "frame_run.log"
+FALLBACK_LOG_PATH = OUTPUT_DIR / "frame_run.log"
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(),
-    ],
-)
-LOGGER = logging.getLogger(__name__)
+
+def configure_logging() -> logging.Logger:
+    handlers: List[logging.Handler] = []
+    log_paths = [LOG_PATH, FALLBACK_LOG_PATH]
+    selected_path: Optional[Path] = None
+
+    for path in log_paths:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(path)
+            handlers.append(file_handler)
+            selected_path = path
+            if path != LOG_PATH:
+                print(
+                    f"WARNING: Primary log path {LOG_PATH} unavailable. "
+                    f"Using fallback log at {path}.",
+                    flush=True,
+                )
+            break
+        except (OSError, PermissionError) as exc:
+            print(
+                f"WARNING: Unable to open log file {path}: {exc}. Continuing without this path.",
+                flush=True,
+            )
+
+    handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
+
+    logger = logging.getLogger(__name__)
+    if selected_path is None:
+        logger.warning("File logging disabled; continuing with console logging only.")
+    return logger
+
+
+LOGGER = configure_logging()
 
 SESSION = requests.Session()
 SESSION.headers.update(
