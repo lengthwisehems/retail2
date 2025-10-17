@@ -193,6 +193,43 @@ def clean_html_text(raw_html: Optional[str]) -> str:
     return soup.get_text(" ", strip=True)
 
 
+def normalize_measurement_value(raw: Any) -> str:
+    if raw in (None, ""):
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    cleaned = re.sub(r"[^0-9./\s]", " ", text)
+    tokens = [tok for tok in cleaned.replace("\u200b", " ").split() if tok]
+    if not tokens:
+        return ""
+
+    total = 0.0
+    valid = False
+    for token in tokens:
+        if "/" in token:
+            try:
+                numerator, denominator = token.split("/", 1)
+                total += float(numerator) / float(denominator)
+                valid = True
+                continue
+            except (ValueError, ZeroDivisionError):
+                return ""
+        try:
+            total += float(token)
+            valid = True
+        except ValueError:
+            return ""
+
+    if not valid:
+        return ""
+
+    if total.is_integer():
+        return str(int(total))
+    return f"{total:.2f}".rstrip("0").rstrip(".")
+
+
 def stringify_identifier(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -446,7 +483,7 @@ def assemble_rows(
                 "Variant Title": full_variant_title,
                 "Color": color,
                 "Size": variant.get("option2", ""),
-                "Inseam": variant.get("option3", ""),
+                "Inseam": normalize_measurement_value(variant.get("option3")),
                 "Rise": rise,
                 "Leg Opening": leg_opening,
                 "Price": format_price(variant.get("price")),
