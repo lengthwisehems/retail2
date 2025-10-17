@@ -31,6 +31,12 @@ call :RunScraper "Edyson" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\edyson_all_layout.log"
 call :UpdateFinalExit
 
+call :RunScraper "Frame" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\frame_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\frame_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "GoodAmerican" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\GoodAmerican\Goodamerican_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\GoodAmerican\Output" ^

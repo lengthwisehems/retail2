@@ -8,6 +8,7 @@ import os
 import re
 import time
 from datetime import datetime
+from fractions import Fraction
 from html import unescape
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -194,43 +195,6 @@ def clean_html_text(raw_html: Optional[str]) -> str:
     return soup.get_text(" ", strip=True)
 
 
-def normalize_measurement_value(raw: Any) -> str:
-    if raw in (None, ""):
-        return ""
-    text = str(raw).strip()
-    if not text:
-        return ""
-
-    cleaned = re.sub(r"[^0-9./\s]", " ", text)
-    tokens = [tok for tok in cleaned.replace("\u200b", " ").split() if tok]
-    if not tokens:
-        return ""
-
-    total = 0.0
-    valid = False
-    for token in tokens:
-        if "/" in token:
-            try:
-                numerator, denominator = token.split("/", 1)
-                total += float(numerator) / float(denominator)
-                valid = True
-                continue
-            except (ValueError, ZeroDivisionError):
-                return ""
-        try:
-            total += float(token)
-            valid = True
-        except ValueError:
-            return ""
-
-    if not valid:
-        return ""
-
-    if total.is_integer():
-        return str(int(total))
-    return f"{total:.2f}".rstrip("0").rstrip(".")
-
-
 def stringify_identifier(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -243,9 +207,70 @@ def stringify_identifier(value: Any) -> str:
     return str(value)
 
 
+MEASURE_CACHE: Dict[str, Tuple[str, str]] = {}
+MEASURE_PATTERN_RISE = re.compile(r"(front\s+)?rise\s*:\s*([^•\n]+)", re.IGNORECASE)
+MEASURE_PATTERN_OPENING = re.compile(r"(bottom|leg)\s+opening\s*:\s*([^•\n]+)", re.IGNORECASE)
+
+
+def parse_measure_value(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.replace("\u2033", "").replace("\u2032", "").replace("\"", "")
+    cleaned = cleaned.replace("inches", "").replace("inch", "")
+    cleaned = re.sub(r"[^0-9./\s]", " ", cleaned)
+    tokens = [tok for tok in cleaned.split() if tok]
+    if not tokens:
+        return ""
+    total = 0.0
+    consumed = False
+    for tok in tokens:
+        try:
+            if "/" in tok:
+                total += float(Fraction(tok))
+            else:
+                total += float(tok)
+            consumed = True
+        except Exception:
+            continue
+    if not consumed:
+        return ""
+    if abs(total - round(total)) < 1e-6:
+        return str(int(round(total)))
+    return f"{total:.2f}".rstrip("0").rstrip(".")
+
+
 def get_measurements(handle: str) -> Tuple[str, str]:
-    """Daily run skips PDP measurement scraping to avoid DNS failures."""
-    return "", ""
+    if handle in MEASURE_CACHE:
+        return MEASURE_CACHE[handle]
+
+    url = f"{BASE_URL}/products/{handle}"
+    try:
+        html = get_with_retry(url, expect_json=False)
+    except Exception as exc:
+        log(f"[warn] failed to pull measurements for {handle}: {exc!r}")
+        MEASURE_CACHE[handle] = ("", "")
+        return MEASURE_CACHE[handle]
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" \n")
+    rise = ""
+    opening = ""
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not rise:
+            match = MEASURE_PATTERN_RISE.search(stripped)
+            if match:
+                rise = parse_measure_value(match.group(2))
+        if not opening:
+            match = MEASURE_PATTERN_OPENING.search(stripped)
+            if match:
+                opening = parse_measure_value(match.group(2))
+        if rise and opening:
+            break
+
+    MEASURE_CACHE[handle] = (rise, opening)
+    return MEASURE_CACHE[handle]
 
 
 def fetch_collection_products() -> List[Dict[str, Any]]:
@@ -484,7 +509,7 @@ def assemble_rows(
                 "Variant Title": full_variant_title,
                 "Color": color,
                 "Size": variant.get("option2", ""),
-                "Inseam": normalize_measurement_value(variant.get("option3")),
+                "Inseam": variant.get("option3", ""),
                 "Rise": rise,
                 "Leg Opening": leg_opening,
                 "Price": format_price(variant.get("price")),
@@ -516,7 +541,7 @@ def write_csv(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         raise ValueError("No data rows to write")
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"AGJEANS_{timestamp}.csv"
+    filename = f"AGJEANS_Measurements_{timestamp}.csv"
     path = os.path.join(OUTPUT_DIR, filename)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADERS, extrasaction="ignore")
