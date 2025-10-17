@@ -274,7 +274,7 @@ def extract_measurements(html):
 
 def run():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") # unique run marker
-    csv_path = OUTPUT_DIR / f"AMO_{timestamp}.csv"
+    csv_path = OUTPUT_DIR / f"AMO_Measurements_{timestamp}.csv"
 
     products = fetch_all_products()
 
@@ -324,7 +324,18 @@ def run():
                     barcode_map[vid] = vj.get("barcode") or ""
                     quantity_price_breaks_map[vid] = vj.get("quantity_price_breaks")
 
+            try:
+                html = fetch_pdp_html(handle)
+            except Exception as e:
+                log(f"[WARN] PDP fetch failed for {handle}: {e}")
+                html = ""
+
             rise = back_rise = inseam = leg_open = ""
+            if html:
+                try:
+                    rise, back_rise, inseam, leg_open = extract_measurements(html)
+                except Exception:
+                    pass
 
             style_total = 0
             style_has_qty = False
