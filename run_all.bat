@@ -13,10 +13,22 @@ REM  Run scrapers in alphabetical order
 REM    To add a new brand, copy one of the blocks below and adjust the
 REM    friendly name plus the three paths (script, output folder, log file).
 REM ---------------------------------------------------------------------------
+call :RunScraper "ABrand" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\abrand_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\abrand_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "AGJeans" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AGJeans\agjeans_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AGJeans\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AGJeans\agjeans_run.log"
+call :UpdateFinalExit
+
+call :RunScraper "AMO" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\amo_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "AMO" ^
@@ -49,6 +61,13 @@ call :RunScraper "Haikure" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Haikure\haikure_inventory.log"
 call :UpdateFinalExit
 
+REM L'Agence denim scraper
+call :RunScraper "LAgence" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\lagence_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\lagence_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "MotherDenim" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Motherdenim_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Output" ^
@@ -77,6 +96,12 @@ call :RunScraper "ReDone" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\redone_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\shopredone_inventory.log"
+call :UpdateFinalExit
+
+call :RunScraper "Rollas" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\rollas_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\rollas_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "Rudes" ^
