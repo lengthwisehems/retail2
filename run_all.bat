@@ -31,6 +31,12 @@ call :RunScraper "AMO" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
 call :UpdateFinalExit
 
+call :RunScraper "AMO" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\amo_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "Edyson" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\edyson_products_all_to_layout.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\Output" ^
