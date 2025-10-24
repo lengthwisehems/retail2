@@ -31,10 +31,10 @@ call :RunScraper "AMO" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
 call :UpdateFinalExit
 
-call :RunScraper "AMO" ^
-                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\amo_inventory.py" ^
-                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output" ^
-                  "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
+call :RunScraper "DL1961" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\dl1961_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\dl1961_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "Edyson" ^
@@ -72,6 +72,12 @@ call :RunScraper "MotherDenim" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Motherdenim_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Output\motherdenim_run.log"
+call :UpdateFinalExit
+
+call :RunScraper "Neuw" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\neuw_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\neuw_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "Paige" ^
