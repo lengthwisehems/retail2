@@ -13,6 +13,12 @@ REM  Run scrapers in alphabetical order
 REM    To add a new brand, copy one of the blocks below and adjust the
 REM    friendly name plus the three paths (script, output folder, log file).
 REM ---------------------------------------------------------------------------
+call :RunScraper "ABrand" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\abrand_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\ABrand\abrand_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "AGJeans" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AGJeans\agjeans_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AGJeans\Output" ^
@@ -25,10 +31,22 @@ call :RunScraper "AMO" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\AMO\Output\amo_run.log"
 call :UpdateFinalExit
 
+call :RunScraper "DL1961" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\dl1961_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\DL1961\dl1961_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "Edyson" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\edyson_products_all_to_layout.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\edyson_all_layout.log"
+call :UpdateFinalExit
+
+call :RunScraper "Frame" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\frame_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Frame\frame_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "GoodAmerican" ^
@@ -43,10 +61,23 @@ call :RunScraper "Haikure" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Haikure\haikure_inventory.log"
 call :UpdateFinalExit
 
+REM L'Agence denim scraper
+call :RunScraper "LAgence" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\lagence_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\lagence_run.log"
+call :UpdateFinalExit
+
 call :RunScraper "MotherDenim" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Motherdenim_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\MotherDenim\Output\motherdenim_run.log"
+call :UpdateFinalExit
+
+call :RunScraper "Neuw" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\neuw_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Neuw\neuw_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "Paige" ^
@@ -71,6 +102,12 @@ call :RunScraper "ReDone" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\redone_inventory.py" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\Output" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\ReDone\shopredone_inventory.log"
+call :UpdateFinalExit
+
+call :RunScraper "Rollas" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\rollas_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\Rollas\rollas_run.log"
 call :UpdateFinalExit
 
 call :RunScraper "Rudes" ^

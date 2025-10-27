@@ -25,6 +25,13 @@ from urllib.parse import urlparse, urlunparse
 BASE_URL = "https://staud.clothing"
 COLLECTION_PATH = "/collections/staud-jeans/products.json"
 
+GRAPHQL_ENDPOINT = "https://staud-clothing.myshopify.com/api/2025-10/graphql.json"
+GRAPHQL_TOKEN_ENV_VARS = [
+    "STAUD_SHOPIFY_STOREFRONT_TOKEN",
+    "STAUD_SHOPIFY_GRAPHQL_TOKEN",
+    "STAUD_GRAPHQL_TOKEN",
+]
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = SCRIPT_DIR / "Output"
 LOG_PATH = SCRIPT_DIR / "staud_run.log"
@@ -38,8 +45,9 @@ USER_AGENT = (
 )
 
 HOST_FALLBACKS = {
-    "staud.clothing": ["www.staud.clothing"],
-    "www.staud.clothing": ["staud.clothing"],
+    "staud.clothing": ["www.staud.clothing", "staud-clothing.myshopify.com"],
+    "www.staud.clothing": ["staud.clothing", "staud-clothing.myshopify.com"],
+    "staud-clothing.myshopify.com": ["staud.clothing", "www.staud.clothing"],
 }
 
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
@@ -84,6 +92,14 @@ CSV_HEADERS = [
 
 
 _session: Optional[requests.Session] = None
+
+
+def _get_env_token() -> Optional[str]:
+    for key in GRAPHQL_TOKEN_ENV_VARS:
+        token = os.getenv(key)
+        if token:
+            return token.strip()
+    return None
 
 
 def get_session() -> requests.Session:
@@ -332,8 +348,9 @@ def get_variant_image_url(
     return ""
 
 
-def collect_rows() -> List[Dict[str, Any]]:
+def collect_rows() -> tuple[List[Dict[str, Any]], List[str]]:
     rows: List[Dict[str, Any]] = []
+    failures: List[str] = []
     products = parse_collection_products()
 
     for idx, product in enumerate(products, start=1):
@@ -343,6 +360,8 @@ def collect_rows() -> List[Dict[str, Any]]:
             detail = fetch_product_detail(handle)
         except Exception as exc:
             log(f"[error] failed to fetch detail for {handle}: {exc!r}")
+            if handle:
+                failures.append(handle)
             continue
 
         variant_detail_map = {
@@ -401,15 +420,107 @@ def collect_rows() -> List[Dict[str, Any]]:
 
             rows.append(row)
 
+    return rows, failures
+
+
+def extract_variant_numeric_id(graphql_id: Optional[str]) -> str:
+    if not graphql_id:
+        return ""
+    if "/" in graphql_id:
+        return graphql_id.rstrip("/").split("/")[-1]
+    return graphql_id
+
+
+def perform_graphql_fallback() -> List[Dict[str, Any]]:
+    token = _get_env_token()
+    if not token:
+        raise RuntimeError(
+            "GraphQL fallback requested but no Shopify token was found in environment"
+        )
+
+    session = get_session()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Shopify-Storefront-Access-Token": token,
+    }
+    query = """
+    query StaudInventory($first: Int!) {
+      productVariants(first: $first, query: \"available_for_sale:true\") {
+        edges {
+          node {
+            id
+            sku
+            quantityAvailable
+          }
+        }
+        pageInfo {
+          hasNextPage
+        }
+      }
+    }
+    """
+    payload = {"query": query, "variables": {"first": 250}}
+
+    log("[graphql] triggering fallback inventory query")
+    try:
+        response = session.post(
+            GRAPHQL_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"GraphQL fallback request failed: {exc!r}") from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"GraphQL fallback returned HTTP {response.status_code}: {response.text}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("GraphQL fallback returned non-JSON payload") from exc
+
+    if data.get("errors"):
+        raise RuntimeError(f"GraphQL fallback responded with errors: {data['errors']}")
+
+    product_variants = data.get("data", {}).get("productVariants", {})
+    edges = product_variants.get("edges", []) if isinstance(product_variants, dict) else []
+    page_info = (
+        product_variants.get("pageInfo", {})
+        if isinstance(product_variants, dict)
+        else {}
+    )
+
+    if page_info.get("hasNextPage"):
+        log(
+            "[graphql] warning: fallback response indicates additional pages; only first page was requested"
+        )
+
+    rows: List[Dict[str, Any]] = []
+    for edge in edges:
+        node = edge.get("node", {}) if isinstance(edge, dict) else {}
+        variant_id = extract_variant_numeric_id(node.get("id"))
+        quantity = node.get("quantityAvailable")
+        row = {header: "" for header in CSV_HEADERS}
+        row["SKU - Shopify"] = variant_id
+        if quantity is not None:
+            row["Quantity Available"] = quantity
+        rows.append(row)
+
+    log(f"[graphql] fallback generated {len(rows)} rows")
     return rows
 
 
-def write_csv(rows: List[Dict[str, Any]]) -> str:
+def write_csv(rows: List[Dict[str, Any]], *, backup: bool = False) -> str:
     if not rows:
         raise ValueError("No data rows available to write")
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"STAUD_{timestamp}.csv"
+    prefix = "STAUD_backup_" if backup else "STAUD_"
+    filename = f"{prefix}{timestamp}.csv"
     path = os.path.join(OUTPUT_DIR, filename)
 
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -425,11 +536,25 @@ def write_csv(rows: List[Dict[str, Any]]) -> str:
 def main() -> None:
     start = time.time()
     try:
-        rows = collect_rows()
-        if not rows:
-            log("[warn] No rows collected. CSV will not be created.")
-            return
-        csv_path = write_csv(rows)
+        rows, failures = collect_rows()
+        fallback_needed = not rows or bool(failures)
+
+        if fallback_needed:
+            if failures:
+                log(
+                    f"[warn] Primary scrape skipped {len(failures)} handles -> initiating GraphQL fallback"
+                )
+            else:
+                log("[warn] Primary scrape produced no rows -> initiating GraphQL fallback")
+
+            fallback_rows = perform_graphql_fallback()
+            if not fallback_rows:
+                raise RuntimeError(
+                    "GraphQL fallback returned no data; aborting without CSV output"
+                )
+            csv_path = write_csv(fallback_rows, backup=True)
+        else:
+            csv_path = write_csv(rows)
         elapsed = time.time() - start
         log(f"[done] Completed in {elapsed:.1f}s -> {csv_path}")
     except Exception as exc:
