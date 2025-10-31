@@ -104,6 +104,17 @@ EXCLUDED_PRODUCT_TYPES = {
     "jacket",
 }
 
+PRODUCT_TYPE_TO_KEEP = {
+    "jeans",
+    "pants",
+    "maternity",
+    "ankle",
+    "crop",
+    "instasculpt",
+    "leg",
+    "rise",
+}
+
 EXCLUDED_TAGS = {
     "men",
     "kids",
@@ -160,7 +171,7 @@ LOGGER = configure_logging()
 
 GRAPHQL_QUERY = """
 query WomensJeans($cursor: String, $pageSize: Int!) {
-  products(first: $pageSize, after: $cursor) {
+  products(first: $pageSize, after: $cursor, query: "product_type:Women AND jeans") {
     edges {
       cursor
       node {
@@ -271,6 +282,8 @@ def fetch_searchspring() -> Dict[str, SearchspringHit]:
                 continue
             if product_type == "rise" and "short" in title:
                 continue
+            if product_type and product_type not in PRODUCT_TYPE_TO_KEEP:
+                continue
             if any(keyword in title for keyword in EXCLUDED_TITLE_KEYWORDS):
                 continue
             tags = clean_tags(item.get("tags", []))
@@ -283,16 +296,7 @@ def fetch_searchspring() -> Dict[str, SearchspringHit]:
             if badges:
                 values = [b.get("value") for b in badges if isinstance(b, dict)]
                 promo_value = "; ".join([v for v in values if v]) or None
-            raw_ga = item.get("ga_unique_purchases")
-            ga_purchases: Optional[int] = None
-            if isinstance(raw_ga, (int, float)):
-                ga_purchases = int(raw_ga)
-            elif isinstance(raw_ga, str):
-                stripped = raw_ga.strip()
-                try:
-                    ga_purchases = int(float(stripped))
-                except ValueError:
-                    ga_purchases = None
+            ga_purchases = item.get("ga_unique_purchases")
             instock_pct = item.get("ss_instock_pct")
             if instock_pct not in (None, ""):
                 try:
@@ -308,7 +312,7 @@ def fetch_searchspring() -> Dict[str, SearchspringHit]:
                 product_type_raw=product_type or "",
                 vendor=vendor,
                 promo=promo_value,
-                ga_purchases=ga_purchases,
+                ga_purchases=int(ga_purchases) if isinstance(ga_purchases, (int, float)) else None,
                 instock_pct=instock_pct,
                 tags=tags,
             )

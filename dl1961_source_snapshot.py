@@ -66,20 +66,17 @@ class FetchContext:
         return resp.json()
 
 
-SEARCHSPRING_SITE_ID = "dkc5xr"
+SEARCHSPRING_SITE_ID = "8176gy"
 SEARCHSPRING_URL = (
-    "https://dkc5xr.a.searchspring.io/api/search/autocomplete.json"
+    "https://8176gy.a.searchspring.io/api/search/autocomplete.json"
 )
 
-STOREFRONT_URL = "https://warpandweft1.myshopify.com/api/2024-04/graphql.json"
-STOREFRONT_TOKEN = "8473dc07111af05dd96ecf3f061a64ac"
+STOREFRONT_URL = "https://dl1961trial.myshopify.com/api/2023-04/graphql.json"
+STOREFRONT_TOKEN = "d66ac22abacd5c3978abe95b55eaa3df"
 
-SHOPIFY_COLLECTION_URLS = [
-    "https://warpweftworld.com/collections/womens-regular/products.json",
-    "https://warpweftworld.com/collections/womens-plus/products.json",
-    "https://warpweftworld.com/collections/womens-regular-sale-2/products.json",
-    "https://warpweftworld.com/collections/womens-plus-sale-2/products.json",
-]
+SHOPIFY_COLLECTION_URL = (
+    "https://dl1961.com/collections/women-view-all-fits/products.json"
+)
 
 
 def fetch_searchspring(ctx: FetchContext) -> list[dict[str, Any]]:
