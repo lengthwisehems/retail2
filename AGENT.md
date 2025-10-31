@@ -2,10 +2,10 @@
 
 This document captures the conventions and brand-specific notes for the denim inventory scrapers maintained in this repository. It is intended to let a new contributor ramp quickly, understand where each CSV field comes from, and avoid breaking the existing data paths.
 
-## Shared conventions
+## Shared conventions (read this slowly – skipping any bullet will break the feeds)
 
-- **Runtime environment**: All scrapers use Python 3.11+ with `requests` and, when needed, `beautifulsoup4`. We standardize on a single `requests.Session` per run with a desktop User-Agent and exponential backoff around transient HTTP errors (429/5xx).Log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) in the command prompt while the script is running.
-- **Output layout**: Every script defines `BASE_DIR = Path(__file__).resolve().parent`, `OUTPUT_DIR = BASE_DIR / "Output"`, and a brand-specific `LOG_PATH`. `OUTPUT_DIR` is created up front and all exports are timestamped `BRAND_YYYY-MM-DD_HH-MM-SS.csv` (24-hour clock). Logs append to `[brand]_run.log` in the same directory and gracefully falls back if the preferred path is unavailable.
+- **Runtime environment**: All scrapers use Python 3.11+ with `requests` and, when needed, `beautifulsoup4`. We standardize on a single `requests.Session` per run with a desktop User-Agent and exponential backoff around transient HTTP errors (429/5xx). **Always** log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) in the command prompt while the script is running so stalled runs are obvious.
+- **Output layout**: Every script defines `BASE_DIR = Path(__file__).resolve().parent`, `OUTPUT_DIR = BASE_DIR / "Output"`, and a brand-specific `LOG_PATH`. `OUTPUT_DIR` is created up front and all exports are timestamped `BRAND_YYYY-MM-DD_HH-MM-SS.csv` (24-hour clock). Logs append to `[brand]_run.log` in the same directory and gracefully fall back if the preferred path is unavailable.
 - **Logging fallbacks**: When configuring logging handlers, always attempt to open the primary log file inside a try/except block and fall back to `OUTPUT_DIR / "[brand]_run.log"` (or stream-only logging) if the primary path is locked. Emit a warning so the automation log explains which destination is active. Apply this pattern to every new scraper.
 - **CSV schema**: Start from the baseline schema
   `Style Id, Handle, Published At, Product, Style Name, Product Type, Tags,
@@ -15,14 +15,26 @@ This document captures the conventions and brand-specific notes for the denim in
   brand instructions. Depending on the information available more headers may be added and some maybe deleted. Where the information for each of these headers can be sourced is detailed in the prompt for when scraping a new brand. The format of the mapping is pasted as a table in prompt. The layout goes:
 Header for CSV: this is what should be put as the label in the csv output. This will change from brand to brand so pay attention to what is an isn’t listed in the mapping
 Label in Data/json/html: this is usually the word to look for in order to find the data that should be scraped. This will change from brand to brand so pay attention to what is listed in the mapping.
-Example: show an example of the type and formatting of the information that should be pulled in 
+Example: show an example of the type and formatting of the information that should be pulled in
 Where found: the URL or name of page for where the information can be found. This will change from brand to brand so pay attention to the source.
-Where Found (details): additional help in the event the information may be difficult to find, has specific rules for what should/shouldn’t be pulled, or requires additional formatting details. This may not always be filled. What is/isn’t filled and what instructions are given  will change from brand to brand so pay attention to the mapping in the prompt.
+Where Found (details): additional help in the event the information may be difficult to find, has specific rules for what should/shouldn’t be pulled, or requires additional formatting details. This may not always be filled. What is/isn’t filled and what instructions are given will change from brand to brand so pay attention to the mapping in the prompt.
 
 - **Logging**: Log major milestones (collection page counts, Searchspring/Algolia pagination, fallbacks) and any retries so production runs can be audited.
 - **Retry policy**: Treat 429/5xx as transient, sleep with exponential backoff, log successful fallbacks, and rotate through host fallbacks by adding alternate domain (e.g., amodenim.com vs www.amodenim.com).
 - **Do not regress working code**: When adding features, leave the validated inventory path untouched. New behavior should sit behind clearly documented flags or separate functions.
 - **Pre-emptive fixes**: Refer to each brand's **Edits made to fix repeated scraping failures** to implement preventative fixes when writing new code
+
+### Data hygiene rules (non-negotiable)
+
+1. **Treat every identifier as text.** Shopify product ids, variant ids, SKUs, and barcodes must stay as strings. Casting to `int` will chop leading or trailing zeros (e.g., `56622797685120` → `5662279768512`) and corrupt downstream reconciliations. Call `str(value)` if the API returns a number.
+2. **Measurements must keep decimals.** The shared `parse_measurement` helper handles whole numbers, decimals, and fractions (`10 3/4`). Always convert centimetres to inches with `Decimal` math and round using `quantize(Decimal("0.01"), ROUND_HALF_UP)` so `11.25` does not become `11`.
+3. **Respect option fallbacks.** If `option2` or `option3` is missing, reuse `option1` so Color/Size are still populated. Never leave the column blank because you forgot to branch.
+4. **Follow the exclusion rules exactly.** Each prompt calls out handles, tags, or product types to skip. Implement those tests verbatim and add asserts covering the sample handles supplied in the prompt before you ship changes.
+5. **Use the key specified for joins.** Searchspring merges are keyed by `ss_id`, Nosto merges by Shopify variant id, etc. Do not attempt fuzzy joins—if a record is missing, log it for manual review.
+6. **Format dates as `MM/DD/YYYY`.** Convert Shopify ISO timestamps with `datetime.fromisoformat(...).strftime("%m/%d/%Y")`. Locale defaults will vary between machines.
+7. **Sanitize HTML before parsing.** Replace `&nbsp;` with spaces, strip tags with BeautifulSoup, and normalise whitespace before searching for measurement tokens.
+
+If you are tempted to “just cast to int” or “round the measurement”, stop and build the proper helper. The last person who ignored this instruction shipped CSVs with missing decimals and truncated ids—do not repeat that mistake.
 
 
 ## Brand notes
@@ -103,6 +115,63 @@ for Style Id, Handle, Published At, Product, Tags, Vendor, Variant Title (Produc
 
 ### AMO (`amo_inventory.py`)
 - **Edits made to fix repeated scraping failures**: Previously failed when `amodenim.com` DNS lookups broke, and partial runs left product rows missing details. Now uses a shared requests session with fallback host handling, centralized retry logging, and writes CSV output plus a run log resolved from the script directory.
+
+### Frame (`frame_inventory.py` / `frame_inventory_with_measurements.py`)
+- **Catalog source**: Combine the women’s denim and sale collection feeds (`https://frame-store.com/collections/denim-women/products.json?limit=250&page=n` and `https://frame-store.com/collections/sale-denim/products.json?limit=250&page=n`). Only keep `product_type == "Jeans"`, except when the tags include `collection::skirts & shorts`—in that case set Product Type to `Skirt/Short`.
+- **Searchspring enrichment**: Query `https://v1j77y.a.searchspring.io/api/search/search.json?siteId=v1j77y&resultsFormat=json&q=women&ss_category=Jeans&resultsPerPage=100&page=n`. Join on Shopify variant id to ingest Quantity Available (`inventory_quantity`), style totals (`ss_inventory_count`), barcode, jean style tags (`filterleg::`), inseam/rise labels, stretch, and color families.
+- **Measurements**: The daily scraper leaves Rise/Inseam/Leg Opening blank (headers remain). The monthly `_with_measurements` script fetches `https://frame-store.com/products/<handle>?modals=details_modal`, parses the hidden `measurement-image__list`, and writes the inch values as decimals.
+- **Pricing**: Shopify already returns dollar strings. Do **not** divide by 100.
+- **Logging**: `initialize_logging()` tries the base directory log and falls back to `OUTPUT_DIR/frame_run.log` if OneDrive locks the file.
+
+### L’Agence (`lagence_inventory.py` / `lagence_inventory_with_measurements.py`)
+- **Shopify collections**: Iterate over `collections/jeans` and `collections/sale` JSON feeds. Filter to `product_type == "jean"`.
+- **Nosto GraphQL**: Query the category ids `626045911412` (denim) and `160218808423` (sale) and join on Shopify variant id. Nosto supplies Quantity Available, style totals, barcodes, jean style tags, inseam/rise labels, stretch, simplified colors, and measurements (`custom-detail_spec_*`).
+- **Monthly measurements**: Same pipeline as Frame—cache PDP modal HTML when Nosto omits Rise/Inseam/Leg Opening.
+- **Price normalization**: Keep Shopify `price`/`compare_at_price` verbatim.
+
+### Rolla’s (`rollas_inventory.py` / `rollas_inventory_with_measurements.py`)
+- **GraphQL filter**: `collection:women AND tag:'category:Jeans'`. Skip any product tagged `gender:Guys`.
+- **Inseam + size**: Option3 stores centimetre inseams; convert to inches (two decimals). If missing, scrape the PDP measurement list (monthly script).
+- **Jean style**: Use the helper in `rollas/style_rules.py` which maps `fit`, `fit_swatch`, and title keywords (e.g., `Heidi Low`) to canonical styles. Do not hand-roll mappings.
+- **Inseam label**: Apply the Skinny/Baggy/Straight + inseam matrix via `determine_inseam_label()`.
+- **Stretch**: Prefer tags (`stretch:Rigid`, `stretch:Super`); fall back to description keywords.
+
+### Abrand (`abrand_inventory.py` / `abrand_inventory_with_measurements.py`)
+- **GraphQL scope**: Use the Storefront API with `tag:'gender:Girls'`. Men’s SKUs must never appear.
+- **Measurement parsing**: Convert option3 centimetres to inches. The monthly script scrapes the PDP `Details` accordion and supports both `cm` and `in` strings.
+- **Jean style**: Map `fit`, `fit_swatch`, and title keywords to Straight/Flare/Boot/Barrel/Baggy exactly as described in the prompt matrix (Heidi Low counts as Straight).
+- **Stretch**: Normalize to exactly `Rigid`, `comfort-stretch`, or `stretch` using tags first, then description keywords.
+
+### DL1961 (`dl1961_inventory.py` / `dl1961_inventory_with_measurements.py` / `dl1961_source_snapshot.py`)
+- **Searchspring authoritative list**: Query `https://8176gy.a.searchspring.io/...` (legacy) or `https://dkc5xr.a.searchspring.io/...` (Warp + Weft). The Searchspring handles define the SKU list, `ga_unique_purchases`, promos, and in-stock percentages. If a handle is not present, skip it entirely.
+- **Storefront GraphQL**: Enumerate all products and apply the prompt’s exclusion rules afterward (`product_type_unigram` filters, bad tags like `fabriccrochet`, titles containing `short`, etc.).
+- **Measurements**: Parse `Rise`, `Inseam`, and `Leg Opening` from the description. When blank, scrape PDP HTML `pro-benefits` spans (monthly script). The helper accepts inch-only strings.
+- **Pricing**: Shopify provides dollar strings; compare-at price comes from Searchspring `msrp`.
+- **Analytics**: Convert `ga_unique_purchases` strings to integers before writing the CSV.
+
+### Icon Denim (`icon_inventory.py`)
+- **Collection feeds**: Pull women’s bottoms and last-chance jeans with `currency=USD`. Filter for titles containing `Jean`.
+- **Variant options**: If `option2` is `null`, leave Color blank and treat `option1` as Size. Otherwise `option1` = Color, `option2` = Size.
+- **GraphQL enrichment**: Fetch descriptions, SKUs, barcodes, inventory counts, and PDP URLs from `https://icondenimlosangeles.com/api/2025-04/graphql.json` using the provided token.
+- **Stretch**: Scan the description for `Rigid` and populate the column when present.
+
+### Neuw (`neuw_inventory.py` / `neuw_inventory_with_measurements.py`)
+- **GraphQL filter**: `collection:womens-jeans` with `tag:'gender:Girls'`.
+- **Size & inseam**: Extract from SKU strings (`A43J96-3130-MID BLUE-23/30`). Split on `-` and `/` but preserve trailing zeros by keeping everything as strings.
+- **Inseam label**: Follow the jean-style/inseam matrix (e.g., Skinny + 32 → Long, Baggy + 30 → Petite). The helper in `neuw/labels.py` already encodes the rules.
+- **Stretch**: Tags expose `stretch:` tokens; fallback to description keywords `comfort-stretch`, `stretch`, or `Rigid`.
+- **Monthly measurements**: Scrape PDP `Details` items when Storefront omits measurements. Support both centimetre and inch units.
+
+### Rolla’s / Abrand / Neuw / DL1961 / Icon monthly measurement scripts
+- All `_with_measurements.py` scripts reuse the daily data pipeline and augment it with PDP HTML fallbacks. Cache PDP responses by handle and always return measurement strings with two decimal places.
+
+### Warp + Weft (`warpweft_inventory.py`)
+- **GraphQL scope**: Request all product types `"Women's Jeans"`, `"Women's Plus Size Jeans"`, and `"Women's Regular Size Jeans"`. Immediately drop any title containing `dress`, `short`, `skirt`, `jacket`, `shirt`, `vest`, or `tee`.
+- **Measurements**: Extract `Rise`, `Inseam`, and `Leg Opening` from the description using the regex helpers that mirror the Excel formulas provided in the prompt. Validate that the inseam falls within the allowed list; raise if it does not so bugs are caught early.
+- **Searchspring merge**: Join on Shopify product id (`ss_id`). Use Searchspring for `msrp` (Compare at Price), promo badges, in-stock percentage (append `%`), and primary image URLs.
+- **Labels**: Tags include `fit:Bootcut`, `Length:long`, `Rise:high`, etc. Parse them with the shared helper in `warpweft/attribute_maps.py`. When multiple tags qualify, prefer the one whose keyword appears in the product title.
+- **Stretch**: Tags contain `stretch:high`, `stretch:low`, or `stretch:rigid`. Map directly to `High Stretch`, `Low Stretch`, or `Rigid`. If absent but description mentions `sculpting denim`, fill `Sculpting Denim`.
+- **Promo badges**: Output the Searchspring strings exactly as provided—no trimming or reformatting.
 
 ## Maintenance checklist
 
