@@ -188,16 +188,22 @@ def fetch_storefront(ctx: FetchContext) -> list[dict[str, Any]]:
 
 def fetch_collection_json(ctx: FetchContext) -> list[dict[str, Any]]:
     logging.info("Fetching Shopify collection JSON")
-    page = 1
     products: list[dict[str, Any]] = []
-    while True:
-        payload = ctx.get_json(SHOPIFY_COLLECTION_URL, params={"limit": 250, "page": page})
-        page_products = payload.get("products", [])
-        logging.info("Collection page %s -> %s products", page, len(page_products))
-        if not page_products:
-            break
-        products.extend(page_products)
-        page += 1
+    for base_url in SHOPIFY_COLLECTION_URLS:
+        page = 1
+        while True:
+            payload = ctx.get_json(base_url, params={"limit": 250, "page": page})
+            page_products = payload.get("products", [])
+            logging.info(
+                "Collection %s page %s -> %s products",
+                base_url,
+                page,
+                len(page_products),
+            )
+            if not page_products:
+                break
+            products.extend(page_products)
+            page += 1
     return products
 
 

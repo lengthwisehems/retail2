@@ -383,13 +383,11 @@ def extract_style_name(tags: Iterable[str]) -> str:
 
 def determine_product_type(hit: Optional[SearchspringHit], title: str) -> Optional[str]:
     if hit is None:
-        return "Jeans"
+        return None
     raw = hit.product_type_raw
     if raw in EXCLUDED_PRODUCT_TYPES:
         return None
     if raw == "rise" and "short" in title.lower():
-        return None
-    if raw and raw not in PRODUCT_TYPE_TO_KEEP:
         return None
     return "Jeans"
 
@@ -637,6 +635,9 @@ def assemble_rows(
             LOGGER.info("Skipping product %s because of title/tags filters", handle)
             continue
         search_hit = search_hits.get(handle)
+        if search_hit is None:
+            LOGGER.debug("Skipping %s because it is not present in Searchspring", handle)
+            continue
         product_type = determine_product_type(search_hit, title)
         if product_type is None:
             LOGGER.info("Skipping product %s due to product type filters", handle)

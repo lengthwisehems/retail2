@@ -61,6 +61,12 @@ call :RunScraper "Haikure" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\Haikure\haikure_inventory.log"
 call :UpdateFinalExit
 
+call :RunScraper "IconDenim" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\IconDenim\icon_inventory.py" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\IconDenim\Output" ^
+                  "C:\Users\carri\OneDrive - Length Wise\data scraping\IconDenim\icon_run.log"
+call :UpdateFinalExit
+
 REM L'Agence denim scraper
 call :RunScraper "LAgence" ^
                   "C:\Users\carri\OneDrive - Length Wise\data scraping\LAgence\lagence_inventory.py" ^
