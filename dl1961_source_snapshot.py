@@ -66,17 +66,20 @@ class FetchContext:
         return resp.json()
 
 
-SEARCHSPRING_SITE_ID = "8176gy"
+SEARCHSPRING_SITE_ID = "dkc5xr"
 SEARCHSPRING_URL = (
-    "https://8176gy.a.searchspring.io/api/search/autocomplete.json"
+    "https://dkc5xr.a.searchspring.io/api/search/autocomplete.json"
 )
 
-STOREFRONT_URL = "https://dl1961trial.myshopify.com/api/2023-04/graphql.json"
-STOREFRONT_TOKEN = "d66ac22abacd5c3978abe95b55eaa3df"
+STOREFRONT_URL = "https://warpandweft1.myshopify.com/api/2024-04/graphql.json"
+STOREFRONT_TOKEN = "8473dc07111af05dd96ecf3f061a64ac"
 
-SHOPIFY_COLLECTION_URL = (
-    "https://dl1961.com/collections/women-view-all-fits/products.json"
-)
+SHOPIFY_COLLECTION_URLS = [
+    "https://warpweftworld.com/collections/womens-regular/products.json",
+    "https://warpweftworld.com/collections/womens-plus/products.json",
+    "https://warpweftworld.com/collections/womens-regular-sale-2/products.json",
+    "https://warpweftworld.com/collections/womens-plus-sale-2/products.json",
+]
 
 
 def fetch_searchspring(ctx: FetchContext) -> list[dict[str, Any]]:
@@ -188,16 +191,22 @@ def fetch_storefront(ctx: FetchContext) -> list[dict[str, Any]]:
 
 def fetch_collection_json(ctx: FetchContext) -> list[dict[str, Any]]:
     logging.info("Fetching Shopify collection JSON")
-    page = 1
     products: list[dict[str, Any]] = []
-    while True:
-        payload = ctx.get_json(SHOPIFY_COLLECTION_URL, params={"limit": 250, "page": page})
-        page_products = payload.get("products", [])
-        logging.info("Collection page %s -> %s products", page, len(page_products))
-        if not page_products:
-            break
-        products.extend(page_products)
-        page += 1
+    for base_url in SHOPIFY_COLLECTION_URLS:
+        page = 1
+        while True:
+            payload = ctx.get_json(base_url, params={"limit": 250, "page": page})
+            page_products = payload.get("products", [])
+            logging.info(
+                "Collection %s page %s -> %s products",
+                base_url,
+                page,
+                len(page_products),
+            )
+            if not page_products:
+                break
+            products.extend(page_products)
+            page += 1
     return products
 
 
