@@ -6,6 +6,7 @@ import csv
 import logging
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from html import unescape
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -287,6 +288,39 @@ def determine_inseam_style(title: str) -> str:
     return "Cropped" if "crop" in title.lower() else ""
 
 
+def _format_decimal(value: Decimal) -> str:
+    quantized = value.quantize(Decimal("0.01"))
+    result = format(quantized.normalize(), "f")
+    if "." in result:
+        result = result.rstrip("0").rstrip(".")
+    return result
+
+
+def format_price(raw: Optional[object]) -> str:
+    if raw in (None, "", "null"):
+        return ""
+
+    if isinstance(raw, (int, float)):
+        value = Decimal(str(raw))
+        if isinstance(raw, int) and raw >= 100:
+            # Shopify product JSON returns cents as integers.
+            value = value / Decimal(100)
+        return _format_decimal(value)
+
+    text = str(raw).strip()
+    if not text or text.lower() == "null":
+        return ""
+
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return text
+
+    if text.isdigit() and len(text) > 2:
+        value = value / Decimal(100)
+    return _format_decimal(value)
+
+
 def format_date(raw: Optional[str]) -> str:
     if not raw:
         return ""
@@ -332,6 +366,15 @@ def assemble_rows(products: Dict[int, Dict], storefront_cache: Dict[str, Dict]) 
             if sku_brand:
                 sku_brand = " ".join(sku_brand.split())
 
+            option1 = variant.get("option1")
+            option2 = variant.get("option2")
+            if option2 in (None, ""):
+                color = ""
+                size = option1 or ""
+            else:
+                color = option1 or ""
+                size = option2 or ""
+
             row = [
                 str(product.get("id", "")),
                 handle,
@@ -343,10 +386,10 @@ def assemble_rows(products: Dict[int, Dict], storefront_cache: Dict[str, Dict]) 
                 vendor,
                 description,
                 f"{title} - {variant.get('title', '')}",
-                variant.get("option1", ""),
-                variant.get("option2", ""),
-                str(variant.get("price", "")),
-                "" if variant.get("compare_at_price") in (None, "") else str(variant.get("compare_at_price")),
+                color,
+                size,
+                format_price(variant.get("price")),
+                format_price(variant.get("compare_at_price")),
                 str(variant.get("available", "")),
                 str(gql_variant.get("quantityAvailable", "")),
                 str(quantity_style),
