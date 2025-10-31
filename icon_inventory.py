@@ -20,8 +20,8 @@ LOG_PATH = BASE_DIR / "icon_run.log"
 FALLBACK_LOG_PATH = OUTPUT_DIR / "icon_run.log"
 
 COLLECTION_URLS = [
-    "https://icondenimlosangeles.com/collections/bottoms-women/products.json?sort_by=manual&filter.p.t.category=aa-1-12-4&limit=250",
-    "https://icondenimlosangeles.com/collections/last-chance-women/products.json?sort_by=manual&filter.p.t.category=aa-1-12-4&limit=250",
+    "https://icondenimlosangeles.com/collections/bottoms-women/products.json?sort_by=manual&filter.p.t.category=aa-1-12-4&limit=250&currency=USD",
+    "https://icondenimlosangeles.com/collections/last-chance-women/products.json?sort_by=manual&filter.p.t.category=aa-1-12-4&limit=250&currency=USD",
 ]
 
 HOST_FALLBACKS = (
