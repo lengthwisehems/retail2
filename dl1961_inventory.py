@@ -16,7 +16,7 @@ OUTPUT_DIR = BASE_DIR / "Output"
 LOG_PATH = BASE_DIR / "dl1961_run.log"
 FALLBACK_LOG_PATH = OUTPUT_DIR / "dl1961_run.log"
 
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_HEADERS = {
     "User-Agent": (

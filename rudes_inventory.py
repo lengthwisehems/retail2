@@ -3,23 +3,84 @@
 # Quantities come from PDP <script> ReStock-config (JavaScript, not JSON).
 # Author: you & ChatGPT
 
-import os, re, csv, json, time, html, math
+from __future__ import annotations
+
+import csv
+import html
+import json
+import logging
+import re
+import time
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse
+
 import requests
 
-# --------- CONFIG ----------
-BASE      = "https://rudesdenim.com"
-PROD_URL  = f"{BASE}/products.json"
-PDP_URL   = f"{BASE}/products/{{handle}}"
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+LOG_PATH = BASE_DIR / "rudes_run.log"
+FALLBACK_LOG_PATH = OUTPUT_DIR / "rudes_run.log"
 
-OUT_DIR   = r"C:\Users\carri\OneDrive - Length Wise\data scraping\Rudes\Output"
-LOG_PATH  = os.path.join(OUT_DIR, "rudes_run.log")
-EXCEL_XLSX= os.path.join(OUT_DIR, "RUDES_daily.xlsx")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging() -> logging.Logger:
+    logger = logging.getLogger("rudes")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    selected_path: Path | None = None
+    fallback_used = False
+
+    for path in (LOG_PATH, FALLBACK_LOG_PATH):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(path, encoding="utf-8")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            selected_path = path
+            if path != LOG_PATH:
+                fallback_used = True
+            break
+        except (OSError, PermissionError) as exc:
+            print(
+                f"WARNING: Unable to open log file {path}: {exc}. Continuing without this destination.",
+                flush=True,
+            )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if selected_path is None:
+        logger.warning("File logging disabled; continuing with console logging only.")
+    elif fallback_used:
+        logger.warning("Primary log path %s unavailable. Using fallback log at %s.", LOG_PATH, selected_path)
+
+    return logger
+
+
+LOGGER = configure_logging()
+
+# --------- CONFIG ----------
+PRIMARY_HOSTS = [
+    "https://rudesdenim.com",
+    "https://rudes-jeans.myshopify.com",
+]
+BASE = PRIMARY_HOSTS[0]
+PRODUCTS_PATH = "/products.json"
+PDP_PATH_TEMPLATE = "/products/{handle}"
+EXCEL_PATH = OUTPUT_DIR / "RUDES_daily.xlsx"
 
 # Turn OCR on only when you’re ready. It needs external Tesseract installed & PATH set.
 OCR_MEASUREMENTS = False            # <- keep False for now (body_html rules first)
 TESSERACT_PATH   = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # if you later turn OCR on
+
+RETRIES = 2
 
 # Allowed sizes to disambiguate size vs color
 ALLOWED_SIZES = {
@@ -29,22 +90,52 @@ ALLOWED_SIZES = {
 }
 
 # --------- UTILS ----------
-os.makedirs(OUT_DIR, exist_ok=True)
 
-def log(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+def log(message: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, message)
 
-def get(url: str, **kw):
-    r = requests.get(url, timeout=30, **kw)
-    r.raise_for_status()
-    return r
+
+def _candidate_urls(url: str) -> Iterable[str]:
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        for host in PRIMARY_HOSTS:
+            host_parsed = urlparse(host)
+            yield urlunparse(
+                (
+                    host_parsed.scheme,
+                    host_parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+    else:
+        for host in PRIMARY_HOSTS:
+            yield urljoin(host, url)
+
+
+def get(url: str, **kw) -> requests.Response:
+    last_exc: Exception | None = None
+    for candidate in _candidate_urls(url):
+        for attempt in range(1, RETRIES + 2):
+            try:
+                response = requests.get(candidate, timeout=30, **kw)
+                response.raise_for_status()
+                if candidate != url:
+                    log(f"Fetched {url} via fallback host {candidate}")
+                return response
+            except requests.RequestException as exc:  # pragma: no cover - network edge cases
+                last_exc = exc
+                log(
+                    f"Request failed for {candidate} (attempt {attempt}/{RETRIES + 1}): {exc}",
+                    level=logging.WARNING,
+                )
+                time.sleep(0.4)
+        log(f"Switching host for {url}", level=logging.INFO)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Unable to fetch {url}")
 
 def money_cents_to_str(v):
     # Rudes prices look like cents; keep “$185.00” formatting if cents given;
@@ -95,7 +186,7 @@ def fetch_all_products() -> List[dict]:
     allp = []
     page = 1
     while True:
-        url = f"{PROD_URL}?limit=250&page={page}"
+        url = f"{PRODUCTS_PATH}?limit=250&page={page}"
         r = get(url)
         data = r.json()
         prods = data.get("products") or []
@@ -245,7 +336,7 @@ def run():
     date_col  = datetime.now().strftime("%Y-%m-%d")
     time_col  = datetime.now().strftime("%H:%M:%S")
 
-    csv_path = os.path.join(OUT_DIR, f"RUDES_{timestamp}.csv")
+    csv_path = OUTPUT_DIR / f"RUDES_{timestamp}.csv"
 
     fields = [
         "Style Id","Handle","Published At","Product","Product Type","Vendor","Description",
@@ -255,7 +346,7 @@ def run():
         "SKU","Image URL","SKU URL","Date","Time"
     ]
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
 
@@ -272,7 +363,7 @@ def run():
 
             # PDP HTML (for quantities, and OCR if enabled)
             try:
-                pdp_html = get(PDP_URL.format(handle=handle)).text
+                pdp_html = get(PDP_PATH_TEMPLATE.format(handle=handle)).text
             except Exception as e:
                 log(f"[PDP] {handle} fetch error: {e}")
                 pdp_html = ""
@@ -359,23 +450,22 @@ def run():
     # -------- Append to Excel (no formulas touched) --------
     try:
         from openpyxl import Workbook, load_workbook
-        if os.path.exists(EXCEL_XLSX):
-            wb = load_workbook(EXCEL_XLSX)
+        if EXCEL_PATH.exists():
+            wb = load_workbook(EXCEL_PATH)
             ws = wb.active
         else:
             wb = Workbook()
             ws = wb.active
             ws.append(fields)  # header
 
-        # stream CSV rows into Excel
-        with open(csv_path, newline="", encoding="utf-8") as f:
+        with csv_path.open(newline="", encoding="utf-8") as f:
             reader = csv.reader(f)
-            next(reader, None)  # skip header
+            next(reader, None)
             for row in reader:
                 ws.append(row)
 
-        wb.save(EXCEL_XLSX)
-        log(f"Excel: {EXCEL_XLSX}")
+        wb.save(EXCEL_PATH)
+        log(f"Excel: {EXCEL_PATH}")
     except Exception as e:
         log(f"[Excel] append failed: {e}")
 
