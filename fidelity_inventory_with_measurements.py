@@ -17,7 +17,7 @@ OUTPUT_DIR = BASE_DIR / "Output"
 LOG_PATH = BASE_DIR / "fidelity_measurements_run.log"
 FALLBACK_LOG_PATH = OUTPUT_DIR / "fidelity_measurements_run.log"
 
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGGER = logging.getLogger("fidelity_inventory.measurements")
 LOGGER.setLevel(logging.INFO)
