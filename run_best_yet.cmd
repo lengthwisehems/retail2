@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions
 
 REM ---------- Python from Site Extension ----------
 set "PY=D:\home\python3111x64\python.exe"
@@ -28,7 +28,7 @@ if errorlevel 1 echo([WARN] Pip upgrade reported an error; continuing with exist
 if errorlevel 1 (
     echo([WARN] Package installation reported an error; scrapers may fail if dependencies are missing.
 ) else (
-    echo(Packages verified.
+    echo Packages verified.
 )
 "%PY%" -V
 
@@ -45,7 +45,7 @@ call :UpdateFinalExit %ERRORLEVEL%
 call :RunScraper "DL1961"      "%ROOT%DL1961\dl1961_inventory.py"                   "%OUT%\DL1961\Output"           "%LOGS%\DL1961\dl1961_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
-call :RunScraper "Edyson"      "%ROOT%Edyson\edyson_inventory.py"                  "%OUT%\Edyson\Output"           "%LOGS%\Edyson\edyson_run.log"
+call :RunScraper "Edyson" "%ROOT%Edyson\edyson_inventory.py" "%OUT%\Edyson\Output" "%LOGS%\Edyson\edyson_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
 call :RunScraper "Fidelity"    "%ROOT%Fidelity\fidelity_inventory.py"               "%OUT%\Fidelity\Output"         "%LOGS%\Fidelity\fidelity_run.log"
@@ -96,7 +96,7 @@ call :UpdateFinalExit %ERRORLEVEL%
 call :RunScraper "Staud"       "%ROOT%Staud\staud_inventory.py"                     "%OUT%\Staud\Output"            "%LOGS%\Staud\staud_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
-call :RunScraper "Triarchy"    "%ROOT%Triarchy\triarchy_inventory.py"                "%OUT%\Triarchy\Output"       "%LOGS%\Triarchy\triarchy_run.log"
+call :RunScraper "Triarchy" "%ROOT%Triarchy\triarchy_inventory.py" "%OUT%\Triarchy\Output" "%LOGS%\Triarchy\triarchy_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
 call :RunScraper "Warpweft"    "%ROOT%Warpweft\warpweft_inventory.py"               "%OUT%\Warpweft\Output"         "%LOGS%\Warpweft\warpweft_run.log"
@@ -129,10 +129,10 @@ goto :AfterAzCopy
     echo([WARN] AzCopy is not available in PATH. Ensure the App Service image includes AzCopy or add it via Site Extensions.
     exit /b 0
   )
-  echo AZCOPY_LOG_LOCATION=%AZCOPY_LOG_LOCATION%
-  echo AZCOPY_JOB_PLAN_LOCATION=%AZCOPY_JOB_PLAN_LOCATION%
-  echo AZCOPY_AUTO_LOGIN_TYPE=%AZCOPY_AUTO_LOGIN_TYPE%
-  if defined AZCOPY_TENANT_ID echo AZCOPY_TENANT_ID=%AZCOPY_TENANT_ID%
+  echo(AZCOPY_LOG_LOCATION=%AZCOPY_LOG_LOCATION%
+  echo(AZCOPY_JOB_PLAN_LOCATION=%AZCOPY_JOB_PLAN_LOCATION%
+  echo(AZCOPY_AUTO_LOGIN_TYPE=%AZCOPY_AUTO_LOGIN_TYPE%
+  if defined AZCOPY_TENANT_ID echo(AZCOPY_TENANT_ID=%AZCOPY_TENANT_ID%
 
   REM ---- Confirm there are files to upload (recursive) ----
   dir /b /s "%OUT%\*.csv" >nul 2>&1
@@ -144,7 +144,7 @@ goto :AfterAzCopy
   REM ---- Copy: MSI auth happens automatically at command time ----
   azcopy copy "%OUT%" "https://lengthwisescraperstorage.blob.core.windows.net/scraperoutput" --recursive --from-to=LocalBlob --include-pattern="*.csv" --overwrite=ifSourceNewer
   if errorlevel 1 (
-    echo([WARN] azcopy copy failed (non-fatal). See logs in "%AZCOPY_LOG_LOCATION%".
+    echo([WARN] azcopy copy failed ^(non-fatal^). See logs in "%AZCOPY_LOG_LOCATION%".
     if defined AZCOPY_SAS_URL (
       echo([INFO] Trying SAS fallback...
       REM Replace <SAS_URL> with your container URL + SAS from the portal.
@@ -152,7 +152,7 @@ goto :AfterAzCopy
       REM   https://lengthwisescraperstorage.blob.core.windows.net/scraperoutput?<SAS>
       azcopy copy "%OUT%" "%AZCOPY_SAS_URL%" --recursive --from-to=LocalBlob --include-pattern="*.csv" --overwrite=ifSourceNewer
       if errorlevel 1 (
-        echo([WARN] azcopy SAS copy failed (non-fatal). Check "%AZCOPY_LOG_LOCATION%".
+        echo([WARN] azcopy SAS copy failed ^(non-fatal^). Check "%AZCOPY_LOG_LOCATION%".
       ) else (
         echo(AzCopy SAS fallback completed.
       )
@@ -222,12 +222,12 @@ if defined LEGACY_SOURCE if defined LEGACY_DEST if exist "!LEGACY_SOURCE!" (
     robocopy "!LEGACY_SOURCE!" "!LEGACY_DEST!" *.csv /E /XO /NFL /NDL >>"!LOGFILE!" 2>&1
     set "ROBO_EXIT=%ERRORLEVEL%"
     if !ROBO_EXIT! geq 8 (
-        echo([WARN] Robocopy reported an error (exit !ROBO_EXIT!) while harvesting !SCRAPER_NAME! CSVs from "!LEGACY_SOURCE!".
+        echo([WARN] Robocopy reported an error ^(exit !ROBO_EXIT!^) while harvesting !SCRAPER_NAME! CSVs from "!LEGACY_SOURCE!".
     ) else if !ROBO_EXIT! gtr 0 (
-        echo([INFO] Harvested CSV updates for !SCRAPER_NAME! from "!LEGACY_SOURCE!" (exit !ROBO_EXIT!).
+        echo([INFO] Harvested CSV updates for !SCRAPER_NAME! from "!LEGACY_SOURCE!" ^(exit !ROBO_EXIT!^).
     )
 ) else (
-    echo([INFO] Skipping legacy CSV harvest (no configured LEGACY_SOURCE/DEST).
+    echo([INFO] Skipping legacy CSV harvest ^(no configured LEGACY_SOURCE/DEST^).
 )
 
 for /f "delims=" %%C in ('dir /b "!OUTDIR!\*.csv" 2^>nul') do (
@@ -300,14 +300,14 @@ if !SCRAPER_EXIT! equ 0 (
     echo([ERROR] !SCRAPER_NAME! failed: !FAIL_REASON!
     if exist "!LOGFILE!" (
         echo([INFO] Review log for details: !LOGFILE!
-        powershell -NoProfile -Command "Write-Output '----- Last 20 log lines for !SCRAPER_NAME! -----'; Get-Content -LiteralPath '!LOGFILE!' -Tail 20" 2>nul
+        call :TailLog "!SCRAPER_NAME!" "!LOGFILE!"
     ) else (
         echo([WARN] Log file could not be created at !LOGFILE!.
     )
 )
 
 echo End: !SCRAPER_END! exit !SCRAPER_EXIT!>>"!LOGFILE!"
-echo.>>"!LOGFILE!"
+echo(>>"!LOGFILE!"
 
 endlocal & exit /b %SCRAPER_EXIT%
 
@@ -318,7 +318,15 @@ REM ---------------------------------------------------------------------------
 if not "%~1"=="0" if "%FINAL_EXIT%"=="0" set "FINAL_EXIT=%~1"
 exit /b 0
 
+:TailLog
+setlocal EnableExtensions EnableDelayedExpansion
+set "BRAND=%~1"
+set "FILE=%~2"
+if exist "!FILE!" (
+  powershell -NoProfile -Command "Write-Output '----- Last 20 log lines for ' + $env:BRAND + ' -----'; Get-Content -LiteralPath $env:FILE -Tail 20" 2>nul
+)
+endlocal & exit /b 0
+
 :ReturnFinalExit
 endlocal
 exit /b %FINAL_EXIT%
-
