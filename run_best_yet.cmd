@@ -18,6 +18,7 @@ if not exist "%OUT%"  mkdir "%OUT%"
 if not exist "%LOGS%" mkdir "%LOGS%"
 
 set "FINAL_EXIT=0"
+set "BRANDS=ABrand AGJeans AMO DL1961 Edyson Fidelity Frame GoodAmerican Haikure IconDenim LAgence MotherDenim Neuw Paige Pistola RamyBrook ReDone Rollas Rudes Selfcontrast Staud Triarchy Warpweft"
 set "SIZE_THRESHOLD=25600"
 
 echo Ensuring required Python packages...
@@ -322,3 +323,4 @@ exit /b 0
 
 :ReturnFinalExit
 endlocal & exit /b %FINAL_EXIT%
+
