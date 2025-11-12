@@ -96,6 +96,35 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
     }
 }
 
+
+def normalize_tokens(value: Any) -> List[str]:
+    """Return an ordered list of unique, non-empty tokens."""
+
+    if not value:
+        return []
+
+    tokens: List[str] = []
+    if isinstance(value, str):
+        token = value.strip()
+        if token:
+            tokens.append(token)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            token = item.strip()
+            if token:
+                tokens.append(token)
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
 FALLBACK_COLLECTION_QUERY = """
 query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
   collection(handle: $handle) {
@@ -1193,17 +1222,30 @@ class GraphQLQueryBuilder:
 def probe_graphql_endpoints(
     session: requests.Session,
     endpoints: Sequence[str],
-    provided_token: Optional[str],
+    tokens_with_source: Sequence[Tuple[Optional[str], str]],
     logger: logging.Logger,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+    *,
+    include_unauthenticated: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Set[Optional[str]]]]:
     access_rows: List[Dict[str, Any]] = []
     operational: List[str] = []
+    success_map: Dict[str, Set[Optional[str]]] = {endpoint: set() for endpoint in endpoints}
+
+    deduped_tokens: List[Tuple[Optional[str], str]] = []
+    seen_keys: Set[Tuple[Optional[str], str]] = set()
+    for token, source in tokens_with_source:
+        normalized = token.strip() if isinstance(token, str) else token
+        normalized = normalized or None
+        key = (normalized, source)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_tokens.append((normalized, source))
 
     for endpoint in endpoints:
-        attempts: List[Tuple[Optional[str], str]] = []
-        if provided_token:
-            attempts.append((provided_token, "provided_token"))
-        attempts.append((None, "unauthenticated"))
+        attempts: List[Tuple[Optional[str], str]] = list(deduped_tokens)
+        if include_unauthenticated:
+            attempts.append((None, "unauthenticated"))
 
         for token, token_source in attempts:
             payload = {"query": SHOP_PROBE_QUERY}
@@ -1225,13 +1267,14 @@ def probe_graphql_endpoints(
                     entry["shop_name"] = shop.get("name")
                     entry["primary_domain"] = (shop.get("primaryDomain") or {}).get("url")
                     entry["note"] = "success"
+                    success_map.setdefault(endpoint, set()).add(token)
+                    if token is None and endpoint not in operational:
+                        operational.append(endpoint)
                 else:
                     errors = (data or {}).get("errors") if data else None
                     entry["note"] = f"errors:{len(errors)}" if errors else "no_shop_data"
             access_rows.append(entry)
-            if entry["ok"] and not token and endpoint not in operational:
-                operational.append(endpoint)
-    return access_rows, operational
+    return access_rows, operational, success_map
 
 
 def apply_tag_filter(product: Dict[str, Any]) -> bool:
@@ -1766,14 +1809,36 @@ def gather_storefront_data(
         logger.info("No GraphQL endpoints configured; skipping Storefront extraction")
         return [], []
 
-    provided_token = X_SHOPIFY_STOREFRONT_ACCESS_TOKEN or None
-    access_rows, _ = probe_graphql_endpoints(session, endpoints, provided_token, logger)
+    provided_tokens = [
+        (token, "provided_token") for token in normalize_tokens(X_SHOPIFY_STOREFRONT_ACCESS_TOKEN)
+    ]
+    access_rows, _operational, success_map = probe_graphql_endpoints(
+        session, endpoints, provided_tokens, logger
+    )
     endpoints_to_use = list(dict.fromkeys(endpoints))
+    token_success_map: Dict[str, Set[Optional[str]]] = {
+        endpoint: set(tokens) for endpoint, tokens in success_map.items()
+    }
 
     def attempt_with_token(
         token: Optional[str], source: str
     ) -> Optional[List[Dict[str, Any]]]:
-        for endpoint in endpoints_to_use:
+        endpoints_iterable = endpoints_to_use
+        if token is not None:
+            eligible = [
+                endpoint
+                for endpoint in endpoints_to_use
+                if token in token_success_map.get(endpoint, set())
+            ]
+            if not eligible:
+                logger.debug(
+                    "Skipping token %s entirely; no endpoints reported a successful probe",
+                    token,
+                )
+                return None
+            endpoints_iterable = eligible
+
+        for endpoint in endpoints_iterable:
             if STOREFRONT_COLLECTION_HANDLES:
                 rows, status, note = collect_storefront_from_collections(
                     session, endpoint, token, logger
@@ -1805,15 +1870,31 @@ def gather_storefront_data(
 
     attempted_sources: set = set()
 
-    if provided_token:
-        result = attempt_with_token(provided_token, "provided_token")
-        attempted_sources.add((provided_token, "provided_token"))
-        if result:
-            return result, access_rows
+    if provided_tokens:
+        for provided_token, source in provided_tokens:
+            if (provided_token, source) in attempted_sources:
+                continue
+            result = attempt_with_token(provided_token, source)
+            attempted_sources.add((provided_token, source))
+            if result:
+                return result, access_rows
 
     discovered_tokens: List[Tuple[Optional[str], str]] = []
     if html:
-        discovered_tokens.extend(discover_tokens(session, html, logger))
+        new_tokens = discover_tokens(session, html, logger)
+        if new_tokens:
+            discovery_rows, _ops, discovery_success = probe_graphql_endpoints(
+                session,
+                endpoints_to_use,
+                new_tokens,
+                logger,
+                include_unauthenticated=False,
+            )
+            access_rows.extend(discovery_rows)
+            for endpoint, tokens in discovery_success.items():
+                if tokens:
+                    token_success_map.setdefault(endpoint, set()).update(tokens)
+        discovered_tokens.extend(new_tokens)
 
     for token, source in discovered_tokens:
         if (token, source) in attempted_sources:
