@@ -8,6 +8,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -176,6 +177,57 @@ query CollectionProducts($handle: String!, $cursor: String, $pageSize: Int!) {
 }
 """
 
+FALLBACK_COLLECTION_QUERY = """
+query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
+  collection(handle: $handle) {
+    id
+    handle
+    title
+    products(first: $pageSize, after: $cursor) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        cursor
+        node {
+          id
+          handle
+          title
+          description
+          productType
+          tags
+          vendor
+          onlineStoreUrl
+          createdAt
+          updatedAt
+          publishedAt
+          variants(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            edges {
+              cursor
+              node {
+                id
+                title
+                sku
+                availableForSale
+                price {
+                  amount
+                  currencyCode
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 PRODUCTS_QUERY = """
 query ProductsProbe($cursor: String, $pageSize: Int!, $query: String) {
   products(first: $pageSize, after: $cursor, query: $query) {
@@ -290,6 +342,52 @@ query ProductsProbe($cursor: String, $pageSize: Int!, $query: String) {
 }
 """
 
+FALLBACK_PRODUCTS_QUERY = """
+query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
+  products(first: $pageSize, after: $cursor, query: $query) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    edges {
+      cursor
+      node {
+        id
+        handle
+        title
+        description
+        productType
+        tags
+        vendor
+        onlineStoreUrl
+        createdAt
+        updatedAt
+        publishedAt
+        variants(first: 100) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            cursor
+            node {
+              id
+              title
+              sku
+              availableForSale
+              price {
+                amount
+                currencyCode
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 SHOP_PROBE_QUERY = "query { shop { name primaryDomain { url } } }"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -378,11 +476,19 @@ def flatten_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return flat
 
 
-def write_sheet(sheet, rows: List[Dict[str, Any]]):
+def write_sheet(
+    sheet,
+    rows: List[Dict[str, Any]],
+    *,
+    column_order: Optional[Sequence[str]] = None,
+):
     if not rows:
         sheet.append(["No data"])
         return
-    columns = sorted({key for row in rows for key in row.keys()})
+    if column_order is None:
+        columns = sorted({key for row in rows for key in row.keys()})
+    else:
+        columns = list(column_order)
     sheet.append(columns)
     for row in rows:
         sheet.append([normalize_cell(row.get(column)) for column in columns])
@@ -410,7 +516,40 @@ def build_products_json_url() -> Optional[str]:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
-def fetch_collection_json(session: requests.Session, logger: logging.Logger) -> List[Dict[str, Any]]:
+def derive_tag_group_key(tag: str) -> str:
+    normalized = str(tag or "").strip().lower()
+    if not normalized:
+        return "misc"
+    prefix = normalized
+    for separator in ("-", "_", " "):
+        if separator in normalized:
+            prefix = normalized.split(separator, 1)[0]
+            break
+    prefix = re.sub(r"[^a-z0-9]+", "_", prefix).strip("_")
+    return prefix or "misc"
+
+
+def group_tags_for_columns(tags: Sequence[str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    seen: Dict[str, set] = defaultdict(set)
+    for raw_tag in tags:
+        if not isinstance(raw_tag, str):
+            continue
+        tag = raw_tag.strip()
+        if not tag:
+            continue
+        group_key = derive_tag_group_key(tag)
+        column_name = f"tags_group_{group_key}"
+        bucket = grouped.setdefault(column_name, [])
+        if tag not in seen[column_name]:
+            bucket.append(tag)
+            seen[column_name].add(tag)
+    return grouped
+
+
+def fetch_collection_json(
+    session: requests.Session, logger: logging.Logger
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     products_json_url = build_products_json_url()
     if not products_json_url:
         logger.info("No collection JSON URL computed; skipping JSON extraction")
@@ -454,10 +593,64 @@ def fetch_collection_json(session: requests.Session, logger: logging.Logger) -> 
 
     logger.info("Collected %s products from collection JSON", len(all_products))
     rows: List[Dict[str, Any]] = []
+    tag_group_counts: Counter[str] = Counter()
     for product in all_products:
-        flat = flatten_record({"product": product})
-        rows.append(flat)
-    return rows
+        product_copy = dict(product)
+        tags = list(product_copy.pop("tags", []) or [])
+        variants = list(product_copy.get("variants", []) or [])
+        product_copy.pop("variants", None)
+
+        flat_product = flatten_record({"product": product_copy})
+        if tags:
+            flat_product["product.tags_all"] = ", ".join(tags)
+
+        tag_groups = group_tags_for_columns(tags)
+
+        if not variants:
+            row = dict(flat_product)
+            for column_name, tag_values in tag_groups.items():
+                joined = ", ".join(tag_values)
+                row[column_name] = joined
+                if joined:
+                    tag_group_counts[column_name] += 1
+            rows.append(row)
+            continue
+
+        for variant in variants:
+            variant_copy = dict(variant)
+            flat_variant = flatten_record({"variant": variant_copy})
+            row = dict(flat_product)
+            row.update(flat_variant)
+            for column_name, tag_values in tag_groups.items():
+                joined = ", ".join(tag_values)
+                row[column_name] = joined
+                if joined:
+                    tag_group_counts[column_name] += 1
+            rows.append(row)
+
+    if not rows:
+        return [], []
+
+    columns = {key for row in rows for key in row.keys()}
+    tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
+    tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
+
+    base_columns = [col for col in columns if col not in tag_group_columns]
+    base_columns.sort()
+
+    insert_after = None
+    for candidate in ("product.published_at", "product_published_at"):
+        if candidate in base_columns:
+            insert_after = candidate
+            break
+
+    if insert_after is not None:
+        idx = base_columns.index(insert_after) + 1
+        column_order = base_columns[:idx] + tag_group_columns + base_columns[idx:]
+    else:
+        column_order = base_columns + tag_group_columns
+
+    return rows, column_order
 
 
 def make_absolute(url: str, base: str) -> str:
@@ -782,6 +975,222 @@ def collect_storefront_from_products(
     return rows, first_status, note
 
 
+def fallback_collect_storefront(
+    session: requests.Session,
+    endpoints: Sequence[str],
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if not endpoints:
+        return [], None
+
+    if STOREFRONT_COLLECTION_HANDLES:
+        return fallback_collect_from_collections(session, endpoints, logger)
+    return fallback_collect_from_products(session, endpoints, logger)
+
+
+def fallback_collect_from_collections(
+    session: requests.Session,
+    endpoints: Sequence[str],
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    for endpoint in endpoints:
+        logger.info(
+            "Attempting unauthenticated Storefront fallback via %s", endpoint
+        )
+        rows: List[Dict[str, Any]] = []
+        first_status: Optional[int] = None
+        success = True
+
+        for handle in STOREFRONT_COLLECTION_HANDLES:
+            cursor: Optional[str] = None
+            while True:
+                payload = {
+                    "query": FALLBACK_COLLECTION_QUERY,
+                    "variables": {
+                        "handle": handle,
+                        "cursor": cursor,
+                        "pageSize": GRAPHQL_PAGE_SIZE,
+                    },
+                }
+                response, data = perform_graphql_request(
+                    session, endpoint, payload, token=None
+                )
+                if first_status is None and response is not None:
+                    first_status = response.status_code
+                if response is None or not response.ok:
+                    logger.debug(
+                        "Fallback Storefront request failed for %s (handle=%s): %s",
+                        endpoint,
+                        handle,
+                        getattr(response, "status_code", "error"),
+                    )
+                    success = False
+                    break
+
+                collection = (
+                    ((data or {}).get("data") or {}).get("collection") if data else None
+                )
+                if not collection:
+                    logger.debug(
+                        "Fallback Storefront returned no collection data for handle '%s'",
+                        handle,
+                    )
+                    success = False
+                    break
+
+                collection_info = {
+                    "collection_id": collection.get("id"),
+                    "collection_handle": collection.get("handle"),
+                    "collection_title": collection.get("title"),
+                }
+
+                products_connection = collection.get("products") or {}
+                edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
+                for edge in edges:
+                    product = edge.get("node") or {}
+                    if not apply_tag_filter(product):
+                        continue
+                    variants_connection = product.get("variants") or {}
+                    variant_edges: Iterable[Dict[str, Any]] = (
+                        variants_connection.get("edges") or []
+                    )
+                    if not variant_edges:
+                        rows.append(
+                            flatten_graphql_product(
+                                collection_info, edge.get("cursor", ""), product, None
+                            )
+                        )
+                    else:
+                        for variant_edge in variant_edges:
+                            rows.append(
+                                flatten_graphql_product(
+                                    collection_info,
+                                    edge.get("cursor", ""),
+                                    product,
+                                    variant_edge,
+                                )
+                            )
+
+                page_info = products_connection.get("pageInfo") or {}
+                if page_info.get("hasNextPage"):
+                    cursor = page_info.get("endCursor")
+                    time.sleep(0.5)
+                else:
+                    break
+
+            if not success:
+                break
+
+        if rows and success:
+            access_entry = {
+                "endpoint": endpoint,
+                "token": "",
+                "token_source": "fallback_unauthenticated",
+                "status_code": first_status or "",
+                "ok": True,
+                "note": "fallback_success",
+            }
+            return rows, access_entry
+
+    return [], None
+
+
+def fallback_collect_from_products(
+    session: requests.Session,
+    endpoints: Sequence[str],
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    query_string = build_product_query_string()
+    for endpoint in endpoints:
+        logger.info(
+            "Attempting unauthenticated Storefront products fallback via %s",
+            endpoint,
+        )
+        rows: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        first_status: Optional[int] = None
+
+        while True:
+            payload = {
+                "query": FALLBACK_PRODUCTS_QUERY,
+                "variables": {
+                    "cursor": cursor,
+                    "pageSize": GRAPHQL_PAGE_SIZE,
+                    "query": query_string,
+                },
+            }
+            response, data = perform_graphql_request(
+                session, endpoint, payload, token=None
+            )
+            if first_status is None and response is not None:
+                first_status = response.status_code
+            if response is None or not response.ok:
+                logger.debug(
+                    "Fallback products request failed for %s: %s",
+                    endpoint,
+                    getattr(response, "status_code", "error"),
+                )
+                rows = []
+                break
+
+            products_connection = (
+                ((data or {}).get("data") or {}).get("products") if data else None
+            )
+            if not products_connection:
+                logger.debug(
+                    "Fallback products query returned no data for endpoint %s",
+                    endpoint,
+                )
+                rows = []
+                break
+
+            edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
+            for edge in edges:
+                product = edge.get("node") or {}
+                if not apply_tag_filter(product):
+                    continue
+                variants_connection = product.get("variants") or {}
+                variant_edges: Iterable[Dict[str, Any]] = (
+                    variants_connection.get("edges") or []
+                )
+                if not variant_edges:
+                    rows.append(
+                        flatten_graphql_product(
+                            {"collection_handle": ""}, edge.get("cursor", ""), product, None
+                        )
+                    )
+                else:
+                    for variant_edge in variant_edges:
+                        rows.append(
+                            flatten_graphql_product(
+                                {"collection_handle": ""},
+                                edge.get("cursor", ""),
+                                product,
+                                variant_edge,
+                            )
+                        )
+
+            page_info = products_connection.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                cursor = page_info.get("endCursor")
+                time.sleep(0.5)
+            else:
+                break
+
+        if rows:
+            access_entry = {
+                "endpoint": endpoint,
+                "token": "",
+                "token_source": "fallback_unauthenticated",
+                "status_code": first_status or "",
+                "ok": True,
+                "note": "fallback_success",
+            }
+            return rows, access_entry
+
+    return [], None
+
+
 def gather_storefront_data(
     session: requests.Session,
     html: str,
@@ -843,6 +1252,15 @@ def gather_storefront_data(
                     source,
                 )
                 return rows, access_rows
+    fallback_rows, fallback_entry = fallback_collect_storefront(
+        session, endpoints_to_use, logger
+    )
+    if fallback_rows:
+        logger.info("Storefront fallback succeeded without a token")
+        if fallback_entry:
+            access_rows.append(fallback_entry)
+        return fallback_rows, access_rows
+
     logger.warning("Storefront extraction did not return any rows")
     return [], access_rows
 
@@ -851,11 +1269,13 @@ def export_workbook(
     json_rows: List[Dict[str, Any]],
     storefront_rows: List[Dict[str, Any]],
     access_rows: List[Dict[str, Any]],
+    *,
+    json_column_order: Optional[Sequence[str]] = None,
 ) -> Path:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "JSON"
-    write_sheet(sheet, json_rows)
+    write_sheet(sheet, json_rows, column_order=json_column_order)
 
     storefront_sheet = workbook.create_sheet("Storefront")
     write_sheet(storefront_sheet, storefront_rows)
@@ -876,9 +1296,14 @@ def main() -> None:
     logger = configure_logging()
     session = build_session()
     html = fetch_collection_html(session, logger)
-    json_rows = fetch_collection_json(session, logger)
+    json_rows, json_column_order = fetch_collection_json(session, logger)
     storefront_rows, access_rows = gather_storefront_data(session, html, logger)
-    output_path = export_workbook(json_rows, storefront_rows, access_rows)
+    output_path = export_workbook(
+        json_rows,
+        storefront_rows,
+        access_rows,
+        json_column_order=json_column_order,
+    )
     logger.info("Workbook written to %s", output_path.as_posix())
 
 
