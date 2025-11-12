@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
@@ -64,6 +64,7 @@ COLUMN_ORDER_BASE: Tuple[str, ...] = (
     "product.published_at",
     "product.created_at",
     "product.title",
+    "product.productType",
     "product.tags_all",
     "product.vendor",
     "product.description",
@@ -83,6 +84,17 @@ COLUMN_ORDER_BASE: Tuple[str, ...] = (
     "product.images[0].src",
     "product.onlineStoreUrl",
 )
+
+DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
+    "ProductVariant": {
+        "components",
+        "groupedBy",
+        "quantityPriceBreaks",
+        "sellingPlanAllocations",
+        "sellingPlanGroups",
+        "storeAvailability",
+    }
+}
 
 FALLBACK_COLLECTION_QUERY = """
 query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
@@ -403,6 +415,18 @@ def remove_matching_keys(
                 break
 
 
+def extract_field_from_error_path(path: Sequence[Any]) -> Optional[str]:
+    for segment in reversed(path or []):
+        if isinstance(segment, str):
+            return segment
+    return None
+
+
+def infer_error_target_type(path: Sequence[Any]) -> str:
+    string_segments = [segment for segment in path if isinstance(segment, str)]
+    return "ProductVariant" if "variants" in string_segments else "Product"
+
+
 def populate_variant_options(row: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
     if variant is None:
         return
@@ -495,6 +519,8 @@ def finalize_common_row(
             row["product.published_at"] = row.get("product_published_at")
         if "product_published_at" in row:
             row.pop("product_published_at", None)
+        if "product.productType" not in row and "product.product_type" in row:
+            row["product.productType"] = row.pop("product.product_type")
         if "product.body_html" in row:
             row.setdefault("product.descriptionHtml", row["product.body_html"])
             row.setdefault("product.description", row["product.body_html"])
@@ -928,12 +954,19 @@ class GraphQLQueryBuilder:
         logger: logging.Logger,
         *,
         max_depth: int = 3,
+        forbidden_fields: Optional[Dict[str, Sequence[str]]] = None,
     ) -> None:
         self.session = session
         self.endpoint = endpoint
         self.token = token
         self.logger = logger
         self.max_depth = max_depth
+        self.forbidden_fields: Dict[str, Set[str]] = defaultdict(set)
+        for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
+            self.forbidden_fields[parent].update(names)
+        if forbidden_fields:
+            for parent, names in forbidden_fields.items():
+                self.forbidden_fields[parent].update(names)
         self.schema = GraphQLSchema(session, endpoint, token, logger)
         self.variant_selection = self._build_type_selection(
             "ProductVariant", max(1, max_depth - 1)
@@ -957,6 +990,8 @@ class GraphQLQueryBuilder:
         if not name or name.startswith("__"):
             return False
         if field_has_required_args(field):
+            return False
+        if name in self.forbidden_fields.get(parent_type, set()):
             return False
         if parent_type == "ProductVariant" and name == "product":
             return False
@@ -1069,7 +1104,9 @@ class GraphQLQueryBuilder:
                     base_name, depth, new_visited, parent_type=parent_type
                 )
             else:
-                body = self._build_type_selection(base_name, depth, visited=new_visited)
+                body = self._build_type_selection(
+                    base_name, depth, visited=tuple(visited)
+                )
             if not body:
                 return None
             args = self._build_field_args(field)
@@ -1245,90 +1282,163 @@ def collect_storefront_from_collections(
     token: Optional[str],
     logger: logging.Logger,
 ) -> Tuple[List[Dict[str, Any]], Optional[int], str]:
-    rows: List[Dict[str, Any]] = []
+    forbidden: Dict[str, Set[str]] = defaultdict(set)
+    for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
+        forbidden[parent].update(names)
+
     first_status: Optional[int] = None
-    note = ""
 
-    try:
-        builder = GraphQLQueryBuilder(session, endpoint, token, logger)
-    except GraphQLIntrospectionError as exc:
-        logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
-        return [], None, "builder_error"
+    while True:
+        try:
+            builder = GraphQLQueryBuilder(
+                session,
+                endpoint,
+                token,
+                logger,
+                forbidden_fields=forbidden,
+            )
+        except GraphQLIntrospectionError as exc:
+            logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
+            return [], None, "builder_error"
 
-    query_text = builder.collection_query
+        query_text = builder.collection_query
+        rows: List[Dict[str, Any]] = []
+        need_retry = False
+        newly_blocked: Dict[str, Set[str]] = defaultdict(set)
 
-    for handle in STOREFRONT_COLLECTION_HANDLES:
-        cursor: Optional[str] = None
-        while True:
-            payload = {
-                "query": query_text,
-                "variables": {
-                    "handle": handle,
-                    "cursor": cursor,
-                    "pageSize": GRAPHQL_PAGE_SIZE,
-                },
-            }
-            response, data = perform_graphql_request(session, endpoint, payload, token)
-            if first_status is None and response is not None:
-                first_status = response.status_code
-            if response is None:
-                return [], first_status, "request_exception"
-            if not response.ok:
-                return [], first_status, f"HTTP_{response.status_code}"
+        for handle in STOREFRONT_COLLECTION_HANDLES:
+            cursor: Optional[str] = None
+            while True:
+                payload = {
+                    "query": query_text,
+                    "variables": {
+                        "handle": handle,
+                        "cursor": cursor,
+                        "pageSize": GRAPHQL_PAGE_SIZE,
+                    },
+                }
+                response, data = perform_graphql_request(
+                    session, endpoint, payload, token
+                )
+                if first_status is None and response is not None:
+                    first_status = response.status_code
+                if response is None:
+                    return [], first_status, "request_exception"
+                if not response.ok:
+                    return [], first_status, f"HTTP_{response.status_code}"
 
-            collection = ((data or {}).get("data") or {}).get("collection") if data else None
-            if not collection:
+                payload_data = (data or {}).get("data") if data else None
+                collection = (payload_data or {}).get("collection") if payload_data else None
                 errors = (data or {}).get("errors") if data else None
-                return [], first_status, (
-                    f"no_collection_data:{len(errors)}" if errors else "no_collection_data"
-                )
 
-            errors = (data or {}).get("errors") if data else None
-            if errors:
-                logger.debug(
-                    "Collection query returned %s errors for handle %s on %s",
-                    len(errors),
-                    handle,
-                    endpoint,
-                )
+                if not collection:
+                    if errors:
+                        unrecoverable = True
+                        for error in errors:
+                            path = error.get("path") or []
+                            field_name = extract_field_from_error_path(path)
+                            if not field_name:
+                                continue
+                            unrecoverable = False
+                            target_type = infer_error_target_type(path)
+                            if field_name not in forbidden[target_type]:
+                                forbidden[target_type].add(field_name)
+                                newly_blocked[target_type].add(field_name)
+                                need_retry = True
+                        if unrecoverable:
+                            return [], first_status, f"no_collection_data:{len(errors)}"
+                        break
+                    return [], first_status, "no_collection_data"
 
-            collection_info = {
-                "collection_id": collection.get("id"),
-                "collection_handle": collection.get("handle"),
-                "collection_title": collection.get("title"),
-            }
-            products_connection = collection.get("products") or {}
-            edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
-            for edge in edges:
-                product = edge.get("node") or {}
-                if not apply_tag_filter(product):
-                    continue
-                variants_connection = product.get("variants") or {}
-                variant_edges: Iterable[Dict[str, Any]] = variants_connection.get("edges") or []
-                if not variant_edges:
-                    rows.append(
-                        flatten_graphql_product(
-                            collection_info, edge.get("cursor", ""), product, None
-                        )
+                if errors:
+                    logger.debug(
+                        "Collection query returned %s errors for handle %s on %s",
+                        len(errors),
+                        handle,
+                        endpoint,
                     )
-                else:
-                    for variant_edge in variant_edges:
+                    new_field_added = False
+                    for error in errors:
+                        path = error.get("path") or []
+                        field_name = extract_field_from_error_path(path)
+                        if not field_name:
+                            continue
+                        target_type = infer_error_target_type(path)
+                        if field_name not in forbidden[target_type]:
+                            forbidden[target_type].add(field_name)
+                            newly_blocked[target_type].add(field_name)
+                            need_retry = True
+                            new_field_added = True
+                    if need_retry:
+                        break
+                    if not new_field_added:
+                        return [], first_status, f"errors:{len(errors)}"
+
+                collection_info = {
+                    "collection_id": collection.get("id"),
+                    "collection_handle": collection.get("handle"),
+                    "collection_title": collection.get("title"),
+                }
+                products_connection = collection.get("products") or {}
+                edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
+                for edge in edges:
+                    product = edge.get("node") or {}
+                    if not apply_tag_filter(product):
+                        continue
+                    variants_connection = product.get("variants") or {}
+                    variant_edges: Iterable[Dict[str, Any]] = (
+                        variants_connection.get("edges") or []
+                    )
+                    if not variant_edges:
                         rows.append(
                             flatten_graphql_product(
-                                collection_info, edge.get("cursor", ""), product, variant_edge
+                                collection_info, edge.get("cursor", ""), product, None
                             )
                         )
-            page_info = products_connection.get("pageInfo") or {}
-            if page_info.get("hasNextPage"):
-                cursor = page_info.get("endCursor")
-                logger.info(
-                    "Collection %s has additional Storefront pages; continuing", handle
-                )
-                time.sleep(0.5)
-            else:
+                    else:
+                        for variant_edge in variant_edges:
+                            rows.append(
+                                flatten_graphql_product(
+                                    collection_info,
+                                    edge.get("cursor", ""),
+                                    product,
+                                    variant_edge,
+                                )
+                            )
+                page_info = products_connection.get("pageInfo") or {}
+                if page_info.get("hasNextPage"):
+                    cursor = page_info.get("endCursor")
+                    logger.info(
+                        "Collection %s has additional Storefront pages; continuing",
+                        handle,
+                    )
+                    time.sleep(0.5)
+                else:
+                    break
+
+            if need_retry:
                 break
-    note = "success" if rows else "no_rows"
-    return rows, first_status, note
+
+        if need_retry:
+            blocked_summary = {
+                parent: sorted(fields)
+                for parent, fields in newly_blocked.items()
+                if fields
+            }
+            if blocked_summary:
+                logger.info(
+                    "Retrying collection query without restricted fields: %s",
+                    blocked_summary,
+                )
+            else:
+                logger.debug(
+                    "Encountered errors but no removable fields; aborting with failure"
+                )
+                return [], first_status, "errors"
+            continue
+
+        note = "success" if rows else "no_rows"
+        return rows, first_status, note
 
 
 def build_product_query_string() -> Optional[str]:
@@ -1353,9 +1463,14 @@ def collect_storefront_from_products(
     cursor: Optional[str] = None
     query_string = build_product_query_string()
     first_status: Optional[int] = None
+    forbidden: Dict[str, Set[str]] = defaultdict(set)
+    for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
+        forbidden[parent].update(names)
 
     try:
-        builder = GraphQLQueryBuilder(session, endpoint, token, logger)
+        builder = GraphQLQueryBuilder(
+            session, endpoint, token, logger, forbidden_fields=forbidden
+        )
     except GraphQLIntrospectionError as exc:
         logger.debug("Unable to build products query for %s: %s", endpoint, exc)
         return [], None, "builder_error"
