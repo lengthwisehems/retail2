@@ -1,18 +1,78 @@
 # -*- coding: utf-8 -*-
-import os, re, csv, time, html, json, requests
+from __future__ import annotations
+
+import csv
+import html
+import json
+import logging
+import re
+import time
 from datetime import datetime
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urljoin, urlparse, urlunparse
 
-BASE = "https://triarchy.com"
+import requests
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+LOG_PATH = BASE_DIR / "triarchy_run.log"
+FALLBACK_LOG_PATH = OUTPUT_DIR / "triarchy_run.log"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging() -> logging.Logger:
+    logger = logging.getLogger("triarchy")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    selected_path: Path | None = None
+    fallback_used = False
+
+    for path in (LOG_PATH, FALLBACK_LOG_PATH):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(path, encoding="utf-8")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            selected_path = path
+            if path != LOG_PATH:
+                fallback_used = True
+            break
+        except (OSError, PermissionError) as exc:
+            print(
+                f"WARNING: Unable to open log file {path}: {exc}. Continuing without this destination.",
+                flush=True,
+            )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if selected_path is None:
+        logger.warning("File logging disabled; continuing with console logging only.")
+    elif fallback_used:
+        logger.warning("Primary log path %s unavailable. Using fallback log at %s.", LOG_PATH, selected_path)
+
+    return logger
+
+
+LOGGER = configure_logging()
+
+PRIMARY_HOSTS = [
+    "https://triarchy.com",
+    "https://triarchydev.myshopify.com",
+]
+BASE = PRIMARY_HOSTS[0]
 COLL = "/collections/jeans"
-
-OUT_DIR = r"C:\Users\carri\OneDrive - Length Wise\data scraping\Triarchy\Output"
-LOG     = r"C:\Users\carri\OneDrive - Length Wise\data scraping\Triarchy\triarchy_inline_inventory.log"
 
 HEADERS = {"User-Agent": "inventory-research/1.0 (+length-wise)"}
 TIMEOUT = 30
 RETRIES = 2
-SLEEP   = 0.25
+SLEEP = 0.25
 MAX_PAGES = 10  # collection pages to try for handles and products.json
 
 CSV_HEADERS = [
@@ -22,30 +82,63 @@ CSV_HEADERS = [
     "Quantity of style","SKU","Image URL","SKU URL"
 ]
 
-os.makedirs(OUT_DIR, exist_ok=True)
+def log(message: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, message)
 
-def log(msg: str):
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
 
-def http_get(url, params=None, accept=None):
-    for _ in range(RETRIES + 1):
-        h = dict(HEADERS)
-        if accept:
-            h["Accept"] = accept
-        r = requests.get(url, params=params, headers=h, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.text
-        time.sleep(0.4)
-    r.raise_for_status()
+def _candidate_urls(url: str) -> Iterable[str]:
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        for host in PRIMARY_HOSTS:
+            host_parsed = urlparse(host)
+            yield urlunparse(
+                (
+                    host_parsed.scheme,
+                    host_parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+    else:
+        for host in PRIMARY_HOSTS:
+            yield urljoin(host, url)
+
+
+def http_get(url: str, params=None, accept: str | None = None) -> str:
+    headers = dict(HEADERS)
+    if accept:
+        headers["Accept"] = accept
+    last_exc: Exception | None = None
+    for candidate in _candidate_urls(url):
+        for attempt in range(1, RETRIES + 2):
+            try:
+                response = requests.get(candidate, params=params, headers=headers, timeout=TIMEOUT)
+                if response.status_code == 200:
+                    if candidate != url:
+                        log(f"Fetched {url} via fallback host {candidate}")
+                    return response.text
+                log(
+                    f"GET {candidate} returned {response.status_code} (attempt {attempt}/{RETRIES + 1})",
+                    level=logging.WARNING,
+                )
+            except requests.RequestException as exc:  # pragma: no cover - network failures
+                last_exc = exc
+                log(
+                    f"GET {candidate} failed: {exc} (attempt {attempt}/{RETRIES + 1})",
+                    level=logging.WARNING,
+                )
+            time.sleep(0.4)
+        log(f"Switching host for {url}", level=logging.INFO)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Unable to fetch {url}")
+
 
 def http_get_json(url, params=None):
-    for _ in range(RETRIES + 1):
-        r = requests.get(url, params=params, headers={**HEADERS, "Accept": "application/json"}, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-        time.sleep(0.4)
-    r.raise_for_status()
+    text = http_get(url, params=params, accept="application/json")
+    return json.loads(text)
 
 # ---------------------------------------
 # Discover handles from collection HTML + collection JSON
@@ -222,7 +315,7 @@ def last_word_product_type(title):
 # ---------------------------------------
 def main():
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    outfile = os.path.join(OUT_DIR, f"triarchy_inline_inventory_{ts}.csv")
+    output_path = OUTPUT_DIR / f"TRIARCHY_{ts}.csv"
     log(f"=== Run {ts} ===")
 
     handles_html = handles_from_collection_html()
@@ -231,7 +324,7 @@ def main():
 
     log(f"[DISC] total handles={len(handles)}")
 
-    with open(outfile, "w", newline="", encoding="utf-8") as f:
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         w.writeheader()
 
@@ -343,8 +436,8 @@ def main():
             except Exception as e:
                 log(f"[ERR] handle={handle} -> {e}")
 
-    log(f"[DONE] file={outfile}")
-    print(f"Wrote {outfile}")
+    log(f"[DONE] file={output_path}")
+    print(f"Wrote {output_path}")
 
 if __name__ == "__main__":
     main()

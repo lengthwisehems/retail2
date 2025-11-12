@@ -1,11 +1,69 @@
-import os, re, csv, json, time, html, requests
+from __future__ import annotations
+
+import csv
+import html
+import json
+import logging
+import re
+import time
 from datetime import datetime
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+LOG_PATH = BASE_DIR / "edyson_run.log"
+FALLBACK_LOG_PATH = OUTPUT_DIR / "edyson_run.log"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging() -> logging.Logger:
+    logger = logging.getLogger("edyson")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    selected_path: Path | None = None
+    fallback_used = False
+    for path in (LOG_PATH, FALLBACK_LOG_PATH):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            selected_path = path
+            if path != LOG_PATH:
+                fallback_used = True
+            break
+        except (OSError, PermissionError) as exc:
+            print(
+                f"WARNING: Unable to open log file {path}: {exc}. Continuing without this destination.",
+                flush=True,
+            )
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    if selected_path is None:
+        logger.warning("File logging disabled; continuing with console logging only.")
+    elif fallback_used:
+        logger.warning("Primary log path %s unavailable. Using fallback log at %s.", LOG_PATH, selected_path)
+    return logger
+
+
+LOGGER = configure_logging()
 
 # ---------- Config ----------
-BASE = "https://edyson.com"
-OUT_DIR = r"C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\Output"
-LOG     = r"C:\Users\carri\OneDrive - Length Wise\data scraping\Edyson\edyson_all_layout.log"
+PRIMARY_HOSTS = [
+    "https://edyson.com",
+    "https://edysonsdenim.myshopify.com",
+]
+BASE = PRIMARY_HOSTS[0]
 
 HEADERS = {"User-Agent": "inventory-research/1.0 (+length-wise)"}
 TIMEOUT = 30
@@ -20,28 +78,63 @@ CSV_HEADERS = [
     "Quantity of style","SKU","Image URL","SKU URL"
 ]
 
-os.makedirs(OUT_DIR, exist_ok=True)
-
 # ---------- Utilities ----------
-def log(msg: str):
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
+def log(msg: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, msg)
 
-def http_get(url, params=None):
-    for _ in range(RETRIES + 1):
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.text
-        time.sleep(0.4)
-    r.raise_for_status()
+
+def _candidate_urls(url: str) -> Iterable[str]:
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        for host in PRIMARY_HOSTS:
+            host_parsed = urlparse(host)
+            yield urlunparse(
+                (
+                    host_parsed.scheme,
+                    host_parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+    else:
+        for host in PRIMARY_HOSTS:
+            yield urljoin(host, url)
+
+
+def http_get(url: str, params=None, headers=None):
+    headers = headers or HEADERS
+    last_exc: Exception | None = None
+    for candidate in _candidate_urls(url):
+        for attempt in range(RETRIES + 1):
+            try:
+                response = requests.get(candidate, params=params, headers=headers, timeout=TIMEOUT)
+                if response.status_code == 200:
+                    if candidate != url:
+                        log(f"Fetched {url} via fallback host {candidate}")
+                    return response.text
+                log(
+                    f"GET {candidate} returned {response.status_code} (attempt {attempt + 1}/{RETRIES + 1})",
+                    level=logging.WARNING,
+                )
+            except requests.RequestException as exc:  # pragma: no cover - network issues
+                last_exc = exc
+                log(
+                    f"GET {candidate} failed: {exc} (attempt {attempt + 1}/{RETRIES + 1})",
+                    level=logging.WARNING,
+                )
+            time.sleep(0.4)
+        log(f"Switching host for {url}", level=logging.INFO)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Unable to fetch {url}")
+
 
 def http_get_json(url, params=None):
-    for _ in range(RETRIES + 1):
-        r = requests.get(url, params=params, headers={**HEADERS, "Accept":"application/json"}, timeout=TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-        time.sleep(0.4)
-    r.raise_for_status()
+    headers = {**HEADERS, "Accept": "application/json"}
+    text = http_get(url, params=params, headers=headers)
+    return json.loads(text)
 
 def html_to_text(s: str) -> str:
     if not s:
@@ -156,7 +249,7 @@ def scrape_measurements(handle: str):
 # ---------- 5) Main ----------
 def main():
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    outfile = os.path.join(OUT_DIR, f"edyson_jeans_{ts}.csv")
+    output_path = OUTPUT_DIR / f"EDYSON_{ts}.csv"
     log(f"=== Run {ts} ===")
 
     products = discover_all_products()
@@ -168,7 +261,7 @@ def main():
     else:
         log(f"[CREDS] domain={domain} token_len={len(token)}")
 
-    with open(outfile, "w", newline="", encoding="utf-8") as f:
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
         w.writeheader()
 
@@ -248,8 +341,8 @@ def main():
             except Exception as e:
                 log(f"[ERR ] handle={p.get('handle')} -> {e}")
 
-    log(f"[DONE] file={outfile}")
-    print(f"Wrote {outfile}")
+    log(f"[DONE] file={output_path}")
+    print(f"Wrote {output_path}")
 
 if __name__ == "__main__":
     main()

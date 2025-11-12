@@ -1,1 +1,154 @@
-import csv, time, requestsfrom datetime import datetimefrom pathlib import Pathimport osSCRIPT_DIR = Path(__file__).resolve().parentOUT_DIR = SCRIPT_DIR / "Output"LOG_PATH = SCRIPT_DIR / "ga_run.log"os.makedirs(OUT_DIR, exist_ok=True)BASE = "https://www.goodamerican.com/api/searchspring"DOMAIN = "https://www.goodamerican.com/collections/womens-jeans"HEADERS = [    "Product Title","Product Handle","Product Type","Vendor","ss_instock_pct","ss_inventory_count",    "Variant Title","Color","Inseam","Size","Price","Compare at Price",    "Available for Sale","Quantity Available","SKU","Image URL"]def is_jeans(item):    # collection_handle is a list of strings    colls = set((item.get("collection_handle") or []))    pt = (item.get("product_type") or "").lower()    handle = (item.get("handle") or "").lower()    if "womens-jeans" in colls:         return True    if "jean" in pt:         return True    # exclude obvious non-jeans    bad = ("jumpsuit","short","skirt","dress","bodysuit")    return not any(b in handle for b in bad) and ("jean" in handle)def money(m):    if isinstance(m, dict):        return m.get("amount") or m.get("value")    return mdef image_from(item):    if isinstance(item.get("featuredImage"), dict):        return item["featuredImage"].get("url")    if isinstance(item.get("image"), dict):        return item["image"].get("url")    imgs = item.get("images")    if isinstance(imgs, list) and imgs:        return imgs[0].get("url") if isinstance(imgs[0], dict) else imgs[0]    return Nonedef variant_nodes(item):    v = item.get("variants")    if isinstance(v, dict) and "nodes" in v:        return v["nodes"]    return []def selected_opts(v):    color = size = inseam = ""    for opt in v.get("selectedOptions", []) or []:        name = (opt.get("name") or "").lower()        val = opt.get("value") or ""        if "color" in name: color = val        elif "inseam" in name or "length" in name: inseam = val        elif name in ("size","waist","letter size"): size = val    return color, size, inseamdef rows_from_item(item):    rows = []    if not is_jeans(item):        return rows    title = item.get("title") or item.get("name") or ""    handle = item.get("handle") or (item.get("url","").split("/")[-1])    ptype = item.get("product_type") or item.get("type") or ""    vendor = item.get("brand") or item.get("vendor") or ""    ss_pct = item.get("ss_instock_pct") or item.get("in_stock_pct") or item.get("instock_pct")    ss_count = item.get("ss_inventory_count") or item.get("inventory") or item.get("inventory_count")    fallback_img = image_from(item)    variants = variant_nodes(item)    if variants:        for v in variants:            color, size, inseam = selected_opts(v)            rows.append({                "Product Title": title,                "Product Handle": handle,                "Product Type": ptype,                "Vendor": vendor,                "ss_instock_pct": ss_pct,                "ss_inventory_count": ss_count,                "Variant Title": v.get("title") or "",                "Color": color,                "Inseam": inseam,                "Size": size,                "Price": money(v.get("price")),                "Compare at Price": money(v.get("compareAtPrice")),                "Available for Sale": v.get("availableForSale"),                "Quantity Available": v.get("quantityAvailable") if v.get("quantityAvailable") is not None else v.get("inventoryQuantity"),                "SKU": v.get("sku") or "",                "Image URL": (v.get("image") or {}).get("url") if isinstance(v.get("image"), dict) else fallback_img            })    else:        rows.append({            "Product Title": title,            "Product Handle": handle,            "Product Type": ptype,            "Vendor": vendor,            "ss_instock_pct": ss_pct,            "ss_inventory_count": ss_count,            "Variant Title": "",            "Color": item.get("color") or "",            "Inseam": item.get("inseam") or "",            "Size": "",            "Price": item.get("price"),            "Compare at Price": item.get("compare_at_price"),            "Available for Sale": item.get("in_stock"),            "Quantity Available": item.get("inventory"),            "SKU": item.get("sku") or "",            "Image URL": fallback_img        })    return rowsdef run():    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # local time; use UTC if you prefer    outfile = os.path.join(OUT_DIR, f"goodamerican_womens_jeans_FULL_{timestamp}.csv")    out = open(outfile, "w", newline="", encoding="utf-8")    w = csv.DictWriter(out, fieldnames=HEADERS)    w.writeheader()    page = 1    while True:        params = {"page": page, "domain": DOMAIN}        r = requests.get(BASE, params=params, timeout=30)        r.raise_for_status()        data = r.json()        ss = data.get("ssData") or data  # proxy sometimes returns top-level        results = ss.get("results") or []        if not results:            break        for item in results:            for row in rows_from_item(item):                w.writerow(row)        pag = ss.get("pagination") or {}        print(f"Page {pag.get('currentPage')} of {pag.get('totalPages')} wrote {len(results)} styles")        if not pag.get("nextPage") or pag.get("currentPage") == pag.get("totalPages"):            break        page += 1        time.sleep(0.25)    out.close()    print(f"Wrote {outfile}")if __name__ == "__main__":    run()
+import csv, time, requests
+from datetime import datetime
+from pathlib import Path
+
+import os
+SCRIPT_DIR = Path(__file__).resolve().parent
+OUT_DIR = SCRIPT_DIR / "Output"
+LOG_PATH = SCRIPT_DIR / "ga_run.log"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+BASE = "https://www.goodamerican.com/api/searchspring"
+DOMAIN = "https://www.goodamerican.com/collections/womens-jeans"
+
+HEADERS = [
+    "Product Title","Product Handle","Product Type","Vendor","ss_instock_pct","ss_inventory_count",
+    "Variant Title","Color","Inseam","Size","Price","Compare at Price",
+    "Available for Sale","Quantity Available","SKU","Image URL"
+]
+
+def is_jeans(item):
+    # collection_handle is a list of strings
+    colls = set((item.get("collection_handle") or []))
+    pt = (item.get("product_type") or "").lower()
+    handle = (item.get("handle") or "").lower()
+    if "womens-jeans" in colls: 
+        return True
+    if "jean" in pt: 
+        return True
+    # exclude obvious non-jeans
+    bad = ("jumpsuit","short","skirt","dress","bodysuit")
+    return not any(b in handle for b in bad) and ("jean" in handle)
+
+def money(m):
+    if isinstance(m, dict):
+        return m.get("amount") or m.get("value")
+    return m
+
+def image_from(item):
+    if isinstance(item.get("featuredImage"), dict):
+        return item["featuredImage"].get("url")
+    if isinstance(item.get("image"), dict):
+        return item["image"].get("url")
+    imgs = item.get("images")
+    if isinstance(imgs, list) and imgs:
+        return imgs[0].get("url") if isinstance(imgs[0], dict) else imgs[0]
+    return None
+
+def variant_nodes(item):
+    v = item.get("variants")
+    if isinstance(v, dict) and "nodes" in v:
+        return v["nodes"]
+    return []
+
+def selected_opts(v):
+    color = size = inseam = ""
+    for opt in v.get("selectedOptions", []) or []:
+        name = (opt.get("name") or "").lower()
+        val = opt.get("value") or ""
+        if "color" in name: color = val
+        elif "inseam" in name or "length" in name: inseam = val
+        elif name in ("size","waist","letter size"): size = val
+    return color, size, inseam
+
+def rows_from_item(item):
+    rows = []
+    if not is_jeans(item):
+        return rows
+    title = item.get("title") or item.get("name") or ""
+    handle = item.get("handle") or (item.get("url","").split("/")[-1])
+    ptype = item.get("product_type") or item.get("type") or ""
+    vendor = item.get("brand") or item.get("vendor") or ""
+    ss_pct = item.get("ss_instock_pct") or item.get("in_stock_pct") or item.get("instock_pct")
+    ss_count = item.get("ss_inventory_count") or item.get("inventory") or item.get("inventory_count")
+    fallback_img = image_from(item)
+
+    variants = variant_nodes(item)
+    if variants:
+        for v in variants:
+            color, size, inseam = selected_opts(v)
+            rows.append({
+                "Product Title": title,
+                "Product Handle": handle,
+                "Product Type": ptype,
+                "Vendor": vendor,
+                "ss_instock_pct": ss_pct,
+                "ss_inventory_count": ss_count,
+                "Variant Title": v.get("title") or "",
+                "Color": color,
+                "Inseam": inseam,
+                "Size": size,
+                "Price": money(v.get("price")),
+                "Compare at Price": money(v.get("compareAtPrice")),
+                "Available for Sale": v.get("availableForSale"),
+                "Quantity Available": v.get("quantityAvailable") if v.get("quantityAvailable") is not None else v.get("inventoryQuantity"),
+                "SKU": v.get("sku") or "",
+                "Image URL": (v.get("image") or {}).get("url") if isinstance(v.get("image"), dict) else fallback_img
+            })
+    else:
+        rows.append({
+            "Product Title": title,
+            "Product Handle": handle,
+            "Product Type": ptype,
+            "Vendor": vendor,
+            "ss_instock_pct": ss_pct,
+            "ss_inventory_count": ss_count,
+            "Variant Title": "",
+            "Color": item.get("color") or "",
+            "Inseam": item.get("inseam") or "",
+            "Size": "",
+            "Price": item.get("price"),
+            "Compare at Price": item.get("compare_at_price"),
+            "Available for Sale": item.get("in_stock"),
+            "Quantity Available": item.get("inventory"),
+            "SKU": item.get("sku") or "",
+            "Image URL": fallback_img
+        })
+    return rows
+
+def run():
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # local time; use UTC if you prefer
+    outfile = os.path.join(OUT_DIR, f"goodamerican_womens_jeans_FULL_{timestamp}.csv")
+
+    out = open(outfile, "w", newline="", encoding="utf-8")
+    w = csv.DictWriter(out, fieldnames=HEADERS)
+    w.writeheader()
+
+    page = 1
+    while True:
+        params = {"page": page, "domain": DOMAIN}
+        r = requests.get(BASE, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        ss = data.get("ssData") or data  # proxy sometimes returns top-level
+        results = ss.get("results") or []
+        if not results:
+            break
+
+        for item in results:
+            for row in rows_from_item(item):
+                w.writerow(row)
+
+        pag = ss.get("pagination") or {}
+        print(f"Page {pag.get('currentPage')} of {pag.get('totalPages')} wrote {len(results)} styles")
+        if not pag.get("nextPage") or pag.get("currentPage") == pag.get("totalPages"):
+            break
+        page += 1
+        time.sleep(0.25)
+
+    out.close()
+    print(f"Wrote {outfile}")
+
+if __name__ == "__main__":
+    run()
