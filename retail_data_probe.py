@@ -895,6 +895,11 @@ def fetch_collection_json(
 
 def extract_searchspring_results(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, dict):
+        ss_data = payload.get("ssData")
+        if isinstance(ss_data, dict):
+            nested_results = extract_searchspring_results(ss_data)
+            if nested_results:
+                return nested_results
         primary = payload.get("results")
         if isinstance(primary, list):
             return [item for item in primary if isinstance(item, dict)]
@@ -1006,6 +1011,8 @@ def fetch_searchspring_data(
             "page": page,
         }
         params.update(SEARCHSPRING_EXTRA_PARAMS or {})
+        if COLLECTION_URL and "domain" not in params:
+            params["domain"] = COLLECTION_URL
 
         logger.info("Fetching Searchspring page %s", page)
         try:
