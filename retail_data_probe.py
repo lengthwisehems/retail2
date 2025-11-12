@@ -359,6 +359,44 @@ def flatten_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return flat
 
 
+def extract_graphql_variant_entries(
+    variants_connection: Any,
+) -> List[Dict[str, Any]]:
+    if not isinstance(variants_connection, dict):
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    seen_ids: Set[Any] = set()
+
+    edges = variants_connection.get("edges") or []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        node = edge.get("node")
+        if not isinstance(node, dict):
+            continue
+        vid = node.get("id")
+        if vid is not None:
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+        entries.append({"cursor": edge.get("cursor", ""), "node": node})
+
+    nodes = variants_connection.get("nodes") or []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            vid = node.get("id")
+            if vid is not None and vid in seen_ids:
+                continue
+            if vid is not None:
+                seen_ids.add(vid)
+            entries.append({"cursor": "", "node": node})
+
+    return entries
+
+
 def build_option_columns(options: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     columns: Dict[str, str] = {}
     aggregate_values: List[str] = []
@@ -905,11 +943,26 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                     seen_ids.add(vid)
                 variants.append(variant)
         elif isinstance(value, dict):
-            variant = dict(value)
-            vid = variant.get("id")
-            if vid is not None and vid not in seen_ids:
-                seen_ids.add(vid)
-            variants.append(variant)
+            nodes = value.get("nodes") if isinstance(value.get("nodes"), list) else None
+            if nodes is not None:
+                for item in nodes:
+                    if not isinstance(item, dict):
+                        continue
+                    variant = dict(item)
+                    vid = variant.get("id")
+                    if vid is not None and vid in seen_ids:
+                        continue
+                    if vid is not None:
+                        seen_ids.add(vid)
+                    variants.append(variant)
+            else:
+                variant = dict(value)
+                vid = variant.get("id")
+                if vid is not None and vid in seen_ids:
+                    continue
+                if vid is not None:
+                    seen_ids.add(vid)
+                variants.append(variant)
 
     for size_key in ("ss_size_json", "ss_sizes_json"):
         raw_value = product.pop(size_key, None)
@@ -1701,17 +1754,17 @@ def collect_storefront_from_collections(
                     if not apply_tag_filter(product):
                         continue
                     variants_connection = product.get("variants") or {}
-                    variant_edges: Iterable[Dict[str, Any]] = (
-                        variants_connection.get("edges") or []
+                    variant_entries = extract_graphql_variant_entries(
+                        variants_connection
                     )
-                    if not variant_edges:
+                    if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
                                 collection_info, edge.get("cursor", ""), product, None
                             )
                         )
                     else:
-                        for variant_edge in variant_edges:
+                        for variant_edge in variant_entries:
                             rows.append(
                                 flatten_graphql_product(
                                     collection_info,
@@ -1830,15 +1883,15 @@ def collect_storefront_from_products(
             if not apply_tag_filter(product):
                 continue
             variants_connection = product.get("variants") or {}
-            variant_edges: Iterable[Dict[str, Any]] = variants_connection.get("edges") or []
-            if not variant_edges:
+            variant_entries = extract_graphql_variant_entries(variants_connection)
+            if not variant_entries:
                 rows.append(
                     flatten_graphql_product(
                         {"collection_handle": ""}, edge.get("cursor", ""), product, None
                     )
                 )
             else:
-                for variant_edge in variant_edges:
+                for variant_edge in variant_entries:
                     rows.append(
                         flatten_graphql_product(
                             {"collection_handle": ""}, edge.get("cursor", ""), product, variant_edge
@@ -1931,17 +1984,17 @@ def fallback_collect_from_collections(
                     if not apply_tag_filter(product):
                         continue
                     variants_connection = product.get("variants") or {}
-                    variant_edges: Iterable[Dict[str, Any]] = (
-                        variants_connection.get("edges") or []
+                    variant_entries = extract_graphql_variant_entries(
+                        variants_connection
                     )
-                    if not variant_edges:
+                    if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
                                 collection_info, edge.get("cursor", ""), product, None
                             )
                         )
                     else:
-                        for variant_edge in variant_edges:
+                        for variant_edge in variant_entries:
                             rows.append(
                                 flatten_graphql_product(
                                     collection_info,
@@ -2030,17 +2083,15 @@ def fallback_collect_from_products(
                 if not apply_tag_filter(product):
                     continue
                 variants_connection = product.get("variants") or {}
-                variant_edges: Iterable[Dict[str, Any]] = (
-                    variants_connection.get("edges") or []
-                )
-                if not variant_edges:
+                variant_entries = extract_graphql_variant_entries(variants_connection)
+                if not variant_entries:
                     rows.append(
                         flatten_graphql_product(
                             {"collection_handle": ""}, edge.get("cursor", ""), product, None
                         )
                     )
                 else:
-                    for variant_edge in variant_edges:
+                    for variant_edge in variant_entries:
                         rows.append(
                             flatten_graphql_product(
                                 {"collection_handle": ""},
