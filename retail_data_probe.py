@@ -28,6 +28,9 @@ GRAPHQL = ""
 X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ""
 GRAPHQL_FILTER_TAG = ""
 STOREFRONT_COLLECTION_HANDLES: List[str] = ["denim"]
+SEARCHSPRING_SITE_ID = ""
+SEARCHSPRING_URL = ""
+SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -712,6 +715,20 @@ def group_tags_for_columns(tags: Sequence[str]) -> Dict[str, List[str]]:
     return grouped
 
 
+def collect_tag_values(record: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    for key, value in record.items():
+        if "tag" not in key.lower():
+            continue
+        if isinstance(value, list):
+            str_items = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+            tags.extend(str_items)
+        elif isinstance(value, str):
+            pieces = [part.strip() for part in value.split(",")]
+            tags.extend([piece for piece in pieces if piece])
+    return tags
+
+
 def fetch_collection_json(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -764,6 +781,11 @@ def fetch_collection_json(
             continue
         product_copy = dict(product)
         tags = list(product_copy.pop("tags", []) or [])
+        tag_set = {tag for tag in tags if isinstance(tag, str)}
+        for extra_tag in collect_tag_values(product):
+            if extra_tag and extra_tag not in tag_set:
+                tags.append(extra_tag)
+                tag_set.add(extra_tag)
         variants = list(product_copy.get("variants", []) or [])
         product_copy.pop("variants", None)
 
@@ -822,6 +844,256 @@ def fetch_collection_json(
             attach_tag_groups(row)
             finalize_json_row(row, product, variant)
             rows.append(row)
+
+    if not rows:
+        return [], []
+
+    columns = {key for row in rows for key in row.keys()}
+    tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
+    tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
+
+    return rows, tag_group_columns
+
+
+def extract_searchspring_results(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        primary = payload.get("results")
+        if isinstance(primary, list):
+            return [item for item in primary if isinstance(item, dict)]
+        if isinstance(primary, dict):
+            aggregated: List[Dict[str, Any]] = []
+            for value in primary.values():
+                if isinstance(value, list):
+                    aggregated.extend([item for item in value if isinstance(item, dict)])
+            if aggregated:
+                return aggregated
+        for key, value in payload.items():
+            if isinstance(value, list):
+                candidates = [item for item in value if isinstance(item, dict)]
+                if candidates:
+                    return candidates
+    return []
+
+
+def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    variants: List[Dict[str, Any]] = []
+    seen_ids: Set[Any] = set()
+    candidate_keys = [
+        key
+        for key in list(product.keys())
+        if key.lower()
+        in {
+            "variants",
+            "variant_list",
+            "variantlist",
+            "skus",
+            "sku_list",
+            "ss_variants",
+        }
+    ]
+    for key in candidate_keys:
+        value = product.pop(key, None)
+        if isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                variant = dict(item)
+                vid = variant.get("id")
+                if vid is not None and vid in seen_ids:
+                    continue
+                if vid is not None:
+                    seen_ids.add(vid)
+                variants.append(variant)
+        elif isinstance(value, dict):
+            variant = dict(value)
+            vid = variant.get("id")
+            if vid is not None and vid not in seen_ids:
+                seen_ids.add(vid)
+            variants.append(variant)
+
+    for size_key in ("ss_size_json", "ss_sizes_json"):
+        raw_value = product.pop(size_key, None)
+        if not raw_value or not isinstance(raw_value, str):
+            continue
+        try:
+            parsed = json.loads(raw_value)
+        except ValueError:
+            continue
+        if isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                variant = dict(item)
+                vid = variant.get("id")
+                if vid is not None and vid in seen_ids:
+                    continue
+                if vid is not None:
+                    seen_ids.add(vid)
+                variants.append(variant)
+
+    return variants
+
+
+def fetch_searchspring_data(
+    session: requests.Session, logger: logging.Logger
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if not SEARCHSPRING_SITE_ID or not SEARCHSPRING_URL:
+        return [], []
+
+    page = 1
+    rows: List[Dict[str, Any]] = []
+    tag_group_counts: Counter[str] = Counter()
+    base_url = SEARCHSPRING_URL.strip()
+
+    while True:
+        params: Dict[str, Any] = {
+            "siteId": SEARCHSPRING_SITE_ID,
+            "resultsFormat": "json",
+            "resultsPerPage": 250,
+            "page": page,
+        }
+        params.update(SEARCHSPRING_EXTRA_PARAMS or {})
+
+        logger.info("Fetching Searchspring page %s", page)
+        try:
+            response = session.get(base_url, params=params, timeout=REQUEST_TIMEOUT, verify=False)
+        except requests.RequestException as exc:
+            logger.warning("Searchspring request failed on page %s: %s", page, exc)
+            break
+
+        if not response.ok:
+            logger.warning(
+                "Searchspring request returned status %s on page %s", response.status_code, page
+            )
+            break
+
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("Searchspring response on page %s was not valid JSON", page)
+            break
+
+        results = extract_searchspring_results(payload)
+        if not results:
+            logger.info("Searchspring page %s returned no results; stopping", page)
+            break
+
+        for product in results:
+            if not isinstance(product, dict):
+                continue
+            product_copy = dict(product)
+            variants = extract_searchspring_variants(product_copy)
+
+            tags = collect_tag_values(product)
+            tag_groups = group_tags_for_columns(tags)
+
+            def attach_tag_groups(target_row: Dict[str, Any]) -> None:
+                for column_name, tag_values in tag_groups.items():
+                    joined = ", ".join(tag_values)
+                    target_row[column_name] = joined
+                    tag_group_counts[column_name] += 1
+
+            image_candidates = [
+                product_copy.get(key)
+                for key in (
+                    "image",
+                    "image_url",
+                    "imageUrl",
+                    "image_link",
+                    "thumbnail",
+                    "thumbnail_url",
+                    "thumbnailImageUrl",
+                )
+            ]
+            image_src = next((candidate for candidate in image_candidates if candidate), None)
+            if image_src:
+                product_copy.setdefault("images", [{"src": image_src}])
+
+            flat_product = flatten_record({"product": product_copy})
+            base_row = dict(flat_product)
+            if tags:
+                base_row["product.tags_all"] = ", ".join(tags)
+
+            for key in (
+                "product.image",
+                "product.image_url",
+                "product.imageUrl",
+                "product.image_link",
+                "product.thumbnail",
+                "product.thumbnail_url",
+                "product.thumbnailImageUrl",
+            ):
+                if key in base_row and not base_row.get("product.images[0].src"):
+                    base_row["product.images[0].src"] = base_row[key]
+
+            if not variants:
+                attach_tag_groups(base_row)
+                finalize_json_row(base_row, product, None)
+                rows.append(base_row)
+                continue
+
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                variant_copy = dict(variant)
+                if "inventory_quantity" not in variant_copy:
+                    for candidate in (
+                        "inventory_quantity",
+                        "inventoryQuantity",
+                        "inventory",
+                        "qty",
+                        "quantity",
+                        "available_quantity",
+                    ):
+                        value = variant_copy.get(candidate)
+                        if value not in (None, ""):
+                            variant_copy["inventory_quantity"] = value
+                            break
+                if "availableForSale" not in variant_copy and isinstance(
+                    variant_copy.get("available"), bool
+                ):
+                    variant_copy["availableForSale"] = variant_copy.get("available")
+
+                flat_variant = flatten_record({"variant": variant_copy})
+                row = dict(base_row)
+                row.update(flat_variant)
+                attach_tag_groups(row)
+                finalize_json_row(row, product, variant_copy)
+                rows.append(row)
+
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        next_page: Optional[int] = None
+        if isinstance(pagination, dict):
+            candidate = pagination.get("nextPage")
+            if isinstance(candidate, int):
+                next_page = candidate
+            elif isinstance(candidate, str) and candidate.isdigit():
+                next_page = int(candidate)
+            elif pagination.get("page") and pagination.get("totalPages"):
+                try:
+                    current_page = int(pagination.get("page"))
+                    total_pages = int(pagination.get("totalPages"))
+                    if current_page < total_pages:
+                        next_page = current_page + 1
+                except (TypeError, ValueError):
+                    next_page = None
+
+        if next_page:
+            page = next_page
+            time.sleep(0.5)
+            continue
+
+        per_page_param = params.get("resultsPerPage")
+        try:
+            per_page_int = int(per_page_param)
+        except (TypeError, ValueError):
+            per_page_int = None
+        if per_page_int and len(results) >= per_page_int:
+            page += 1
+            time.sleep(0.5)
+            continue
+
+        break
 
     if not rows:
         return [], []
@@ -1927,8 +2199,10 @@ def export_workbook(
     json_rows: List[Dict[str, Any]],
     storefront_rows: List[Dict[str, Any]],
     access_rows: List[Dict[str, Any]],
+    searchspring_rows: List[Dict[str, Any]],
     *,
     json_priority_columns: Optional[Sequence[str]] = None,
+    searchspring_priority_columns: Optional[Sequence[str]] = None,
 ) -> Path:
     workbook = Workbook()
     sheet = workbook.active
@@ -1939,6 +2213,16 @@ def export_workbook(
         else list(COLUMN_ORDER_BASE)
     )
     write_sheet(sheet, json_rows, column_order=json_columns)
+
+    searchspring_sheet = workbook.create_sheet("SearchSpring")
+    searchspring_columns = (
+        build_column_order(
+            searchspring_rows, extra_priority=searchspring_priority_columns
+        )
+        if searchspring_rows
+        else list(COLUMN_ORDER_BASE)
+    )
+    write_sheet(searchspring_sheet, searchspring_rows, column_order=searchspring_columns)
 
     storefront_sheet = workbook.create_sheet("Storefront")
     storefront_columns = (
@@ -1963,12 +2247,19 @@ def main() -> None:
     session = build_session()
     html = fetch_collection_html(session, logger)
     json_rows, tag_group_columns = fetch_collection_json(session, logger)
+    if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:
+        searchspring_rows, searchspring_tag_columns = fetch_searchspring_data(session, logger)
+    else:
+        logger.info("Searchspring configuration missing; skipping Searchspring extraction")
+        searchspring_rows, searchspring_tag_columns = [], []
     storefront_rows, access_rows = gather_storefront_data(session, html, logger)
     output_path = export_workbook(
         json_rows,
         storefront_rows,
         access_rows,
+        searchspring_rows,
         json_priority_columns=tag_group_columns,
+        searchspring_priority_columns=searchspring_tag_columns,
     )
     logger.info("Workbook written to %s", output_path.as_posix())
 
