@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
 import requests
 import urllib3
@@ -1003,20 +1003,32 @@ def fetch_searchspring_data(
     tag_group_counts: Counter[str] = Counter()
     base_url = SEARCHSPRING_URL.strip()
 
+    parsed = urlsplit(base_url)
+    base_query: Dict[str, Any] = {
+        key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    endpoint = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
+    is_searchspring_host = "searchspring" in (parsed.netloc or "")
+
     while True:
-        params: Dict[str, Any] = {
-            "siteId": SEARCHSPRING_SITE_ID,
-            "resultsFormat": "json",
-            "resultsPerPage": 250,
-            "page": page,
-        }
+        params: Dict[str, Any] = dict(base_query)
         params.update(SEARCHSPRING_EXTRA_PARAMS or {})
-        if COLLECTION_URL and "domain" not in params:
-            params["domain"] = COLLECTION_URL
+
+        if is_searchspring_host:
+            if SEARCHSPRING_SITE_ID and not params.get("siteId"):
+                params["siteId"] = SEARCHSPRING_SITE_ID
+            params.setdefault("resultsFormat", "json")
+            params.setdefault("resultsPerPage", 250)
+            if COLLECTION_URL and not params.get("domain"):
+                params["domain"] = COLLECTION_URL
+        elif SEARCHSPRING_SITE_ID and not params.get("siteId"):
+            params["siteId"] = SEARCHSPRING_SITE_ID
+
+        params["page"] = page
 
         logger.info("Fetching Searchspring page %s", page)
         try:
-            response = session.get(base_url, params=params, timeout=REQUEST_TIMEOUT, verify=False)
+            response = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT, verify=False)
         except requests.RequestException as exc:
             logger.warning("Searchspring request failed on page %s: %s", page, exc)
             break
