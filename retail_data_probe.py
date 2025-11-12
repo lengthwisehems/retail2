@@ -58,125 +58,6 @@ DEFAULT_GRAPHQL_VERSIONS = [
     "api/2023-04/graphql.json",
 ]
 
-COLLECTION_QUERY = """
-query CollectionProducts($handle: String!, $cursor: String, $pageSize: Int!) {
-  collection(handle: $handle) {
-    id
-    handle
-    title
-    products(first: $pageSize, after: $cursor) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      edges {
-        cursor
-        node {
-          id
-          handle
-          title
-          description
-          descriptionHtml
-          productType
-          tags
-          vendor
-          onlineStoreUrl
-          createdAt
-          updatedAt
-          publishedAt
-          totalInventory
-          featuredImage {
-            url
-            altText
-          }
-          images(first: 20) {
-            edges {
-              cursor
-              node {
-                url
-                altText
-              }
-            }
-          }
-          options {
-            id
-            name
-            values
-          }
-          collections(first: 10) {
-            edges {
-              cursor
-              node {
-                id
-                handle
-                title
-              }
-            }
-          }
-          metafields(first: 20) {
-            edges {
-              cursor
-              node {
-                namespace
-                key
-                value
-                type
-              }
-            }
-          }
-          variants(first: 100) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            edges {
-              cursor
-              node {
-                id
-                title
-                sku
-                barcode
-                availableForSale
-                currentlyNotInStock
-                quantityAvailable
-                requiresShipping
-                selectedOptions {
-                  name
-                  value
-                }
-                price {
-                  amount
-                  currencyCode
-                }
-                compareAtPrice {
-                  amount
-                  currencyCode
-                }
-                image {
-                  url
-                  altText
-                }
-                metafields(first: 10) {
-                  edges {
-                    cursor
-                    node {
-                      namespace
-                      key
-                      value
-                      type
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
 FALLBACK_COLLECTION_QUERY = """
 query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
   collection(handle: $handle) {
@@ -194,7 +75,6 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
           id
           handle
           title
-          description
           productType
           tags
           vendor
@@ -217,120 +97,6 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
                 price {
                   amount
                   currencyCode
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
-PRODUCTS_QUERY = """
-query ProductsProbe($cursor: String, $pageSize: Int!, $query: String) {
-  products(first: $pageSize, after: $cursor, query: $query) {
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-    edges {
-      cursor
-      node {
-        id
-        handle
-        title
-        description
-        descriptionHtml
-        productType
-        tags
-        vendor
-        onlineStoreUrl
-        createdAt
-        updatedAt
-        publishedAt
-        totalInventory
-        featuredImage {
-          url
-          altText
-        }
-        images(first: 20) {
-          edges {
-            cursor
-            node {
-              url
-              altText
-            }
-          }
-        }
-        options {
-          id
-          name
-          values
-        }
-        collections(first: 10) {
-          edges {
-            cursor
-            node {
-              id
-              handle
-              title
-            }
-          }
-        }
-        metafields(first: 20) {
-          edges {
-            cursor
-            node {
-              namespace
-              key
-              value
-              type
-            }
-          }
-        }
-        variants(first: 100) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          edges {
-            cursor
-            node {
-              id
-              title
-              sku
-              barcode
-              availableForSale
-              currentlyNotInStock
-              quantityAvailable
-              requiresShipping
-              selectedOptions {
-                name
-                value
-              }
-              price {
-                amount
-                currencyCode
-              }
-              compareAtPrice {
-                amount
-                currencyCode
-              }
-              image {
-                url
-                altText
-              }
-              metafields(first: 10) {
-                edges {
-                  cursor
-                  node {
-                    namespace
-                    key
-                    value
-                    type
-                  }
                 }
               }
             }
@@ -389,6 +155,53 @@ query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
 """
 
 SHOP_PROBE_QUERY = "query { shop { name primaryDomain { url } } }"
+
+INTROSPECTION_QUERY = """
+query ($typeName: String!) {
+  __type(name: $typeName) {
+    name
+    fields {
+      name
+      args {
+        name
+        defaultValue
+        type {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+              ofType {
+                kind
+                name
+              }
+            }
+          }
+        }
+      }
+      type {
+        kind
+        name
+        ofType {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -474,6 +287,27 @@ def flatten_record(record: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in record.items():
         flat.update(flatten_value(value, key))
     return flat
+
+
+def unwrap_type(type_info: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], Tuple[str, ...]]:
+    wrappers: List[str] = []
+    current = type_info
+    while current and current.get("kind") in {"NON_NULL", "LIST"}:
+        wrappers.append(current["kind"])
+        current = current.get("ofType")
+    kind = current.get("kind") if current else None
+    name = current.get("name") if current else None
+    return kind, name, tuple(wrappers)
+
+
+def field_has_required_args(field: Dict[str, Any]) -> bool:
+    for arg in field.get("args", []):
+        kind, _name, wrappers = unwrap_type(arg.get("type"))
+        if "NON_NULL" in wrappers and arg.get("defaultValue") in (None, "null"):
+            return True
+        if kind == "NON_NULL" and arg.get("defaultValue") in (None, "null"):
+            return True
+    return False
 
 
 def write_sheet(
@@ -742,6 +576,269 @@ def perform_graphql_request(
     return response, data
 
 
+class GraphQLIntrospectionError(RuntimeError):
+    pass
+
+
+class GraphQLSchema:
+    def __init__(
+        self,
+        session: requests.Session,
+        endpoint: str,
+        token: Optional[str],
+        logger: logging.Logger,
+    ) -> None:
+        self.session = session
+        self.endpoint = endpoint
+        self.token = token
+        self.logger = logger
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def get_type(self, type_name: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not type_name:
+            return None
+        if type_name in self._cache:
+            return self._cache[type_name]
+
+        payload = {"query": INTROSPECTION_QUERY, "variables": {"typeName": type_name}}
+        response, data = perform_graphql_request(
+            self.session, self.endpoint, payload, self.token
+        )
+        if response is None or not response.ok:
+            raise GraphQLIntrospectionError(
+                f"Introspection request failed for {type_name}: {getattr(response, 'status_code', 'error')}"
+            )
+        type_info = ((data or {}).get("data") or {}).get("__type") if data else None
+        if not type_info:
+            raise GraphQLIntrospectionError(f"Type {type_name} not found during introspection")
+        self._cache[type_name] = type_info
+        return type_info
+
+
+class GraphQLQueryBuilder:
+    DEFAULT_CONNECTION_LIMITS: Dict[str, int] = {
+        "variants": GRAPHQL_PAGE_SIZE,
+        "images": 50,
+        "media": 50,
+        "collections": 50,
+        "components": 100,
+        "groupedBy": 100,
+        "quantityPriceBreaks": 100,
+        "sellingPlanAllocations": 100,
+        "sellingPlanGroups": 50,
+        "storeAvailability": 100,
+    }
+
+    def __init__(
+        self,
+        session: requests.Session,
+        endpoint: str,
+        token: Optional[str],
+        logger: logging.Logger,
+        *,
+        max_depth: int = 3,
+    ) -> None:
+        self.session = session
+        self.endpoint = endpoint
+        self.token = token
+        self.logger = logger
+        self.max_depth = max_depth
+        self.schema = GraphQLSchema(session, endpoint, token, logger)
+        self.product_selection = self._build_type_selection("Product", max_depth)
+        if not self.product_selection:
+            raise GraphQLIntrospectionError("Unable to build product selection set")
+        self.collection_query = self._build_collection_query()
+        self.products_query = self._build_products_query()
+
+    def _indent(self, text: str, spaces: int = 2) -> str:
+        pad = " " * spaces
+        return "\n".join(f"{pad}{line}" if line else pad for line in text.splitlines())
+
+    def _should_include_field(self, parent_type: str, field: Dict[str, Any]) -> bool:
+        name = field.get("name")
+        if not name or name.startswith("__"):
+            return False
+        if field_has_required_args(field):
+            return False
+        if parent_type == "ProductVariant" and name == "product":
+            return False
+        if name in {"sellingPlanGroups", "sellingPlanAllocations"}:
+            return False
+        return True
+
+    def _build_field_args(self, field: Dict[str, Any]) -> str:
+        args = []
+        arg_index = {arg.get("name"): arg for arg in field.get("args", [])}
+        if "first" in arg_index:
+            limit = self.DEFAULT_CONNECTION_LIMITS.get(field.get("name", ""), GRAPHQL_PAGE_SIZE)
+            args.append(f"first: {limit}")
+        return f"({', '.join(args)})" if args else ""
+
+    def _build_scalar_snapshot(self, type_name: str) -> str:
+        type_info = self.schema.get_type(type_name)
+        if not type_info:
+            return ""
+        scalars: List[str] = []
+        for field in type_info.get("fields", []):
+            if not self._should_include_field(type_name, field):
+                continue
+            kind, _name, _wrappers = unwrap_type(field.get("type"))
+            if kind in {"SCALAR", "ENUM"}:
+                scalars.append(field.get("name"))
+        return "\n".join(scalars)
+
+    def _build_connection_body(
+        self,
+        connection_name: str,
+        depth: int,
+        visited: Sequence[str],
+        parent_type: Optional[str],
+    ) -> str:
+        type_info = self.schema.get_type(connection_name)
+        if not type_info or depth <= 0:
+            return ""
+
+        lines: List[str] = []
+        for field in type_info.get("fields", []):
+            fname = field.get("name")
+            if fname == "pageInfo":
+                lines.append("pageInfo {\n  hasNextPage\n  endCursor\n}")
+            elif fname == "edges":
+                base_kind, edge_type_name, _ = unwrap_type(field.get("type"))
+                if base_kind != "OBJECT" or not edge_type_name:
+                    continue
+                edge_info = self.schema.get_type(edge_type_name)
+                if not edge_info:
+                    continue
+                edge_lines: List[str] = []
+                for edge_field in edge_info.get("fields", []):
+                    ename = edge_field.get("name")
+                    if ename == "cursor":
+                        edge_lines.append("cursor")
+                    elif ename == "node":
+                        node_kind, node_type_name, _ = unwrap_type(edge_field.get("type"))
+                        if node_kind != "OBJECT" or not node_type_name:
+                            continue
+                        if node_type_name in visited:
+                            node_body = self._build_scalar_snapshot(node_type_name)
+                        else:
+                            node_body = self._build_type_selection(
+                                node_type_name,
+                                depth - 1,
+                                visited=tuple(visited) + (node_type_name,),
+                            )
+                        if not node_body and node_type_name == parent_type:
+                            node_body = self._build_scalar_snapshot(node_type_name)
+                        if node_body:
+                            edge_lines.append(
+                                f"node {{\n{self._indent(node_body)}\n}}"
+                            )
+                if edge_lines:
+                    lines.append(
+                        f"edges {{\n{self._indent('\n'.join(edge_lines))}\n}}"
+                    )
+        return "\n".join(lines)
+
+    def _build_field_selection(
+        self,
+        parent_type: str,
+        field: Dict[str, Any],
+        depth: int,
+        visited: Sequence[str],
+    ) -> Optional[str]:
+        name = field.get("name")
+        if not self._should_include_field(parent_type, field):
+            return None
+
+        base_kind, base_name, wrappers = unwrap_type(field.get("type"))
+        if base_kind in {"SCALAR", "ENUM"}:
+            return name
+        if base_kind == "LIST" and not base_name and wrappers:
+            # List ultimately resolves to another type stored deeper in ofType.
+            inner = field.get("type", {})
+            while inner and inner.get("kind") == "LIST":
+                inner = inner.get("ofType")
+            base_kind, base_name, _ = unwrap_type(inner)
+        if base_kind == "OBJECT" and base_name:
+            if base_name in visited or depth <= 0:
+                return None
+            new_visited = tuple(visited) + (base_name,)
+            if base_name.endswith("Connection"):
+                body = self._build_connection_body(
+                    base_name, depth, new_visited, parent_type=parent_type
+                )
+            else:
+                body = self._build_type_selection(base_name, depth, visited=new_visited)
+            if not body:
+                return None
+            args = self._build_field_args(field)
+            return f"{name}{args} {{\n{self._indent(body)}\n}}"
+        return None
+
+    def _build_type_selection(
+        self,
+        type_name: str,
+        depth: int,
+        *,
+        visited: Sequence[str] = (),
+    ) -> str:
+        if depth <= 0 or type_name in visited:
+            return ""
+        type_info = self.schema.get_type(type_name)
+        if not type_info:
+            return ""
+
+        new_visited = tuple(visited) + (type_name,)
+        selections: List[str] = []
+        for field in type_info.get("fields", []):
+            selection = self._build_field_selection(type_name, field, depth - 1, new_visited)
+            if selection:
+                selections.append(selection)
+        return "\n".join(selections)
+
+    def _build_collection_query(self) -> str:
+        product_block = self._indent(self.product_selection)
+        return (
+            "query CollectionProducts($handle: String!, $cursor: String, $pageSize: Int!) {\n"
+            "  collection(handle: $handle) {\n"
+            "    id\n"
+            "    handle\n"
+            "    title\n"
+            "    products(first: $pageSize, after: $cursor) {\n"
+            "      pageInfo {\n"
+            "        hasNextPage\n"
+            "        endCursor\n"
+            "      }\n"
+            "      edges {\n"
+            "        cursor\n"
+            "        node {\n"
+            f"{product_block}\n"
+            "        }\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+
+    def _build_products_query(self) -> str:
+        product_block = self._indent(self.product_selection)
+        return (
+            "query ProductsProbe($cursor: String, $pageSize: Int!, $query: String) {\n"
+            "  products(first: $pageSize, after: $cursor, query: $query) {\n"
+            "    pageInfo {\n"
+            "      hasNextPage\n"
+            "      endCursor\n"
+            "    }\n"
+            "    edges {\n"
+            "      cursor\n"
+            "      node {\n"
+            f"{product_block}\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+
 def probe_graphql_endpoints(
     session: requests.Session,
     endpoints: Sequence[str],
@@ -832,11 +929,19 @@ def collect_storefront_from_collections(
     first_status: Optional[int] = None
     note = ""
 
+    try:
+        builder = GraphQLQueryBuilder(session, endpoint, token, logger)
+    except GraphQLIntrospectionError as exc:
+        logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
+        return [], None, "builder_error"
+
+    query_text = builder.collection_query
+
     for handle in STOREFRONT_COLLECTION_HANDLES:
         cursor: Optional[str] = None
         while True:
             payload = {
-                "query": COLLECTION_QUERY,
+                "query": query_text,
                 "variables": {
                     "handle": handle,
                     "cursor": cursor,
@@ -856,6 +961,15 @@ def collect_storefront_from_collections(
                 errors = (data or {}).get("errors") if data else None
                 return [], first_status, (
                     f"no_collection_data:{len(errors)}" if errors else "no_collection_data"
+                )
+
+            errors = (data or {}).get("errors") if data else None
+            if errors:
+                logger.debug(
+                    "Collection query returned %s errors for handle %s on %s",
+                    len(errors),
+                    handle,
+                    endpoint,
                 )
 
             collection_info = {
@@ -920,9 +1034,17 @@ def collect_storefront_from_products(
     query_string = build_product_query_string()
     first_status: Optional[int] = None
 
+    try:
+        builder = GraphQLQueryBuilder(session, endpoint, token, logger)
+    except GraphQLIntrospectionError as exc:
+        logger.debug("Unable to build products query for %s: %s", endpoint, exc)
+        return [], None, "builder_error"
+
+    query_text = builder.products_query
+
     while True:
         payload = {
-            "query": PRODUCTS_QUERY,
+            "query": query_text,
             "variables": {
                 "cursor": cursor,
                 "pageSize": GRAPHQL_PAGE_SIZE,
@@ -942,6 +1064,14 @@ def collect_storefront_from_products(
             errors = (data or {}).get("errors") if data else None
             return [], first_status, (
                 f"no_products_data:{len(errors)}" if errors else "no_products_data"
+            )
+
+        errors = (data or {}).get("errors") if data else None
+        if errors:
+            logger.debug(
+                "Products query returned %s errors on %s",
+                len(errors),
+                endpoint,
             )
 
         edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
@@ -1202,28 +1332,12 @@ def gather_storefront_data(
         return [], []
 
     provided_token = X_SHOPIFY_STOREFRONT_ACCESS_TOKEN or None
-    access_rows, operational = probe_graphql_endpoints(
-        session, endpoints, provided_token, logger
-    )
+    access_rows, _ = probe_graphql_endpoints(session, endpoints, provided_token, logger)
+    endpoints_to_use = list(dict.fromkeys(endpoints))
 
-    candidate_tokens: List[Tuple[Optional[str], str]] = []
-    if provided_token:
-        candidate_tokens.append((provided_token, "provided_token"))
-
-    discovered = discover_tokens(session, html, logger)
-    for token, source in discovered:
-        candidate_tokens.append((token, source))
-
-    candidate_tokens.append((None, "no_token"))
-
-    tried: set = set()
-    endpoints_to_use = operational or list(endpoints)
-
-    for token, source in candidate_tokens:
-        if (token, source) in tried:
-            continue
-        tried.add((token, source))
-
+    def attempt_with_token(
+        token: Optional[str], source: str
+    ) -> Optional[List[Dict[str, Any]]]:
         for endpoint in endpoints_to_use:
             if STOREFRONT_COLLECTION_HANDLES:
                 rows, status, note = collect_storefront_from_collections(
@@ -1251,7 +1365,35 @@ def gather_storefront_data(
                     endpoint,
                     source,
                 )
-                return rows, access_rows
+                return rows
+        return None
+
+    attempted_sources: set = set()
+
+    if provided_token:
+        result = attempt_with_token(provided_token, "provided_token")
+        attempted_sources.add((provided_token, "provided_token"))
+        if result:
+            return result, access_rows
+
+    discovered_tokens: List[Tuple[Optional[str], str]] = []
+    if html:
+        discovered_tokens.extend(discover_tokens(session, html, logger))
+
+    for token, source in discovered_tokens:
+        if (token, source) in attempted_sources:
+            continue
+        result = attempt_with_token(token, source)
+        attempted_sources.add((token, source))
+        if result:
+            return result, access_rows
+
+    if (None, "no_token") not in attempted_sources:
+        result = attempt_with_token(None, "no_token")
+        attempted_sources.add((None, "no_token"))
+        if result:
+            return result, access_rows
+
     fallback_rows, fallback_entry = fallback_collect_storefront(
         session, endpoints_to_use, logger
     )
