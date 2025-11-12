@@ -58,6 +58,32 @@ DEFAULT_GRAPHQL_VERSIONS = [
     "api/2023-04/graphql.json",
 ]
 
+COLUMN_ORDER_BASE: Tuple[str, ...] = (
+    "product.id",
+    "product.handle",
+    "product.published_at",
+    "product.created_at",
+    "product.title",
+    "product.tags_all",
+    "product.vendor",
+    "product.description",
+    "product.descriptionHtml",
+    "variant.title",
+    "variant.option1",
+    "variant.option2",
+    "variant.option3",
+    "variant.price",
+    "variant.compare_at_price",
+    "variant.available",
+    "variant.quantityAvailable",
+    "product.totalInventory",
+    "variant.id",
+    "variant.sku",
+    "variant.barcode",
+    "product.images[0].src",
+    "product.onlineStoreUrl",
+)
+
 FALLBACK_COLLECTION_QUERY = """
 query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
   collection(handle: $handle) {
@@ -289,6 +315,256 @@ def flatten_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return flat
 
 
+def build_option_columns(options: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    columns: Dict[str, str] = {}
+    aggregate_values: List[str] = []
+    for option in options or []:
+        if not isinstance(option, dict):
+            continue
+        name = str(option.get("name") or "").strip()
+        values = [str(v).strip() for v in option.get("values") or [] if str(v).strip()]
+        if not values:
+            continue
+        joined = ", ".join(values)
+        if name:
+            columns[f"product.options.{name}"] = joined
+        else:
+            aggregate_values.append(joined)
+    if aggregate_values and "product.options" not in columns:
+        columns["product.options"] = ", ".join(aggregate_values)
+    return columns
+
+
+def sanitize_dynamic_header(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z]+", "_", str(value).strip()).strip("_")
+    return cleaned or "value"
+
+
+def apply_name_value_columns(row: Dict[str, Any]) -> None:
+    replacements: Dict[str, Any] = {}
+    to_remove: List[str] = []
+    for key, value in list(row.items()):
+        if not key.endswith(".name"):
+            continue
+        prefix = key[:-5]
+        name_value = str(value).strip()
+        value_key = f"{prefix}.value"
+        if not name_value or value_key not in row:
+            continue
+        new_key = f"{prefix}.{sanitize_dynamic_header(name_value)}"
+        replacements[new_key] = row[value_key]
+        to_remove.extend([key, value_key])
+    for key in to_remove:
+        row.pop(key, None)
+    row.update(replacements)
+
+
+def extract_first_image_src(product: Dict[str, Any]) -> Optional[str]:
+    images = product.get("images")
+    if isinstance(images, list):
+        for item in images:
+            if isinstance(item, dict):
+                src = item.get("src") or item.get("url") or item.get("originalSrc")
+                if src:
+                    return src
+    elif isinstance(images, dict):
+        edges = images.get("edges") or []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            node = edge.get("node")
+            if isinstance(node, dict):
+                src = node.get("src") or node.get("url") or node.get("originalSrc")
+                if src:
+                    return src
+    return None
+
+
+def normalize_money_field(row: Dict[str, Any], base_key: str) -> None:
+    amount_key = f"{base_key}.amount"
+    if base_key not in row and amount_key in row:
+        row[base_key] = row.pop(amount_key)
+    elif amount_key in row and row.get(base_key) == row.get(amount_key):
+        row.pop(amount_key, None)
+
+
+def remove_matching_keys(
+    row: Dict[str, Any], prefixes: Sequence[str], *, allowed: Optional[Sequence[str]] = None
+) -> None:
+    allowed_set = set(allowed or [])
+    for key in list(row.keys()):
+        lowered = key.lower()
+        if "position" in lowered:
+            row.pop(key, None)
+            continue
+        for prefix in prefixes:
+            if key.startswith(prefix) and key not in allowed_set:
+                row.pop(key, None)
+                break
+
+
+def populate_variant_options(row: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
+    if variant is None:
+        return
+    selected = variant.get("selectedOptions") or []
+    for index, option in enumerate(selected):
+        if index >= 3 or not isinstance(option, dict):
+            continue
+        value = option.get("value")
+        if value and not row.get(f"variant.option{index + 1}"):
+            row[f"variant.option{index + 1}"] = value
+
+
+def finalize_common_row(
+    row: Dict[str, Any],
+    product: Dict[str, Any],
+    variant: Optional[Dict[str, Any]],
+    *,
+    source: str,
+) -> None:
+    tags = product.get("tags") or []
+    if isinstance(tags, list) and tags:
+        row["product.tags_all"] = ", ".join(str(tag) for tag in tags if str(tag))
+    for key in list(row.keys()):
+        if key.startswith("product.tags["):
+            row.pop(key, None)
+
+    option_columns = build_option_columns(product.get("options") or [])
+    for key, value in option_columns.items():
+        row[key] = value
+
+    image_src = extract_first_image_src(product)
+    if image_src:
+        row["product.images[0].src"] = image_src
+
+    remove_matching_keys(
+        row,
+        [
+            "product.images[",
+            "product.images.edges",
+            "product.media.edges",
+            "product.collections.edges",
+            "product.options[",
+            "variant.selectedOptions[",
+            "variant.featured_image",
+        ],
+        allowed=["product.images[0].src", "variant.featured_image.src"],
+    )
+
+    normalize_money_field(row, "variant.price")
+    normalize_money_field(row, "variant.compare_at_price")
+
+    if "product.totalInventory" not in row:
+        for candidate in ("product.total_inventory",):
+            if candidate in row:
+                row["product.totalInventory"] = row.pop(candidate)
+                break
+
+    if "variant.available" not in row:
+        for candidate in (
+            "variant.availableForSale",
+            "variant.available_for_sale",
+            "variant.available_for_sale?",
+        ):
+            if candidate in row:
+                row["variant.available"] = row.pop(candidate)
+                break
+
+    if "variant.quantityAvailable" not in row:
+        for candidate in (
+            "variant.quantity_available",
+            "variant.inventory_quantity",
+        ):
+            if candidate in row:
+                row["variant.quantityAvailable"] = row.pop(candidate)
+                break
+
+    populate_variant_options(row, variant)
+
+    apply_name_value_columns(row)
+
+    if source == "storefront":
+        if "product.publishedAt" in row and "product.published_at" not in row:
+            row["product.published_at"] = row.pop("product.publishedAt")
+        if "product.createdAt" in row and "product.created_at" not in row:
+            row["product.created_at"] = row.pop("product.createdAt")
+        if variant and "availableForSale" in variant and "variant.available" not in row:
+            row["variant.available"] = variant.get("availableForSale")
+    else:
+        if "product.published_at" not in row and "product_published_at" in row:
+            row["product.published_at"] = row.get("product_published_at")
+        if "product_published_at" in row:
+            row.pop("product_published_at", None)
+        if "product.body_html" in row:
+            row.setdefault("product.descriptionHtml", row["product.body_html"])
+            row.setdefault("product.description", row["product.body_html"])
+            row.pop("product.body_html", None)
+
+    if "variant.compare_at_price" not in row and variant is not None:
+        compare_candidates = (
+            variant.get("compareAtPrice"),
+            variant.get("compare_at_price"),
+        )
+        for candidate in compare_candidates:
+            if isinstance(candidate, dict):
+                amount = candidate.get("amount")
+                if amount is not None:
+                    row["variant.compare_at_price"] = amount
+                    break
+            elif candidate not in (None, ""):
+                row["variant.compare_at_price"] = candidate
+                break
+
+    if "variant.price" not in row and variant is not None:
+        price_candidates = (
+            variant.get("price"),
+            variant.get("priceV2"),
+        )
+        for candidate in price_candidates:
+            if isinstance(candidate, dict):
+                amount = candidate.get("amount")
+                if amount is not None:
+                    row["variant.price"] = amount
+                    break
+            elif candidate not in (None, ""):
+                row["variant.price"] = candidate
+                break
+
+    if variant is not None:
+        for idx in range(1, 4):
+            option_key = f"option{idx}"
+            alt_key = f"variant.{option_key}"
+            if alt_key not in row and option_key in variant:
+                row[alt_key] = variant.get(option_key)
+
+
+def finalize_json_row(row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
+    finalize_common_row(row, product, variant, source="json")
+
+
+def finalize_storefront_row(
+    row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]
+) -> None:
+    finalize_common_row(row, product, variant, source="storefront")
+
+
+def build_column_order(
+    rows: List[Dict[str, Any]],
+    *,
+    extra_priority: Optional[Sequence[str]] = None,
+) -> List[str]:
+    all_columns = {key for row in rows for key in row.keys()}
+    ordered = list(COLUMN_ORDER_BASE)
+    priority: List[str] = []
+    if extra_priority:
+        for column in extra_priority:
+            if column not in ordered and column in all_columns:
+                priority.append(column)
+    extras = [col for col in all_columns if col not in COLUMN_ORDER_BASE and col not in priority]
+    extras.sort()
+    return ordered + priority + extras
+
+
 def unwrap_type(type_info: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], Tuple[str, ...]]:
     wrappers: List[str] = []
     current = type_info
@@ -429,37 +705,67 @@ def fetch_collection_json(
     rows: List[Dict[str, Any]] = []
     tag_group_counts: Counter[str] = Counter()
     for product in all_products:
+        if not isinstance(product, dict):
+            continue
         product_copy = dict(product)
         tags = list(product_copy.pop("tags", []) or [])
         variants = list(product_copy.get("variants", []) or [])
         product_copy.pop("variants", None)
 
+        options = list(product.get("options") or [])
+        option_columns = build_option_columns(options)
+
+        images = product_copy.get("images") or []
+        first_image_src = None
+        if isinstance(images, list) and images:
+            first_image = images[0]
+            if isinstance(first_image, dict):
+                first_image_src = (
+                    first_image.get("src")
+                    or first_image.get("url")
+                    or first_image.get("originalSrc")
+                )
+        if first_image_src:
+            product_copy["images"] = [{"src": first_image_src}]
+        elif "images" in product_copy:
+            product_copy["images"] = []
+
         flat_product = flatten_record({"product": product_copy})
+        base_row = dict(flat_product)
         if tags:
-            flat_product["product.tags_all"] = ", ".join(tags)
+            base_row["product.tags_all"] = ", ".join(tags)
+        for key, value in option_columns.items():
+            base_row[key] = value
 
         tag_groups = group_tags_for_columns(tags)
 
-        if not variants:
-            row = dict(flat_product)
+        def attach_tag_groups(target_row: Dict[str, Any]) -> None:
             for column_name, tag_values in tag_groups.items():
                 joined = ", ".join(tag_values)
-                row[column_name] = joined
+                target_row[column_name] = joined
                 if joined:
                     tag_group_counts[column_name] += 1
+
+        if not variants:
+            row = dict(base_row)
+            attach_tag_groups(row)
+            finalize_json_row(row, product, None)
             rows.append(row)
             continue
 
         for variant in variants:
+            if not isinstance(variant, dict):
+                continue
             variant_copy = dict(variant)
+            featured = variant_copy.get("featured_image")
+            if isinstance(featured, dict):
+                src = featured.get("src") or featured.get("url")
+                variant_copy["featured_image"] = {"src": src} if src else {}
             flat_variant = flatten_record({"variant": variant_copy})
-            row = dict(flat_product)
+            row = dict(base_row)
             row.update(flat_variant)
-            for column_name, tag_values in tag_groups.items():
-                joined = ", ".join(tag_values)
-                row[column_name] = joined
-                if joined:
-                    tag_group_counts[column_name] += 1
+            attach_tag_groups(row)
+            finalize_json_row(row, product, variant)
             rows.append(row)
 
     if not rows:
@@ -469,22 +775,7 @@ def fetch_collection_json(
     tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
     tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
 
-    base_columns = [col for col in columns if col not in tag_group_columns]
-    base_columns.sort()
-
-    insert_after = None
-    for candidate in ("product.published_at", "product_published_at"):
-        if candidate in base_columns:
-            insert_after = candidate
-            break
-
-    if insert_after is not None:
-        idx = base_columns.index(insert_after) + 1
-        column_order = base_columns[:idx] + tag_group_columns + base_columns[idx:]
-    else:
-        column_order = base_columns + tag_group_columns
-
-    return rows, column_order
+    return rows, tag_group_columns
 
 
 def make_absolute(url: str, base: str) -> str:
@@ -644,6 +935,13 @@ class GraphQLQueryBuilder:
         self.logger = logger
         self.max_depth = max_depth
         self.schema = GraphQLSchema(session, endpoint, token, logger)
+        self.variant_selection = self._build_type_selection(
+            "ProductVariant", max(1, max_depth - 1)
+        )
+        if not self.variant_selection:
+            self.variant_selection = self._build_type_selection("ProductVariant", max_depth)
+        if not self.variant_selection:
+            raise GraphQLIntrospectionError("Unable to build variant selection set")
         self.product_selection = self._build_type_selection("Product", max_depth)
         if not self.product_selection:
             raise GraphQLIntrospectionError("Unable to build product selection set")
@@ -750,6 +1048,9 @@ class GraphQLQueryBuilder:
         if not self._should_include_field(parent_type, field):
             return None
 
+        if parent_type == "Product" and name == "variants":
+            return self._build_variants_field(field)
+
         base_kind, base_name, wrappers = unwrap_type(field.get("type"))
         if base_kind in {"SCALAR", "ENUM"}:
             return name
@@ -774,6 +1075,19 @@ class GraphQLQueryBuilder:
             args = self._build_field_args(field)
             return f"{name}{args} {{\n{self._indent(body)}\n}}"
         return None
+
+    def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
+        args = self._build_field_args(field)
+        body = (
+            "pageInfo {\n  hasNextPage\n  endCursor\n}\n"
+            "edges {\n"
+            "  cursor\n"
+            "  node {\n"
+            f"{self._indent(self.variant_selection, 4)}\n"
+            "  }\n"
+            "}"
+        )
+        return f"variants{args} {{\n{self._indent(body)}\n}}"
 
     def _build_type_selection(
         self,
@@ -909,13 +1223,19 @@ def flatten_graphql_product(
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
 
+    option_columns = build_option_columns(product.get("options") or [])
+    for key, value in option_columns.items():
+        row[key] = value
+
     if variant_edge is None:
+        finalize_storefront_row(row, product, None)
         return row
 
     variant = dict(variant_edge.get("node") or {})
     row["variant_edge_cursor"] = variant_edge.get("cursor", "")
     flat_variant = flatten_record({"variant": variant})
     row.update(flat_variant)
+    finalize_storefront_row(row, product, variant)
     return row
 
 
@@ -1412,15 +1732,23 @@ def export_workbook(
     storefront_rows: List[Dict[str, Any]],
     access_rows: List[Dict[str, Any]],
     *,
-    json_column_order: Optional[Sequence[str]] = None,
+    json_priority_columns: Optional[Sequence[str]] = None,
 ) -> Path:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "JSON"
-    write_sheet(sheet, json_rows, column_order=json_column_order)
+    json_columns = (
+        build_column_order(json_rows, extra_priority=json_priority_columns)
+        if json_rows
+        else list(COLUMN_ORDER_BASE)
+    )
+    write_sheet(sheet, json_rows, column_order=json_columns)
 
     storefront_sheet = workbook.create_sheet("Storefront")
-    write_sheet(storefront_sheet, storefront_rows)
+    storefront_columns = (
+        build_column_order(storefront_rows) if storefront_rows else list(COLUMN_ORDER_BASE)
+    )
+    write_sheet(storefront_sheet, storefront_rows, column_order=storefront_columns)
 
     access_sheet = workbook.create_sheet("Storefront_access")
     write_sheet(access_sheet, access_rows)
@@ -1438,13 +1766,13 @@ def main() -> None:
     logger = configure_logging()
     session = build_session()
     html = fetch_collection_html(session, logger)
-    json_rows, json_column_order = fetch_collection_json(session, logger)
+    json_rows, tag_group_columns = fetch_collection_json(session, logger)
     storefront_rows, access_rows = gather_storefront_data(session, html, logger)
     output_path = export_workbook(
         json_rows,
         storefront_rows,
         access_rows,
-        json_column_order=json_column_order,
+        json_priority_columns=tag_group_columns,
     )
     logger.info("Workbook written to %s", output_path.as_posix())
 
