@@ -133,6 +133,7 @@ MEASUREMENT_REPLACEMENTS = {
     "\u00a0": " ",
 }
 MEASUREMENT_UNIT_PATTERN = r"(?:['\"′″”]|inches?|in\.)"
+MEASUREMENT_VALUE_PATTERN = r"\d+(?:\.\d+)?(?:\s+\d/\d+)?"
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
@@ -340,6 +341,23 @@ def clean_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def contains_keyword(text: str, keyword: str) -> bool:
+    if not text or not keyword:
+        return False
+    lowered = text.lower()
+    needle = keyword.lower().strip()
+    if not needle:
+        return False
+    if re.search(r"\s", needle):
+        return needle in lowered
+    pattern = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+    return re.search(pattern, lowered) is not None
+
+
+def contains_any_keyword(text: str, keywords: Set[str]) -> bool:
+    return any(contains_keyword(text, keyword) for keyword in keywords)
+
+
 def parse_date(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -361,9 +379,9 @@ def should_exclude(product: Dict[str, Any]) -> bool:
         or product.get("product_type")
         or ""
     ).lower()
-    if any(keyword in title for keyword in EXCLUDED_TITLE_KEYWORDS):
+    if contains_any_keyword(title, EXCLUDED_TITLE_KEYWORDS):
         return True
-    if any(keyword in product_type for keyword in EXCLUDED_PRODUCT_TYPES):
+    if contains_any_keyword(product_type, EXCLUDED_PRODUCT_TYPES):
         return True
     return False
 
@@ -413,14 +431,48 @@ def extract_numbers_before(label: str, text: Optional[str]) -> List[str]:
     normalized = normalize_measurement_text(text)
     if not normalized:
         return []
-    pattern = rf"(\d+(?:\.\d+)?)\s*(?:{MEASUREMENT_UNIT_PATTERN})?\s*{re.escape(label)}"
-    matches = re.findall(pattern, normalized, flags=re.IGNORECASE)
-    return [format_measure_value(match) for match in matches if match]
+    label_pattern = re.escape(label)
+    colon_pattern = (
+        rf"{label_pattern}\s*:\s*({MEASUREMENT_VALUE_PATTERN})"
+        rf"\s*(?:{MEASUREMENT_UNIT_PATTERN})?"
+    )
+    colon_matches: List[str] = []
+    for match in re.finditer(colon_pattern, normalized, flags=re.IGNORECASE):
+        value = format_measure_value(match.group(1))
+        if value:
+            colon_matches.append(value)
+    if colon_matches:
+        return colon_matches
+    matches_with_pos: List[Tuple[int, str]] = []
+    after_pattern = (
+        rf"{label_pattern}\s*(?:is|=|-)?\s*({MEASUREMENT_VALUE_PATTERN})"
+        rf"\s*(?:{MEASUREMENT_UNIT_PATTERN})?"
+    )
+    for match in re.finditer(after_pattern, normalized, flags=re.IGNORECASE):
+        value = format_measure_value(match.group(1))
+        if value:
+            matches_with_pos.append((match.start(1), value))
+    before_pattern = rf"({MEASUREMENT_VALUE_PATTERN})\s*(?:{MEASUREMENT_UNIT_PATTERN})?\s+{label_pattern}"
+    for match in re.finditer(before_pattern, normalized, flags=re.IGNORECASE):
+        value = format_measure_value(match.group(1))
+        if value:
+            matches_with_pos.append((match.start(1), value))
+    matches_with_pos.sort(key=lambda item: item[0])
+    return [value for _, value in matches_with_pos]
 
 
 def extract_first_number(label: str, text: Optional[str]) -> str:
     matches = extract_numbers_before(label, text)
     return matches[0] if matches else ""
+
+
+def parse_float(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def determine_jean_style(description: str) -> str:
@@ -794,6 +846,10 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 leg_opening = str(nums[-1]).rstrip("0").rstrip(".") if nums else leg_opening
             except ValueError:
                 pass
+        inseam_value = parse_float(inseam)
+        product_type_output = (
+            "Shorts" if inseam_value is not None and inseam_value < 8 else product_type
+        )
         jean_style = determine_jean_style(description)
         product_line = determine_product_line(title, tags)
         inseam_label = determine_inseam_label(title, description, tags)
@@ -850,7 +906,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "Created At": created_at,
                 "Product": clean_text(f"{title} / {color.upper()}" if color else title),
                 "Style Name": title,
-                "Product Type": product_type,
+                "Product Type": product_type_output,
                 "Tags": tags_joined,
                 "Vendor": vendor,
                 "Description": clean_text(description),
