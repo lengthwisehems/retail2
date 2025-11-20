@@ -51,14 +51,8 @@ TOKEN_REGEX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 DEFAULT_GRAPHQL_VERSIONS = [
     "api/2025-10/graphql.json",
-    "api/2024-01/graphql.json",
-    "api/2025-01/graphql.json",
     "api/2025-07/graphql.json",
-    "api/2025-04/graphql.json",
     "api/unstable/graphql.json",
-    "api/2024-04/graphql.json",
-    "api/2023-01/graphql.json",
-    "api/2023-04/graphql.json",
 ]
 
 COLUMN_ORDER_BASE: Tuple[str, ...] = (
