@@ -110,10 +110,38 @@ for Style Id, Handle, Published At, Product, Tags, Vendor, Variant Title (Produc
 - **Edits made to fix repeated scraping failures**: Previously failed when `amodenim.com` DNS lookups broke, and partial runs left product rows missing details. Now uses a shared requests session with fallback host handling, centralized retry logging, and writes CSV output plus a run log resolved from the script directory.
 - **2 versions** As we kept getting errors during the scrape like "(HTTPSConnectionPool(host='amodenim.com', port=443): Max retries exceeded with url: /products/<handle> (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x000002012714A210>: Failed to resolve 'amodenim.com' ([Errno 11001] getaddrinfo failed)"))); sleeping" We will create 2 codes: amo_inventory_with_measurements.py and amo_inventory.py. amo_inventory_with_measurements includes values for Rise, Back Rise, Inseam, and Leg Opening. amo_inventory.py does not pull values for Rise, Back Rise, Inseam, and Leg Opening but does keep the headers on the csv output for layout consistency. amo_inventory.py is run every day with the outputfile name of `AMO_YYYY-MM-DD_HH-MM-SS.csv` while amo_inventory_with_measurements.py is run monthly with a file output name of `AMO_Measurements_YYYY-MM-DD_HH-MM-SS.csv`
 
+## Stipulations for "probe" code creation
+
+### Example files: retail_data_probe.py and retail_data_probe_additional.py
+
+### Excel/Workbook formatting
+- Canonical column order is fixed across sheets: product.id, product.handle, product.published_at, product.created_at, product.title, product.productType, product.tags_all, product.vendor, product.description, product.descriptionHtml, variant.title, variant.option1, variant.option2, variant.option3, variant.price, variant.compare_at_price, variant.available, variant.quantityAvailable, product.totalInventory, variant.id, variant.sku, variant.barcode, product.images[0].src, product.onlineStoreUrl. Any columns not in this list are appended after product.onlineStoreUrl, with optional priority columns inserted ahead of the alphabetical extras.
+- Every product/variant combination is a separate row in JSON, Apps, and Storefront tabs; style-level rows are only used when a product lacks variants.
+- Only the first product image is retained; all other image fields (positions, height/width, IDs, variant_ids, etc.) are dropped. Variant featured_image is collapsed to featured_image.src when present.
+- Option values are concatenated so option values land in a single cell (option1/option2/option3), and Shopify option position fields are removed.
+- Name/value pairs are converted into columns titled with the name while the redundant “name” column is removed.
+- In only the JSON tab, Tags are grouped by prefix (e.g., fit-, denim-, wash-) into tags_group_* columns, joined with commas, and the tag columns are sorted by how frequently they appear so the most common tag groups sit closest to the base columns. This should not be done for Graphql or any other Apps
+- Put the output for each source (JSON, Graphql, Globo, Rebuyengine, Restock, Avada, bundler.app, postscript etc) in its own tab and make the tab label the name of the app
+
+### GraphQL behavior
+- X_SHOPIFY_STOREFRONT_ACCESS_TOKEN may be a single string or a list; tokens are normalized (trimmed, deduplicated, order preserved) before use.
+- Provided tokens are probed first against all configured GraphQL endpoints via a lightweight shop query; only endpoints that return OK with a given token are used for full collection/product pulls. Probes and outcomes are recorded in the Storefront_access sheet. If fields: {'Product': ['totalInventory'], 'ProductVariant': ['quantityAvailable']} are made available with the given token, stop token discovery and reuse that token for data collection.
+- After provided tokens, any tokens discovered in HTML/script content are probed and, if successful, reused for data collection. If no token works, the script attempts unauthenticated calls, then falls back to simplified collection/product queries that exclude restricted fields.
+- When STOREFRONT_COLLECTION_HANDLES is set, collection-based pagination is used; otherwise a products query runs. Variant connections are normalized so nodes or edges are both accepted, and forbidden fields (selling plan allocations, groupedBy, components, etc.) are stripped to avoid scope errors.
+- Successful Storefront pulls populate the Storefront tab with per-variant rows following the canonical column order. Access attempts (endpoint, token source, status, success flag, notes) are always written to the Storefront_access tab, even when only fallback/unauthenticated data is available.
+
+### App-specific output guidance (Globo, Rebuy, Searchspring etc)
+- Scope: These rules govern helper probes that capture third-party app payloads (e.g., Globo filter JSONP, Rebuy custom widgets, Searchspring search feeds etc) when those feeds are exported alongside Shopify data in the probe workbook.
+- Column inclusion: Always start from the canonical product/variant columns above. Add app-specific fields only when they carry product- or variant-level values (inventory counts, source collection/placement, badge text, merchandising tags, title). Exclude transport-only metadata such as signatures, analytics beacons, widget titles, or pagination cursors unless they directly explain a data value. If any cache keys, tokens, or access codes are discovered that fit the regex of \b[0-9a-f]{32}\b add it to the list of tokens discovered in HTML/script and try it against all configured GraphQL endpoints via a lightweight shop query.
+- Recursion/flattening: Walk nested dictionaries/arrays to capture all product/variant fields; serialize complex substructures only when the keys describe the SKU (e.g., custom size attributes). Drop wrapper layers that exist solely for transport (callbacks, response envelopes, pagination cursors).
+- Relevance filter: Before adding a field, ask whether it describes the product/variant itself (identifier, merchandising attributes, inventory, pricing, URLs, tags, title). If it only explains how the app delivered the data (timing, experiment IDs, request context), omit it. Keep the schema portable so brand-specific, app-specific columns can be appended after the base order without breaking downstream formulas.
+- Prefer stable payloads such as metadata.input_products over volatile recommendation lists.
+- Capture per-variant blocks regardless of whether they arrive under edges, nodes, or custom variant arrays.
 
 ## Maintenance checklist
 
 - Always sanity-check the latest CSV to ensure all values are filled.
+- Always test the code before sharing
 - If a network vendor blocks scripted access, capture raw JSON (e.g., from DevTools) so we can build offline fixtures.
 - When adding a new brand, replicate the shared directory/log scaffolding and document the mapping in this file.
 - If a site migrates or the API schema changes, update the relevant section here so future maintainers know which fallbacks exist and what was tried previously.
