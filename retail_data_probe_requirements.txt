@@ -1,0 +1,16 @@
+retail_data_probe.py output and GraphQL stipulations
+
+Excel/Workbook formatting
+- Canonical column order is fixed across sheets: product.id, product.handle, product.published_at, product.created_at, product.title, product.productType, product.tags_all, product.vendor, product.description, product.descriptionHtml, variant.title, variant.option1, variant.option2, variant.option3, variant.price, variant.compare_at_price, variant.available, variant.quantityAvailable, product.totalInventory, variant.id, variant.sku, variant.barcode, product.images[0].src, product.onlineStoreUrl. Any columns not in this list are appended after product.onlineStoreUrl, with optional priority columns inserted ahead of the alphabetical extras.
+- Every product/variant combination is a separate row in JSON, SearchSpring, and Storefront tabs; style-level rows are only used when a product lacks variants.
+- Only the first product image is retained; all other image fields (positions, height/width, IDs, variant_ids, etc.) are dropped. Variant featured_image is collapsed to featured_image.src when present.
+- Option values are concatenated so option values land in a single cell (option1/option2/option3), and Shopify option position fields are removed.
+- Name/value pairs are converted into columns titled with the name while the redundant “name” column is removed.
+- Tags are grouped by prefix (e.g., fit-, denim-, wash-) into tags_group_* columns, joined with commas, and the tag columns are sorted by how frequently they appear so the most common tag groups sit closest to the base columns.
+
+GraphQL behavior
+- X_SHOPIFY_STOREFRONT_ACCESS_TOKEN may be a single string or a list; tokens are normalized (trimmed, deduplicated, order preserved) before use.
+- Provided tokens are probed first against all configured GraphQL endpoints via a lightweight shop query; only endpoints that return OK with a given token are used for full collection/product pulls. Probes and outcomes are recorded in the Storefront_access sheet.
+- After provided tokens, any tokens discovered in HTML/script content are probed and, if successful, reused for data collection. If no token works, the script attempts unauthenticated calls, then falls back to simplified collection/product queries that exclude restricted fields.
+- When STOREFRONT_COLLECTION_HANDLES is set, collection-based pagination is used; otherwise a products query runs. Variant connections are normalized so nodes or edges are both accepted, and forbidden fields (selling plan allocations, groupedBy, components, etc.) are stripped to avoid scope errors.
+- Successful Storefront pulls populate the Storefront tab with per-variant rows following the canonical column order. Access attempts (endpoint, token source, status, success flag, notes) are always written to the Storefront_access tab, even when only fallback/unauthenticated data is available.
