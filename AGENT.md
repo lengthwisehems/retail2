@@ -1,3 +1,4 @@
+<!-- Synced from upstream AGENT.md at commit 202046fe3641f4f2ad46401ea03c06422c890d66 -->
 # Inventory Scraping Playbook
 
 This document captures the conventions and brand-specific notes for the denim inventory scrapers maintained in this repository. It is intended to let a new contributor ramp quickly, understand where each CSV field comes from, and avoid breaking the existing data paths.

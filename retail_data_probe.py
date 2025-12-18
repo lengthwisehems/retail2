@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
@@ -31,6 +32,7 @@ STOREFRONT_COLLECTION_HANDLES: List[str] = ["denim"]
 SEARCHSPRING_SITE_ID = ""
 SEARCHSPRING_URL = ""
 SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -92,6 +94,27 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
         "storeAvailability",
     }
 }
+
+
+def parse_metafield_identifiers(raw: str) -> List[Tuple[str, str]]:
+    identifiers: List[Tuple[str, str]] = []
+    if not raw:
+        return identifiers
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    seen: Set[Tuple[str, str]] = set()
+    for part in parts:
+        if ":" not in part:
+            continue
+        namespace, key = part.split(":", 1)
+        namespace = namespace.strip()
+        key = key.strip()
+        if not namespace or not key:
+            continue
+        tup = (namespace, key)
+        if tup not in seen:
+            identifiers.append(tup)
+            seen.add(tup)
+    return identifiers
 
 
 def normalize_tokens(value: Any) -> List[str]:
@@ -172,16 +195,32 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
 }
 """
 
-FALLBACK_PRODUCTS_QUERY = """
-query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
-  products(first: $pageSize, after: $cursor, query: $query) {
-    pageInfo {
+def build_metafields_selection() -> str:
+    if not METAFIELD_IDENTIFIERS:
+        return ""
+    identifiers_literal = ", ".join(
+        f'{{namespace: "{ns}", key: "{key}"}}' for ns, key in METAFIELD_IDENTIFIERS
+    )
+    return (
+        "metafields(identifiers: ["
+        + identifiers_literal
+        + "]) {\n  namespace\n  key\n  type\n  value\n}"
+    )
+
+
+def build_fallback_products_query() -> str:
+    metafields_selection = build_metafields_selection()
+    metafields_block = f"\n        {metafields_selection}" if metafields_selection else ""
+    return f"""
+query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {{
+  products(first: $pageSize, after: $cursor, query: $query) {{
+    pageInfo {{
       hasNextPage
       endCursor
-    }
-    edges {
+    }}
+    edges {{
       cursor
-      node {
+      node {{
         id
         handle
         title
@@ -193,29 +232,42 @@ query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
         createdAt
         updatedAt
         publishedAt
-        variants(first: 100) {
-          pageInfo {
+        collections(first: 50) {{
+          edges {{
+            node {{
+              id
+              handle
+              title
+            }}
+          }}
+        }}
+        options {{
+          name
+          values
+        }}{metafields_block}
+        variants(first: 100) {{
+          pageInfo {{
             hasNextPage
             endCursor
-          }
-          edges {
+          }}
+          edges {{
             cursor
-            node {
+            node {{
               id
               title
               sku
               availableForSale
-              price {
+              price {{
                 amount
                 currencyCode
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
 """
 
 SHOP_PROBE_QUERY = "query { shop { name primaryDomain { url } } }"
@@ -266,6 +318,47 @@ query ($typeName: String!) {
   }
 }
 """
+
+FILTER_PROBE_QUERIES = [
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      filters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      productFilters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+]
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -638,6 +731,111 @@ def finalize_storefront_row(
     finalize_common_row(row, product, variant, source="storefront")
 
 
+def extract_collections(product: Dict[str, Any], collection_info: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    handles: List[str] = []
+    titles: List[str] = []
+    collections = product.get("collections")
+    if isinstance(collections, dict):
+        edges = collections.get("edges") or []
+        nodes = collections.get("nodes") or []
+        if nodes:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+        elif edges:
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+
+    fallback_handle = collection_info.get("collection_handle")
+    fallback_title = collection_info.get("collection_title")
+    if fallback_handle and fallback_handle not in handles:
+        handles.append(fallback_handle)
+    if fallback_title and fallback_title not in titles:
+        titles.append(fallback_title)
+    return handles, titles
+
+
+def collect_metafields(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metafields: List[Dict[str, Any]] = []
+    raw_metafields = product.get("metafields")
+    if isinstance(raw_metafields, list):
+        for mf in raw_metafields:
+            if isinstance(mf, dict):
+                metafields.append(
+                    {
+                        "namespace": mf.get("namespace"),
+                        "key": mf.get("key"),
+                        "type": mf.get("type"),
+                        "value": mf.get("value"),
+                    }
+                )
+    elif isinstance(raw_metafields, dict):
+        # Support alias-based selections like mf_0: metafield(...)
+        for value in raw_metafields.values():
+            if isinstance(value, dict):
+                metafields.append(
+                    {
+                        "namespace": value.get("namespace"),
+                        "key": value.get("key"),
+                        "type": value.get("type"),
+                        "value": value.get("value"),
+                    }
+                )
+    return metafields
+
+
+def derive_filter_values(product: Dict[str, Any], metafields: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    filters: Dict[str, Set[str]] = defaultdict(set)
+    product_type = product.get("productType")
+    vendor = product.get("vendor")
+    tags = product.get("tags") or []
+    options = product.get("options") or []
+
+    if product_type:
+        filters["productType"].add(str(product_type))
+    if vendor:
+        filters["vendor"].add(str(vendor))
+    if isinstance(tags, list):
+        for tag in tags:
+            if tag:
+                filters["tags"].add(str(tag))
+
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            name = opt.get("name") or opt.get("title")
+            values = opt.get("values") or []
+            if not name:
+                continue
+            for val in values:
+                if val:
+                    filters[str(name)].add(str(val))
+
+    for mf in metafields:
+        ns = mf.get("namespace")
+        key = mf.get("key")
+        value = mf.get("value")
+        if ns and key and value not in (None, ""):
+            filters[f"{ns}:{key}"].add(str(value))
+
+    return {k: sorted(v) for k, v in filters.items() if v}
+
+
 def build_column_order(
     rows: List[Dict[str, Any]],
     *,
@@ -824,6 +1022,12 @@ def fetch_collection_json(
         options = list(product.get("options") or [])
         option_columns = build_option_columns(options)
 
+        derived_filters = derive_filter_values(product, [])
+        if derived_filters:
+            base_row_filter_values = json.dumps(derived_filters)
+        else:
+            base_row_filter_values = None
+
         images = product_copy.get("images") or []
         first_image_src = None
         if isinstance(images, list) and images:
@@ -843,6 +1047,8 @@ def fetch_collection_json(
         base_row = dict(flat_product)
         if tags:
             base_row["product.tags_all"] = ", ".join(tags)
+        if base_row_filter_values:
+            base_row["filter_values"] = base_row_filter_values
         for key, value in option_columns.items():
             base_row[key] = value
 
@@ -1322,12 +1528,14 @@ class GraphQLQueryBuilder:
         *,
         max_depth: int = 3,
         forbidden_fields: Optional[Dict[str, Sequence[str]]] = None,
+        metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> None:
         self.session = session
         self.endpoint = endpoint
         self.token = token
         self.logger = logger
         self.max_depth = max_depth
+        self.metafield_identifiers = list(metafield_identifiers or METAFIELD_IDENTIFIERS)
         self.forbidden_fields: Dict[str, Set[str]] = defaultdict(set)
         for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
             self.forbidden_fields[parent].update(names)
@@ -1345,6 +1553,11 @@ class GraphQLQueryBuilder:
         self.product_selection = self._build_type_selection("Product", max_depth)
         if not self.product_selection:
             raise GraphQLIntrospectionError("Unable to build product selection set")
+        metafields_selection = self._build_metafields_selection()
+        if metafields_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, metafields_selection] if part
+            )
         self.collection_query = self._build_collection_query()
         self.products_query = self._build_products_query()
 
@@ -1479,6 +1692,49 @@ class GraphQLQueryBuilder:
             args = self._build_field_args(field)
             return f"{name}{args} {{\n{self._indent(body)}\n}}"
         return None
+
+    def _build_metafields_selection(self) -> str:
+        if not self.metafield_identifiers:
+            return ""
+
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        metafields_field = next(
+            (field for field in fields if field.get("name") == "metafields"), None
+        )
+        metafield_field = next(
+            (field for field in fields if field.get("name") == "metafield"), None
+        )
+
+        selection_body = "namespace\nkey\ntype\nvalue"
+        identifiers_literal = ", ".join(
+            f'{{namespace: "{ns}", key: "{key}"}}'
+            for ns, key in self.metafield_identifiers
+        )
+
+        if metafields_field and any(arg.get("name") == "identifiers" for arg in metafields_field.get("args", [])):
+            return (
+                "metafields(identifiers: ["
+                + identifiers_literal
+                + f"]) {{\n  {selection_body}\n}}"
+            )
+
+        if metafield_field and all(
+            any(arg.get("name") == name for arg in metafield_field.get("args", []))
+            for name in ("namespace", "key")
+        ):
+            lines: List[str] = []
+            for idx, (ns, key) in enumerate(self.metafield_identifiers):
+                alias = f"mf_{idx}"
+                lines.append(
+                    f"{alias}: metafield(namespace: \"{ns}\", key: \"{key}\") {{\n  {selection_body}\n}}"
+                )
+            return "\n".join(lines)
+
+        self.logger.debug(
+            "Metafields selection not added; schema lacks identifiers/namespace+key support"
+        )
+        return ""
 
     def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
         args = self._build_field_args(field)
@@ -1623,6 +1879,54 @@ def apply_tag_filter(product: Dict[str, Any]) -> bool:
     return GRAPHQL_FILTER_TAG.lower() in lowered
 
 
+def probe_collection_filters(
+    session: requests.Session,
+    endpoint: str,
+    token: Optional[str],
+    handle: str,
+    logger: logging.Logger,
+) -> Dict[str, List[str]]:
+    for query in FILTER_PROBE_QUERIES:
+        payload = {"query": query, "variables": {"handle": handle}}
+        response, data = perform_graphql_request(session, endpoint, payload, token)
+        if response is None or not response.ok:
+            continue
+
+        filters_block = None
+        collection = ((data or {}).get("data") or {}).get("collection") if data else None
+        if isinstance(collection, dict):
+            products = collection.get("products")
+            if isinstance(products, dict):
+                filters_block = products.get("filters") or products.get("productFilters")
+
+        if not filters_block:
+            continue
+
+        filters: Dict[str, List[str]] = {}
+        for fil in filters_block:
+            if not isinstance(fil, dict):
+                continue
+            label = fil.get("label") or fil.get("id")
+            values = fil.get("values") or []
+            if not label:
+                continue
+            val_labels: List[str] = []
+            for val in values:
+                if isinstance(val, dict):
+                    if val.get("label"):
+                        val_labels.append(str(val.get("label")))
+                    elif val.get("id"):
+                        val_labels.append(str(val.get("id")))
+            if val_labels:
+                filters[str(label)] = val_labels
+        if filters:
+            logger.info("Discovered %s filter groups for collection %s", len(filters), handle)
+            return filters
+
+    logger.debug("No filters discovered for collection %s", handle)
+    return {}
+
+
 def flatten_graphql_product(
     collection_info: Dict[str, Any],
     edge_cursor: str,
@@ -1631,6 +1935,16 @@ def flatten_graphql_product(
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
     row["products_edge_cursor"] = edge_cursor
+
+    collections_handles, collections_titles = extract_collections(product, collection_info)
+    if collections_handles:
+        row["collections.handle"] = ",".join(collections_handles)
+    if collections_titles:
+        row["collections.title"] = ",".join(collections_titles)
+
+    metafields = collect_metafields(product)
+    if metafields:
+        row["metafields"] = json.dumps(metafields)
 
     product_copy = dict(product)
     variants = product_copy.pop("variants", None)
@@ -1644,6 +1958,21 @@ def flatten_graphql_product(
     option_columns = build_option_columns(product.get("options") or [])
     for key, value in option_columns.items():
         row[key] = value
+
+    collection_filters = collection_info.get("collection_filters") if isinstance(collection_info, dict) else None
+    filter_values = collection_filters or {}
+    derived_filters = derive_filter_values(product, metafields)
+    if derived_filters:
+        merged = dict(filter_values)
+        for k, v in derived_filters.items():
+            if k in merged:
+                existing = set(merged[k]) if isinstance(merged[k], list) else set()
+                merged[k] = sorted(existing.union(set(v)))
+            else:
+                merged[k] = v
+        filter_values = merged
+    if filter_values:
+        row["filter_values"] = json.dumps(filter_values)
 
     if variant_edge is None:
         finalize_storefront_row(row, product, None)
@@ -1677,6 +2006,7 @@ def collect_storefront_from_collections(
                 token,
                 logger,
                 forbidden_fields=forbidden,
+                metafield_identifiers=METAFIELD_IDENTIFIERS,
             )
         except GraphQLIntrospectionError as exc:
             logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
@@ -1686,8 +2016,14 @@ def collect_storefront_from_collections(
         rows: List[Dict[str, Any]] = []
         need_retry = False
         newly_blocked: Dict[str, Set[str]] = defaultdict(set)
+        collection_filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in collection_filters_cache:
+                collection_filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, token, handle, logger
+                )
+            handle_filters = collection_filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -1759,6 +2095,7 @@ def collect_storefront_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
                 products_connection = collection.get("products") or {}
                 edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
@@ -1850,7 +2187,12 @@ def collect_storefront_from_products(
 
     try:
         builder = GraphQLQueryBuilder(
-            session, endpoint, token, logger, forbidden_fields=forbidden
+            session,
+            endpoint,
+            token,
+            logger,
+            forbidden_fields=forbidden,
+            metafield_identifiers=METAFIELD_IDENTIFIERS,
         )
     except GraphQLIntrospectionError as exc:
         logger.debug("Unable to build products query for %s: %s", endpoint, exc)
@@ -1946,8 +2288,14 @@ def fallback_collect_from_collections(
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
         success = True
+        filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in filters_cache:
+                filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, None, handle, logger
+                )
+            handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -1988,6 +2336,7 @@ def fallback_collect_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
 
                 products_connection = collection.get("products") or {}
@@ -2055,10 +2404,11 @@ def fallback_collect_from_products(
         rows: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         first_status: Optional[int] = None
+        fallback_query = build_fallback_products_query()
 
         while True:
             payload = {
-                "query": FALLBACK_PRODUCTS_QUERY,
+                "query": fallback_query,
                 "variables": {
                     "cursor": cursor,
                     "pageSize": GRAPHQL_PAGE_SIZE,
@@ -2307,6 +2657,18 @@ def export_workbook(
 # Main entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Retail data probe")
+    parser.add_argument(
+        "--metafield",
+        dest="metafields",
+        help="Comma-separated list of namespace:key metafields to request via Storefront API",
+        default="",
+    )
+    args = parser.parse_args()
+
+    global METAFIELD_IDENTIFIERS
+    METAFIELD_IDENTIFIERS = parse_metafield_identifiers(args.metafields)
+
     logger = configure_logging()
     session = build_session()
     html = fetch_collection_html(session, logger)
