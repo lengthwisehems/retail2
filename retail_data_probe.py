@@ -1042,19 +1042,16 @@ def write_sheet(
         sheet.append([normalize_cell(row.get(column)) for column in columns])
 
 
-def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> str:
-    url = _primary_collection_url()
-    if not url:
+def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> List[Tuple[str, str]]:
+    urls: List[str] = []
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        urls = [url for url in COLLECTION_URL if url]
+    elif isinstance(COLLECTION_URL, str) and COLLECTION_URL:
+        urls = [COLLECTION_URL]
+
+    if not urls:
         logger.info("No COLLECTION_URL configured; skipping HTML fetch")
-        return ""
-    logger.info("Fetching collection HTML from %s", url)
-    try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as exc:
-        logger.warning("Failed to fetch collection HTML: %s", exc)
-        return ""
+        return []
 
     html_blobs: List[Tuple[str, str]] = []
     for url in urls:
@@ -1065,6 +1062,7 @@ def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> 
             html_blobs.append((url, response.text))
         except requests.RequestException as exc:
             logger.warning("Failed to fetch collection HTML from %s: %s", url, exc)
+
     return html_blobs
 
 def build_products_json_url() -> Optional[str]:
@@ -2917,7 +2915,7 @@ def main() -> None:
     session = build_session()
     global COLLECTION_TITLE_MAP
     COLLECTION_TITLE_MAP = fetch_collection_titles(session, logger)
-    html = fetch_collection_html(session, logger)
+    html_blobs = fetch_collection_html(session, logger)
     json_rows, tag_group_columns = fetch_collection_json(session, logger)
     if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:
         searchspring_rows, searchspring_tag_columns = fetch_searchspring_data(session, logger)
