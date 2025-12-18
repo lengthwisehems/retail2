@@ -22,13 +22,15 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "AMO"
-COLLECTION_URL = "https://www.amodenim.com/collections/denim"
-MYSHOPIFY = "https://amo-denim.myshopify.com"
-GRAPHQL = ""
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ""
+BRAND = "Citizens_of_Humanity"
+COLLECTION_URL = [
+    "https://citizensofhumanity.com/collections/womens-jeans",
+]
+MYSHOPIFY = "citizens-of-humanity.myshopify.com"
+GRAPHQL = "https://citizens-of-humanity.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["a1b87221a13b15123b1c8b79a866f388"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["denim"]
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["womens-jeans"]
 SEARCHSPRING_SITE_ID = ""
 SEARCHSPRING_URL = ""
 SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
@@ -93,6 +95,32 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
         "sellingPlanGroups",
         "storeAvailability",
     }
+}
+
+# Additional fields to skip in queries/outputs
+EXTRA_FORBIDDEN_COLUMNS: Set[str] = {
+    "product.collections.pageInfo.endCursor",
+    "product.collections.pageInfo.hasNextPage",
+    "product.encodedVariantAvailability",
+    "product.encodedVariantExistence",
+    "product.featuredImage.height",
+    "product.featuredImage.thumbhash",
+    "product.featuredImage.width",
+    "product.images.pageInfo.endCursor",
+    "product.images.pageInfo.hasNextPage",
+    "product.isGiftCard",
+    "product.media.pageInfo.endCursor",
+    "product.media.pageInfo.hasNextPage",
+    "products_edge_cursor",
+    "variant.currentlyNotInStock",
+    "variant.image.height",
+    "variant.image.id",
+    "variant.image.thumbhash",
+    "variant.image.width",
+    "variant.quantityRule.minimum",
+    "variant_edge_cursor",
+    "variants_endCursor",
+    "variants_hasNextPage",
 }
 
 
@@ -361,6 +389,12 @@ query FiltersProbe($handle: String!) {
 ]
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _primary_collection_url() -> Optional[str]:
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        return COLLECTION_URL[0] if COLLECTION_URL else None
+    return COLLECTION_URL
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +754,9 @@ def finalize_common_row(
             if alt_key not in row and option_key in variant:
                 row[alt_key] = variant.get(option_key)
 
+    for forbidden in list(EXTRA_FORBIDDEN_COLUMNS):
+        row.pop(forbidden, None)
+
 
 def finalize_json_row(row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
     finalize_common_row(row, product, variant, source="json")
@@ -969,12 +1006,13 @@ def write_sheet(
 
 
 def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> str:
-    if not COLLECTION_URL:
+    url = _primary_collection_url()
+    if not url:
         logger.info("No COLLECTION_URL configured; skipping HTML fetch")
         return ""
-    logger.info("Fetching collection HTML from %s", COLLECTION_URL)
+    logger.info("Fetching collection HTML from %s", url)
     try:
-        response = session.get(COLLECTION_URL, timeout=REQUEST_TIMEOUT, verify=False)
+        response = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
         response.raise_for_status()
         return response.text
     except requests.RequestException as exc:
@@ -983,9 +1021,10 @@ def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> 
 
 
 def build_products_json_url() -> Optional[str]:
-    if not COLLECTION_URL:
+    url = _primary_collection_url()
+    if not url:
         return None
-    parts = urlsplit(COLLECTION_URL)
+    parts = urlsplit(url)
     path = parts.path.rstrip("/") + "/products.json"
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
@@ -1626,9 +1665,14 @@ class GraphQLQueryBuilder:
         if not self.product_selection:
             raise GraphQLIntrospectionError("Unable to build product selection set")
         metafields_selection = self._build_metafields_selection()
+        collections_selection = self._build_collections_selection()
         if metafields_selection:
             self.product_selection = "\n".join(
                 part for part in [self.product_selection, metafields_selection] if part
+            )
+        if collections_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, collections_selection] if part
             )
         self.collection_query = self._build_collection_query()
         self.products_query = self._build_products_query()
@@ -1807,6 +1851,26 @@ class GraphQLQueryBuilder:
             "Metafields selection not added; schema lacks identifiers/namespace+key support"
         )
         return ""
+
+    def _build_collections_selection(self) -> str:
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        collections_field = next(
+            (field for field in fields if field.get("name") == "collections"), None
+        )
+        if not collections_field:
+            return ""
+        args = self._build_field_args(collections_field)
+        body = (
+            "edges {\n"
+            "  node {\n"
+            "    id\n"
+            "    handle\n"
+            "    title\n"
+            "  }\n"
+            "}"
+        )
+        return f"collections{args} {{\n{self._indent(body)}\n}}"
 
     def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
         args = self._build_field_args(field)
@@ -2006,8 +2070,6 @@ def flatten_graphql_product(
     variant_edge: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
-    row["products_edge_cursor"] = edge_cursor
-
     collections_handles, collections_titles = extract_collections(product, collection_info)
     if collections_handles:
         row["collections.handle"] = ",".join(collections_handles)
@@ -2019,11 +2081,17 @@ def flatten_graphql_product(
         row["metafields"] = json.dumps(metafields)
 
     product_copy = dict(product)
+    for drop_key in (
+        "encodedVariantAvailability",
+        "encodedVariantExistence",
+        "featuredImage",
+        "images",
+        "media",
+        "isGiftCard",
+    ):
+        product_copy.pop(drop_key, None)
+    product_copy.pop("collections", None)
     variants = product_copy.pop("variants", None)
-    if isinstance(variants, dict):
-        page_info = variants.get("pageInfo") or {}
-        row["variants_hasNextPage"] = page_info.get("hasNextPage")
-        row["variants_endCursor"] = page_info.get("endCursor")
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
 
@@ -2041,7 +2109,8 @@ def flatten_graphql_product(
         return row
 
     variant = dict(variant_edge.get("node") or {})
-    row["variant_edge_cursor"] = variant_edge.get("cursor", "")
+    for drop_key in ("quantityRule", "image"):
+        variant.pop(drop_key, None)
     flat_variant = flatten_record({"variant": variant})
     row.update(flat_variant)
     finalize_storefront_row(row, product, variant)
