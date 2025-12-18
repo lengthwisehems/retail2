@@ -836,6 +836,82 @@ def derive_filter_values(product: Dict[str, Any], metafields: List[Dict[str, Any
     return {k: sorted(v) for k, v in filters.items() if v}
 
 
+def normalize_filter_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+    return cleaned or "unnamed"
+
+
+FILTER_COLUMN_SKIP = {"producttype", "vendor", "tags"}
+
+
+def build_filter_corpus(product: Dict[str, Any]) -> Tuple[str, Set[str]]:
+    parts: List[str] = []
+    for field in ("handle", "title", "productType", "vendor"):
+        val = product.get(field)
+        if isinstance(val, str):
+            parts.append(val)
+    tags = product.get("tags") or []
+    if isinstance(tags, list):
+        parts.extend([t for t in tags if isinstance(t, str)])
+    options = product.get("options") or []
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            values = opt.get("values") or []
+            for val in values:
+                if val:
+                    parts.append(str(val))
+    combined = " ".join(parts).lower()
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", combined)
+    tokens = {tok for tok in normalized_text.split() if tok}
+    return normalized_text, tokens
+
+
+def select_filters_for_product(
+    collection_filters: Dict[str, List[str]],
+    product: Dict[str, Any],
+    derived_filters: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    final_filters: Dict[str, List[str]] = {}
+    normalized_text, tokens = build_filter_corpus(product)
+
+    for key, values in derived_filters.items():
+        if not values:
+            continue
+        final_filters[key] = list(values)
+
+    for key, candidates in (collection_filters or {}).items():
+        if key in final_filters:
+            continue
+        matches: List[str] = []
+        for candidate in candidates or []:
+            cand_str = str(candidate)
+            cand_norm = re.sub(r"[^a-z0-9]+", " ", cand_str.lower()).strip()
+            if not cand_norm:
+                continue
+            cand_tokens = {tok for tok in cand_norm.split() if tok}
+            if cand_norm in normalized_text or cand_tokens.issubset(tokens):
+                matches.append(cand_str)
+        if not matches and candidates and len(candidates) == 1:
+            matches = [str(candidates[0])]
+        if matches:
+            final_filters[key] = matches
+
+    return final_filters
+
+
+def apply_filter_columns(row: Dict[str, Any], filter_values: Dict[str, List[str]]) -> None:
+    for raw_key, values in (filter_values or {}).items():
+        norm_key = normalize_filter_name(raw_key)
+        if norm_key in FILTER_COLUMN_SKIP:
+            continue
+        if not values:
+            continue
+        column = f"filter.{norm_key}"
+        row[column] = ", ".join(values)
+
+
 def build_column_order(
     rows: List[Dict[str, Any]],
     *,
@@ -1023,10 +1099,7 @@ def fetch_collection_json(
         option_columns = build_option_columns(options)
 
         derived_filters = derive_filter_values(product, [])
-        if derived_filters:
-            base_row_filter_values = json.dumps(derived_filters)
-        else:
-            base_row_filter_values = None
+        filter_values = select_filters_for_product({}, product, derived_filters)
 
         images = product_copy.get("images") or []
         first_image_src = None
@@ -1047,8 +1120,7 @@ def fetch_collection_json(
         base_row = dict(flat_product)
         if tags:
             base_row["product.tags_all"] = ", ".join(tags)
-        if base_row_filter_values:
-            base_row["filter_values"] = base_row_filter_values
+        apply_filter_columns(base_row, filter_values)
         for key, value in option_columns.items():
             base_row[key] = value
 
@@ -1959,20 +2031,10 @@ def flatten_graphql_product(
     for key, value in option_columns.items():
         row[key] = value
 
-    collection_filters = collection_info.get("collection_filters") if isinstance(collection_info, dict) else None
-    filter_values = collection_filters or {}
+    collection_filters = collection_info.get("collection_filters") if isinstance(collection_info, dict) else {}
     derived_filters = derive_filter_values(product, metafields)
-    if derived_filters:
-        merged = dict(filter_values)
-        for k, v in derived_filters.items():
-            if k in merged:
-                existing = set(merged[k]) if isinstance(merged[k], list) else set()
-                merged[k] = sorted(existing.union(set(v)))
-            else:
-                merged[k] = v
-        filter_values = merged
-    if filter_values:
-        row["filter_values"] = json.dumps(filter_values)
+    filter_values = select_filters_for_product(collection_filters, product, derived_filters)
+    apply_filter_columns(row, filter_values)
 
     if variant_edge is None:
         finalize_storefront_row(row, product, None)
