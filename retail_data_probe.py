@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
@@ -21,16 +22,20 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "AMO"
-COLLECTION_URL = "https://www.amodenim.com/collections/denim"
-MYSHOPIFY = "https://amo-denim.myshopify.com"
-GRAPHQL = ""
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ""
+BRAND = "Citizens_of_Humanity"
+COLLECTION_URL = [
+    "https://citizensofhumanity.com/collections/womens-jeans",
+]
+MYSHOPIFY = "citizens-of-humanity.myshopify.com"
+GRAPHQL = "https://citizens-of-humanity.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["a1b87221a13b15123b1c8b79a866f388"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["denim"]
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["womens-jeans"]
 SEARCHSPRING_SITE_ID = ""
 SEARCHSPRING_URL = ""
 SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
+COLLECTION_TITLE_MAP: Dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -92,6 +97,53 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
         "storeAvailability",
     }
 }
+
+# Additional fields to skip in queries/outputs
+EXTRA_FORBIDDEN_COLUMNS: Set[str] = {
+    "product.collections.pageInfo.endCursor",
+    "product.collections.pageInfo.hasNextPage",
+    "product.encodedVariantAvailability",
+    "product.encodedVariantExistence",
+    "product.featuredImage.height",
+    "product.featuredImage.thumbhash",
+    "product.featuredImage.width",
+    "product.images.pageInfo.endCursor",
+    "product.images.pageInfo.hasNextPage",
+    "product.isGiftCard",
+    "product.media.pageInfo.endCursor",
+    "product.media.pageInfo.hasNextPage",
+    "products_edge_cursor",
+    "variant.currentlyNotInStock",
+    "variant.image.height",
+    "variant.image.id",
+    "variant.image.thumbhash",
+    "variant.image.width",
+    "variant.quantityRule.minimum",
+    "variant_edge_cursor",
+    "variants_endCursor",
+    "variants_hasNextPage",
+}
+
+
+def parse_metafield_identifiers(raw: str) -> List[Tuple[str, str]]:
+    identifiers: List[Tuple[str, str]] = []
+    if not raw:
+        return identifiers
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    seen: Set[Tuple[str, str]] = set()
+    for part in parts:
+        if ":" not in part:
+            continue
+        namespace, key = part.split(":", 1)
+        namespace = namespace.strip()
+        key = key.strip()
+        if not namespace or not key:
+            continue
+        tup = (namespace, key)
+        if tup not in seen:
+            identifiers.append(tup)
+            seen.add(tup)
+    return identifiers
 
 
 def normalize_tokens(value: Any) -> List[str]:
@@ -172,16 +224,32 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
 }
 """
 
-FALLBACK_PRODUCTS_QUERY = """
-query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
-  products(first: $pageSize, after: $cursor, query: $query) {
-    pageInfo {
+def build_metafields_selection() -> str:
+    if not METAFIELD_IDENTIFIERS:
+        return ""
+    identifiers_literal = ", ".join(
+        f'{{namespace: "{ns}", key: "{key}"}}' for ns, key in METAFIELD_IDENTIFIERS
+    )
+    return (
+        "metafields(identifiers: ["
+        + identifiers_literal
+        + "]) {\n  namespace\n  key\n  type\n  value\n}"
+    )
+
+
+def build_fallback_products_query() -> str:
+    metafields_selection = build_metafields_selection()
+    metafields_block = f"\n        {metafields_selection}" if metafields_selection else ""
+    return f"""
+query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {{
+  products(first: $pageSize, after: $cursor, query: $query) {{
+    pageInfo {{
       hasNextPage
       endCursor
-    }
-    edges {
+    }}
+    edges {{
       cursor
-      node {
+      node {{
         id
         handle
         title
@@ -193,29 +261,42 @@ query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
         createdAt
         updatedAt
         publishedAt
-        variants(first: 100) {
-          pageInfo {
+        collections(first: 50) {{
+          edges {{
+            node {{
+              id
+              handle
+              title
+            }}
+          }}
+        }}
+        options {{
+          name
+          values
+        }}{metafields_block}
+        variants(first: 100) {{
+          pageInfo {{
             hasNextPage
             endCursor
-          }
-          edges {
+          }}
+          edges {{
             cursor
-            node {
+            node {{
               id
               title
               sku
               availableForSale
-              price {
+              price {{
                 amount
                 currencyCode
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
 """
 
 SHOP_PROBE_QUERY = "query { shop { name primaryDomain { url } } }"
@@ -267,7 +348,54 @@ query ($typeName: String!) {
 }
 """
 
+FILTER_PROBE_QUERIES = [
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      filters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      productFilters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+]
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _primary_collection_url() -> Optional[str]:
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        return COLLECTION_URL[0] if COLLECTION_URL else None
+    return COLLECTION_URL
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +755,9 @@ def finalize_common_row(
             if alt_key not in row and option_key in variant:
                 row[alt_key] = variant.get(option_key)
 
+    for forbidden in list(EXTRA_FORBIDDEN_COLUMNS):
+        row.pop(forbidden, None)
+
 
 def finalize_json_row(row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
     finalize_common_row(row, product, variant, source="json")
@@ -636,6 +767,191 @@ def finalize_storefront_row(
     row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]
 ) -> None:
     finalize_common_row(row, product, variant, source="storefront")
+
+
+def extract_collections(product: Dict[str, Any], collection_info: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    handles: List[str] = []
+    titles: List[str] = []
+    collections = product.get("collections")
+    if isinstance(collections, dict):
+        edges = collections.get("edges") or []
+        nodes = collections.get("nodes") or []
+        if nodes:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+        elif edges:
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+
+    fallback_handle = collection_info.get("collection_handle")
+    fallback_title = collection_info.get("collection_title")
+    if fallback_handle and fallback_handle not in handles:
+        handles.append(fallback_handle)
+    if fallback_title and fallback_title not in titles:
+        titles.append(fallback_title)
+    if COLLECTION_TITLE_MAP and handles:
+        for h in handles:
+            if h in COLLECTION_TITLE_MAP and COLLECTION_TITLE_MAP[h] not in titles:
+                titles.append(COLLECTION_TITLE_MAP[h])
+    return handles, titles
+
+
+def collect_metafields(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metafields: List[Dict[str, Any]] = []
+    raw_metafields = product.get("metafields")
+    if isinstance(raw_metafields, list):
+        for mf in raw_metafields:
+            if isinstance(mf, dict):
+                metafields.append(
+                    {
+                        "namespace": mf.get("namespace"),
+                        "key": mf.get("key"),
+                        "type": mf.get("type"),
+                        "value": mf.get("value"),
+                    }
+                )
+    elif isinstance(raw_metafields, dict):
+        # Support alias-based selections like mf_0: metafield(...)
+        for value in raw_metafields.values():
+            if isinstance(value, dict):
+                metafields.append(
+                    {
+                        "namespace": value.get("namespace"),
+                        "key": value.get("key"),
+                        "type": value.get("type"),
+                        "value": value.get("value"),
+                    }
+                )
+    return metafields
+
+
+def derive_filter_values(product: Dict[str, Any], metafields: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    filters: Dict[str, Set[str]] = defaultdict(set)
+    product_type = product.get("productType")
+    vendor = product.get("vendor")
+    tags = product.get("tags") or []
+    options = product.get("options") or []
+
+    if product_type:
+        filters["productType"].add(str(product_type))
+    if vendor:
+        filters["vendor"].add(str(vendor))
+    if isinstance(tags, list):
+        for tag in tags:
+            if tag:
+                filters["tags"].add(str(tag))
+
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            name = opt.get("name") or opt.get("title")
+            values = opt.get("values") or []
+            if not name:
+                continue
+            for val in values:
+                if val:
+                    filters[str(name)].add(str(val))
+
+    for mf in metafields:
+        ns = mf.get("namespace")
+        key = mf.get("key")
+        value = mf.get("value")
+        if ns and key and value not in (None, ""):
+            filters[f"{ns}:{key}"].add(str(value))
+
+    return {k: sorted(v) for k, v in filters.items() if v}
+
+
+def normalize_filter_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+    return cleaned or "unnamed"
+
+
+FILTER_COLUMN_SKIP = {"producttype", "vendor", "tags"}
+
+
+def build_filter_corpus(product: Dict[str, Any]) -> Tuple[str, Set[str]]:
+    parts: List[str] = []
+    for field in ("handle", "title", "productType", "vendor"):
+        val = product.get(field)
+        if isinstance(val, str):
+            parts.append(val)
+    tags = product.get("tags") or []
+    if isinstance(tags, list):
+        parts.extend([t for t in tags if isinstance(t, str)])
+    options = product.get("options") or []
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            values = opt.get("values") or []
+            for val in values:
+                if val:
+                    parts.append(str(val))
+    combined = " ".join(parts).lower()
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", combined)
+    tokens = {tok for tok in normalized_text.split() if tok}
+    return normalized_text, tokens
+
+
+def select_filters_for_product(
+    collection_filters: Dict[str, List[str]],
+    product: Dict[str, Any],
+    derived_filters: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    final_filters: Dict[str, List[str]] = {}
+    normalized_text, tokens = build_filter_corpus(product)
+
+    for key, values in derived_filters.items():
+        if not values:
+            continue
+        final_filters[key] = list(values)
+
+    for key, candidates in (collection_filters or {}).items():
+        if key in final_filters:
+            continue
+        matches: List[str] = []
+        for candidate in candidates or []:
+            cand_str = str(candidate)
+            cand_norm = re.sub(r"[^a-z0-9]+", " ", cand_str.lower()).strip()
+            if not cand_norm:
+                continue
+            cand_tokens = {tok for tok in cand_norm.split() if tok}
+            if cand_norm in normalized_text or cand_tokens.issubset(tokens):
+                matches.append(cand_str)
+        if not matches and candidates and len(candidates) == 1:
+            matches = [str(candidates[0])]
+        if matches:
+            final_filters[key] = matches
+
+    return final_filters
+
+
+def apply_filter_columns(row: Dict[str, Any], filter_values: Dict[str, List[str]]) -> None:
+    for raw_key, values in (filter_values or {}).items():
+        norm_key = normalize_filter_name(raw_key)
+        if norm_key in FILTER_COLUMN_SKIP:
+            continue
+        if not values:
+            continue
+        column = f"filter.{norm_key}"
+        row[column] = ", ".join(values)
 
 
 def build_column_order(
@@ -695,12 +1011,13 @@ def write_sheet(
 
 
 def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> str:
-    if not COLLECTION_URL:
+    url = _primary_collection_url()
+    if not url:
         logger.info("No COLLECTION_URL configured; skipping HTML fetch")
         return ""
-    logger.info("Fetching collection HTML from %s", COLLECTION_URL)
+    logger.info("Fetching collection HTML from %s", url)
     try:
-        response = session.get(COLLECTION_URL, timeout=REQUEST_TIMEOUT, verify=False)
+        response = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
         response.raise_for_status()
         return response.text
     except requests.RequestException as exc:
@@ -709,11 +1026,69 @@ def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> 
 
 
 def build_products_json_url() -> Optional[str]:
-    if not COLLECTION_URL:
+    url = _primary_collection_url()
+    if not url:
         return None
-    parts = urlsplit(COLLECTION_URL)
+    parts = urlsplit(url)
     path = parts.path.rstrip("/") + "/products.json"
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def build_products_json_urls() -> List[str]:
+    urls: List[str] = []
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        for item in COLLECTION_URL:
+            if not item:
+                continue
+            parts = urlsplit(item)
+            path = parts.path.rstrip("/") + "/products.json"
+            urls.append(urlunsplit((parts.scheme, parts.netloc, path, "", "")))
+    else:
+        single = build_products_json_url()
+        if single:
+            urls.append(single)
+    return urls
+
+
+def fetch_collection_titles(session: requests.Session, logger: logging.Logger) -> Dict[str, str]:
+    url = _primary_collection_url()
+    if not url:
+        return {}
+    parts = urlsplit(url)
+    base = f"{parts.scheme}://{parts.netloc}"
+    titles: Dict[str, str] = {}
+    page = 1
+    while True:
+        target = f"{base}/collections.json"
+        params = {"page": page, "limit": 250}
+        try:
+            resp = session.get(target, params=params, timeout=REQUEST_TIMEOUT, verify=False)
+        except requests.RequestException as exc:
+            logger.debug("Failed to fetch collections.json: %s", exc)
+            break
+        if not resp.ok:
+            break
+        try:
+            payload = resp.json()
+        except ValueError:
+            break
+        collections = payload.get("collections") if isinstance(payload, dict) else None
+        if not collections:
+            break
+        for coll in collections:
+            if not isinstance(coll, dict):
+                continue
+            handle = coll.get("handle")
+            title = coll.get("title")
+            if handle and title:
+                titles[str(handle)] = str(title)
+        if len(collections) < 250:
+            break
+        page += 1
+        time.sleep(0.25)
+    if titles:
+        logger.info("Discovered %s collections from collections.json", len(titles))
+    return titles
 
 
 def derive_tag_group_key(tag: str) -> str:
@@ -764,46 +1139,47 @@ def collect_tag_values(record: Dict[str, Any]) -> List[str]:
 def fetch_collection_json(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    products_json_url = build_products_json_url()
-    if not products_json_url:
+    products_json_urls = build_products_json_urls()
+    if not products_json_urls:
         logger.info("No collection JSON URL computed; skipping JSON extraction")
         return []
 
-    page = 1
     all_products: List[Dict[str, Any]] = []
-    while True:
-        params = {"limit": 250, "page": page}
-        logger.info("Fetching collection JSON page %s", page)
-        try:
-            response = session.get(
-                products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
-            )
-        except requests.RequestException as exc:
-            logger.warning("Collection JSON request failed: %s", exc)
-            break
+    for products_json_url in products_json_urls:
+        page = 1
+        while True:
+            params = {"limit": 250, "page": page}
+            logger.info("Fetching collection JSON page %s from %s", page, products_json_url)
+            try:
+                response = session.get(
+                    products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
+                )
+            except requests.RequestException as exc:
+                logger.warning("Collection JSON request failed: %s", exc)
+                break
 
-        if not response.ok:
-            logger.warning(
-                "Collection JSON request returned status %s", response.status_code
-            )
-            break
+            if not response.ok:
+                logger.warning(
+                    "Collection JSON request returned status %s", response.status_code
+                )
+                break
 
-        try:
-            data = response.json()
-        except ValueError:
-            logger.warning("Collection JSON response was not valid JSON")
-            break
+            try:
+                data = response.json()
+            except ValueError:
+                logger.warning("Collection JSON response was not valid JSON")
+                break
 
-        products = data.get("products") or []
-        if not products:
-            logger.info("No products found on page %s; stopping pagination", page)
-            break
+            products = data.get("products") or []
+            if not products:
+                logger.info("No products found on page %s; stopping pagination", page)
+                break
 
-        all_products.extend(products)
-        if len(products) < 250:
-            break
-        page += 1
-        time.sleep(0.5)
+            all_products.extend(products)
+            if len(products) < 250:
+                break
+            page += 1
+            time.sleep(0.5)
 
     logger.info("Collected %s products from collection JSON", len(all_products))
     rows: List[Dict[str, Any]] = []
@@ -824,6 +1200,9 @@ def fetch_collection_json(
         options = list(product.get("options") or [])
         option_columns = build_option_columns(options)
 
+        derived_filters = derive_filter_values(product, [])
+        filter_values = select_filters_for_product({}, product, derived_filters)
+
         images = product_copy.get("images") or []
         first_image_src = None
         if isinstance(images, list) and images:
@@ -843,6 +1222,7 @@ def fetch_collection_json(
         base_row = dict(flat_product)
         if tags:
             base_row["product.tags_all"] = ", ".join(tags)
+        apply_filter_columns(base_row, filter_values)
         for key, value in option_columns.items():
             base_row[key] = value
 
@@ -1322,12 +1702,14 @@ class GraphQLQueryBuilder:
         *,
         max_depth: int = 3,
         forbidden_fields: Optional[Dict[str, Sequence[str]]] = None,
+        metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> None:
         self.session = session
         self.endpoint = endpoint
         self.token = token
         self.logger = logger
         self.max_depth = max_depth
+        self.metafield_identifiers = list(metafield_identifiers or METAFIELD_IDENTIFIERS)
         self.forbidden_fields: Dict[str, Set[str]] = defaultdict(set)
         for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
             self.forbidden_fields[parent].update(names)
@@ -1345,6 +1727,16 @@ class GraphQLQueryBuilder:
         self.product_selection = self._build_type_selection("Product", max_depth)
         if not self.product_selection:
             raise GraphQLIntrospectionError("Unable to build product selection set")
+        metafields_selection = self._build_metafields_selection()
+        collections_selection = self._build_collections_selection()
+        if metafields_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, metafields_selection] if part
+            )
+        if collections_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, collections_selection] if part
+            )
         self.collection_query = self._build_collection_query()
         self.products_query = self._build_products_query()
 
@@ -1479,6 +1871,69 @@ class GraphQLQueryBuilder:
             args = self._build_field_args(field)
             return f"{name}{args} {{\n{self._indent(body)}\n}}"
         return None
+
+    def _build_metafields_selection(self) -> str:
+        if not self.metafield_identifiers:
+            return ""
+
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        metafields_field = next(
+            (field for field in fields if field.get("name") == "metafields"), None
+        )
+        metafield_field = next(
+            (field for field in fields if field.get("name") == "metafield"), None
+        )
+
+        selection_body = "namespace\nkey\ntype\nvalue"
+        identifiers_literal = ", ".join(
+            f'{{namespace: "{ns}", key: "{key}"}}'
+            for ns, key in self.metafield_identifiers
+        )
+
+        if metafields_field and any(arg.get("name") == "identifiers" for arg in metafields_field.get("args", [])):
+            return (
+                "metafields(identifiers: ["
+                + identifiers_literal
+                + f"]) {{\n  {selection_body}\n}}"
+            )
+
+        if metafield_field and all(
+            any(arg.get("name") == name for arg in metafield_field.get("args", []))
+            for name in ("namespace", "key")
+        ):
+            lines: List[str] = []
+            for idx, (ns, key) in enumerate(self.metafield_identifiers):
+                alias = f"mf_{idx}"
+                lines.append(
+                    f"{alias}: metafield(namespace: \"{ns}\", key: \"{key}\") {{\n  {selection_body}\n}}"
+                )
+            return "\n".join(lines)
+
+        self.logger.debug(
+            "Metafields selection not added; schema lacks identifiers/namespace+key support"
+        )
+        return ""
+
+    def _build_collections_selection(self) -> str:
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        collections_field = next(
+            (field for field in fields if field.get("name") == "collections"), None
+        )
+        if not collections_field:
+            return ""
+        args = self._build_field_args(collections_field)
+        body = (
+            "edges {\n"
+            "  node {\n"
+            "    id\n"
+            "    handle\n"
+            "    title\n"
+            "  }\n"
+            "}"
+        )
+        return f"collections{args} {{\n{self._indent(body)}\n}}"
 
     def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
         args = self._build_field_args(field)
@@ -1623,6 +2078,54 @@ def apply_tag_filter(product: Dict[str, Any]) -> bool:
     return GRAPHQL_FILTER_TAG.lower() in lowered
 
 
+def probe_collection_filters(
+    session: requests.Session,
+    endpoint: str,
+    token: Optional[str],
+    handle: str,
+    logger: logging.Logger,
+) -> Dict[str, List[str]]:
+    for query in FILTER_PROBE_QUERIES:
+        payload = {"query": query, "variables": {"handle": handle}}
+        response, data = perform_graphql_request(session, endpoint, payload, token)
+        if response is None or not response.ok:
+            continue
+
+        filters_block = None
+        collection = ((data or {}).get("data") or {}).get("collection") if data else None
+        if isinstance(collection, dict):
+            products = collection.get("products")
+            if isinstance(products, dict):
+                filters_block = products.get("filters") or products.get("productFilters")
+
+        if not filters_block:
+            continue
+
+        filters: Dict[str, List[str]] = {}
+        for fil in filters_block:
+            if not isinstance(fil, dict):
+                continue
+            label = fil.get("label") or fil.get("id")
+            values = fil.get("values") or []
+            if not label:
+                continue
+            val_labels: List[str] = []
+            for val in values:
+                if isinstance(val, dict):
+                    if val.get("label"):
+                        val_labels.append(str(val.get("label")))
+                    elif val.get("id"):
+                        val_labels.append(str(val.get("id")))
+            if val_labels:
+                filters[str(label)] = val_labels
+        if filters:
+            logger.info("Discovered %s filter groups for collection %s", len(filters), handle)
+            return filters
+
+    logger.debug("No filters discovered for collection %s", handle)
+    return {}
+
+
 def flatten_graphql_product(
     collection_info: Dict[str, Any],
     edge_cursor: str,
@@ -1630,14 +2133,28 @@ def flatten_graphql_product(
     variant_edge: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
-    row["products_edge_cursor"] = edge_cursor
+    collections_handles, collections_titles = extract_collections(product, collection_info)
+    if collections_handles:
+        row["collections.handle"] = ",".join(collections_handles)
+    if collections_titles:
+        row["collections.title"] = ",".join(collections_titles)
+
+    metafields = collect_metafields(product)
+    if metafields:
+        row["metafields"] = json.dumps(metafields)
 
     product_copy = dict(product)
+    for drop_key in (
+        "encodedVariantAvailability",
+        "encodedVariantExistence",
+        "featuredImage",
+        "images",
+        "media",
+        "isGiftCard",
+    ):
+        product_copy.pop(drop_key, None)
+    product_copy.pop("collections", None)
     variants = product_copy.pop("variants", None)
-    if isinstance(variants, dict):
-        page_info = variants.get("pageInfo") or {}
-        row["variants_hasNextPage"] = page_info.get("hasNextPage")
-        row["variants_endCursor"] = page_info.get("endCursor")
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
 
@@ -1645,12 +2162,18 @@ def flatten_graphql_product(
     for key, value in option_columns.items():
         row[key] = value
 
+    collection_filters = collection_info.get("collection_filters") if isinstance(collection_info, dict) else {}
+    derived_filters = derive_filter_values(product, metafields)
+    filter_values = select_filters_for_product(collection_filters, product, derived_filters)
+    apply_filter_columns(row, filter_values)
+
     if variant_edge is None:
         finalize_storefront_row(row, product, None)
         return row
 
     variant = dict(variant_edge.get("node") or {})
-    row["variant_edge_cursor"] = variant_edge.get("cursor", "")
+    for drop_key in ("quantityRule", "image"):
+        variant.pop(drop_key, None)
     flat_variant = flatten_record({"variant": variant})
     row.update(flat_variant)
     finalize_storefront_row(row, product, variant)
@@ -1677,6 +2200,7 @@ def collect_storefront_from_collections(
                 token,
                 logger,
                 forbidden_fields=forbidden,
+                metafield_identifiers=METAFIELD_IDENTIFIERS,
             )
         except GraphQLIntrospectionError as exc:
             logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
@@ -1686,8 +2210,14 @@ def collect_storefront_from_collections(
         rows: List[Dict[str, Any]] = []
         need_retry = False
         newly_blocked: Dict[str, Set[str]] = defaultdict(set)
+        collection_filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in collection_filters_cache:
+                collection_filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, token, handle, logger
+                )
+            handle_filters = collection_filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -1759,6 +2289,7 @@ def collect_storefront_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
                 products_connection = collection.get("products") or {}
                 edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
@@ -1850,7 +2381,12 @@ def collect_storefront_from_products(
 
     try:
         builder = GraphQLQueryBuilder(
-            session, endpoint, token, logger, forbidden_fields=forbidden
+            session,
+            endpoint,
+            token,
+            logger,
+            forbidden_fields=forbidden,
+            metafield_identifiers=METAFIELD_IDENTIFIERS,
         )
     except GraphQLIntrospectionError as exc:
         logger.debug("Unable to build products query for %s: %s", endpoint, exc)
@@ -1946,8 +2482,14 @@ def fallback_collect_from_collections(
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
         success = True
+        filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in filters_cache:
+                filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, None, handle, logger
+                )
+            handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -1988,6 +2530,7 @@ def fallback_collect_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
 
                 products_connection = collection.get("products") or {}
@@ -2055,10 +2598,11 @@ def fallback_collect_from_products(
         rows: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         first_status: Optional[int] = None
+        fallback_query = build_fallback_products_query()
 
         while True:
             payload = {
-                "query": FALLBACK_PRODUCTS_QUERY,
+                "query": fallback_query,
                 "variables": {
                     "cursor": cursor,
                     "pageSize": GRAPHQL_PAGE_SIZE,
@@ -2307,8 +2851,22 @@ def export_workbook(
 # Main entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Retail data probe")
+    parser.add_argument(
+        "--metafield",
+        dest="metafields",
+        help="Comma-separated list of namespace:key metafields to request via Storefront API",
+        default="",
+    )
+    args = parser.parse_args()
+
+    global METAFIELD_IDENTIFIERS
+    METAFIELD_IDENTIFIERS = parse_metafield_identifiers(args.metafields)
+
     logger = configure_logging()
     session = build_session()
+    global COLLECTION_TITLE_MAP
+    COLLECTION_TITLE_MAP = fetch_collection_titles(session, logger)
     html = fetch_collection_html(session, logger)
     json_rows, tag_group_columns = fetch_collection_json(session, logger)
     if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:

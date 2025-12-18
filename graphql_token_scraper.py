@@ -2,9 +2,9 @@
 
 Given a collection URL, this script searches the collection page, linked app
 scripts, and each PDP discovered on that collection for candidate GraphQL
-tokens (32-character hex strings). Results are written to an Excel workbook
-with one sheet containing the deduped tokens and a concatenated string of all
-tokens for quick copy/paste.
+tokens and secret-like config values. Results are written to an Excel
+workbook with a token sheet (deduped) and a secrets sheet (per key discovery
+with context), plus a concatenated string of all tokens for quick copy/paste.
 
 The script follows the repo logging/output conventions: a single requests
 session with retries/backoff, desktop User-Agent, Output folder for exports,
@@ -12,17 +12,40 @@ and a run log with a fallback destination when the preferred path is
 unavailable.
 """
 
+# IMPORTANT — Shopify Storefront API token formats are NOT reliable indicators
+# of validity. Shopify does not publish an authoritative list of all possible
+# token formats. Historically:
+# - Pre-2020 tokens: 32-char hex strings.
+# - Post-2020 tokens: prefixed (shpat_, shpca_, shppa_) + 32 chars.
+# - Community has observed tokens like shpua_.
+# Shopify DOES NOT guarantee:
+#   - That prefixes remain stable.
+#   - That token length is fixed.
+#   - That format predicts scope permissions.
+# DO NOT validate tokens with regex or length checks. Treat all secrets as opaque.
+
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
+try:
+    import playwright  # type: ignore
+except ImportError:  # pragma: no cover - environment guard
+    print("Playwright not installed. Run:")
+    print("    pip install playwright")
+    print("    playwright install chromium")
+    sys.exit(1)
+
 import requests
+from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -82,6 +105,65 @@ TEXT_RESOURCE_EXTENSIONS = (
     ".htm",
     ".css",
 )
+
+# Extensions/content that should be treated as binary/noisy and skipped.
+BINARY_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mp3",
+    ".wav",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+)
+
+MIN_HEURISTIC_LENGTH = 32
+
+# Keys that should be treated as suspicious when found inside structured
+# objects (inline script JSON/config blobs). Substring, case-insensitive
+# matching is applied.
+KEY_CANDIDATES = [
+    "storefront_access_token",
+    "storefrontAccessToken",
+    "x-shopify-storefront-access-token",
+    "accessToken",
+    "apiKey",
+    "client_secret",
+]
+
+NOISY_SECRET_KEYS = {
+    "shopifycheckoutapitoken",
+    "checkoutapitoken",
+    "shopify-checkout-api-token",
+}
+
+KNOWN_PUBLIC_TOKENS = set()
+
+# Heuristic literal patterns that often correspond to opaque credentials.
+HEURISTIC_LITERAL_PATTERNS = [
+    re.compile(r"shp(?:at|ca|pa|ua)_[0-9a-zA-Z]{32}"),
+    re.compile(r"\b[0-9a-f]{32}\b"),
+]
+
+visited_urls: Set[str] = set()
+page_html_cache: Dict[str, str] = {}
+
+# Type aliases for readability
+SecretFinding = Dict[str, str]
+TokenRecord = Dict[str, Set[str]]
+TokenStore = Dict[str, TokenRecord]
 
 # ---------------------------------------------------------------------------
 # Session helpers
@@ -152,9 +234,30 @@ def configure_logger() -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 
+def normalize_for_visit(url: str) -> str:
+    try:
+        return normalize_product_url(url)
+    except Exception:
+        return url
+
+
+def is_binary_url(url: str) -> bool:
+    lowered = url.lower()
+    if lowered.startswith("blob:"):
+        return True
+    path = urlparse(lowered).path
+    return any(path.endswith(ext) for ext in BINARY_EXTENSIONS)
+
+
 def should_skip_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return host in SKIP_HOSTS
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    scheme = parsed.scheme.lower()
+    if host in SKIP_HOSTS:
+        return True
+    if scheme in {"blob", "data"}:
+        return True
+    return is_binary_url(url)
 
 
 def normalize_product_url(url: str) -> str:
@@ -173,28 +276,74 @@ def normalize_product_url(url: str) -> str:
     return url
 
 
-def fetch_text(session: requests.Session, url: str, logger: logging.Logger) -> str:
-    if should_skip_url(url):
-        logger.info("Skipping noisy host: %s", url)
+def fetch_text(
+    session: requests.Session,
+    url: str,
+    logger: logging.Logger,
+    *,
+    respect_visited: bool = True,
+) -> str:
+    normalized = normalize_for_visit(url)
+    if respect_visited and normalized in visited_urls:
         return ""
+    if should_skip_url(normalized):
+        logger.info("Skipping noisy/binary host: %s", normalized)
+        if respect_visited:
+            visited_urls.add(normalized)
+        return ""
+    if respect_visited:
+        visited_urls.add(normalized)
     try:
-        resp = session.get(url, timeout=30, verify=False)
+        resp = session.get(normalized, timeout=30, verify=False)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "").lower()
-        if not is_textual(url, content_type):
+        if not is_textual(normalized, content_type):
             return ""
-        return resp.text
+        text = resp.text
+        if normalized.lower().endswith(".js"):
+            lower_text = text.lower()
+            if (
+                len(text) > 250_000
+                and not any(k.lower() in lower_text for k in KEY_CANDIDATES)
+                and not any(p.search(text) for p in HEURISTIC_LITERAL_PATTERNS)
+            ):
+                logger.info("Skipping large script with no key signals: %s", normalized)
+                return ""
+        return text
     except requests.RequestException as exc:  # pragma: no cover - network-dependent
-        logger.warning("Fetch failed %s -> %s", url, exc)
+        logger.warning("Fetch failed %s -> %s", normalized, exc)
         return ""
 
 
-def extract_tokens(text: str) -> Set[str]:
-    return set(re.findall(r"\b[0-9a-fA-F]{32}\b", text))
+def record_token(tokens: TokenStore, token: str, source_url: str, reason: str) -> None:
+    if token in KNOWN_PUBLIC_TOKENS:
+        return
+    entry = tokens.setdefault(token, {"sources": set(), "reasons": set()})
+    entry["sources"].add(source_url)
+    entry["reasons"].add(reason)
+
+
+def extract_literal_tokens(text: str) -> Set[str]:
+    """Capture opaque credential-like strings using heuristic literal patterns."""
+
+    hits: Set[str] = set()
+    for pattern in HEURISTIC_LITERAL_PATTERNS:
+        hits.update(pattern.findall(text))
+    return hits
+
+
+def extract_literal_tokens_from_scripts(html: str) -> Set[str]:
+    hits: Set[str] = set()
+    for blob in extract_script_blobs(html):
+        if blob["text"]:
+            hits.update(extract_literal_tokens(blob["text"]))
+    return hits
 
 
 def is_textual(url: str, content_type: str | None = None) -> bool:
     lowered = url.lower()
+    if is_binary_url(lowered):
+        return False
     if any(lowered.endswith(ext) for ext in TEXT_RESOURCE_EXTENSIONS):
         return True
     if content_type:
@@ -223,7 +372,10 @@ def iter_script_urls(html: str, base_url: str) -> Iterable[str]:
     src_pattern = re.compile(r"<script[^>]+src=\"([^\"]+)\"", re.I)
     for match in src_pattern.finditer(html):
         src = match.group(1)
-        yield urljoin(base_url, src)
+        candidate = urljoin(base_url, src)
+        if should_skip_url(candidate):
+            continue
+        yield candidate
 
 
 def iter_link_urls(html: str, base_url: str) -> Iterable[str]:
@@ -232,7 +384,10 @@ def iter_link_urls(html: str, base_url: str) -> Iterable[str]:
     href_pattern = re.compile(r"<link[^>]+href=\"([^\"]+)\"", re.I)
     for match in href_pattern.finditer(html):
         href = match.group(1)
-        yield urljoin(base_url, href)
+        candidate = urljoin(base_url, href)
+        if should_skip_url(candidate):
+            continue
+        yield candidate
 
 
 def iter_app_urls(text: str, base_url: str) -> Iterable[str]:
@@ -245,6 +400,8 @@ def iter_app_urls(text: str, base_url: str) -> Iterable[str]:
         try:
             candidate = normalize_product_url(raw)
         except ValueError:
+            continue
+        if should_skip_url(candidate):
             continue
         if any(keyword in candidate for keyword in APP_HOST_KEYWORDS):
             yield candidate
@@ -261,12 +418,112 @@ def iter_network_urls(text: str, base_url: str) -> Iterable[str]:
             candidate = normalize_product_url(raw)
         except ValueError:
             continue
+        if should_skip_url(candidate):
+            continue
         # Skip obvious binary assets to keep requests reasonable.
         if any(candidate.lower().endswith(ext) for ext in TEXT_RESOURCE_EXTENSIONS) or any(
             keyword in candidate for keyword in APP_HOST_KEYWORDS
         ):
             yield candidate
 
+
+def extract_script_blobs(html: str) -> List[Dict[str, Any]]:
+    """Return script contents with minimal context (index/id/type)."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    blobs: List[Dict[str, Any]] = []
+    for idx, tag in enumerate(soup.find_all("script")):
+        attrs = {k: (" ".join(v) if isinstance(v, list) else str(v)) for k, v in tag.attrs.items()}
+        text = tag.string if tag.string is not None else tag.decode_contents()
+        blobs.append(
+            {
+                "index": idx,
+                "attrs": attrs,
+                "text": text or "",
+                "type": attrs.get("type", ""),
+            }
+        )
+    return blobs
+
+
+def extract_candidate_json_strings(script_text: str, is_json_type: bool) -> List[str]:
+    """Find JSON-like substrings inside a script body.
+
+    Priority order:
+    - Entire body when the script tag advertises JSON (e.g., application/json, ld+json).
+    - Inline assignments like `window.__xyz = {...};` captured via a regex.
+    - Fallback to the full body when it starts with a JSON object/array.
+    """
+
+    candidates: List[str] = []
+    stripped = script_text.strip()
+    if not stripped:
+        return candidates
+
+    if is_json_type:
+        candidates.append(stripped)
+        return candidates
+
+    # Assignments to window/global objects
+    assign_pattern_obj = re.compile(r"=\s*({.*?})\s*;", re.S)
+    assign_pattern_array = re.compile(r"=\s*(\[.*?\])\s*;", re.S)
+    for pattern in (assign_pattern_obj, assign_pattern_array):
+        for match in pattern.finditer(script_text):
+            candidates.append(match.group(1).strip())
+
+    # Walk the script text to locate any JSON-like payloads using raw_decode.
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(script_text):
+        ch = script_text[idx]
+        if ch in "[{":
+            try:
+                _, end = decoder.raw_decode(script_text, idx)
+                candidates.append(script_text[idx:end].strip())
+                idx = end
+                continue
+            except Exception:
+                pass
+        idx += 1
+
+    # Fallback: if the whole body looks like JSON, try it too.
+    if stripped.startswith("{") or stripped.startswith("["):
+        candidates.append(stripped)
+
+    return candidates
+
+
+def safe_json_loads(blob: str) -> Any | None:
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+def find_candidate_keys(obj: Any, key_candidates: Sequence[str], path: str = "") -> List[Tuple[str, str, Any]]:
+    """Recursively search for keys that include any candidate token."""
+
+    hits: List[Tuple[str, str, Any]] = []
+    lower_candidates = [kc.lower() for kc in key_candidates]
+
+    def _normalize_key(key: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", key.lower())
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_path = f"{path}.{k}" if path else k
+            normalized_key = _normalize_key(k)
+            if normalized_key in NOISY_SECRET_KEYS:
+                continue
+            if any(candidate in k.lower() for candidate in lower_candidates):
+                hits.append((new_path, k, v))
+            hits.extend(find_candidate_keys(v, key_candidates, new_path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]" if path else f"[{idx}]"
+            hits.extend(find_candidate_keys(item, key_candidates, new_path))
+
+    return hits
 
 # ---------------------------------------------------------------------------
 # Token gathering
@@ -276,16 +533,62 @@ def iter_network_urls(text: str, base_url: str) -> Iterable[str]:
 def process_text_blob(
     source_url: str,
     text: str,
-    token_sources: Dict[str, Set[str]],
+    token_sources: TokenStore,
     logger: logging.Logger,
-) -> str:
+) -> Tuple[str, Set[str]]:
     normalized = text.replace("\\/", "/")
-    tokens = extract_tokens(normalized)
+    lower_url = source_url.lower()
+    tokens: Set[str] = set()
+    if lower_url.endswith((".js", ".mjs", ".json")):
+        tokens = extract_literal_tokens(normalized)
+    elif "<script" in normalized.lower():
+        tokens = extract_literal_tokens_from_scripts(normalized)
     if tokens:
         logger.info("%s tokens found in %s", len(tokens), source_url)
     for tok in tokens:
-        token_sources.setdefault(tok, set()).add(source_url)
-    return normalized
+        record_token(token_sources, tok, source_url, "heuristic_literal")
+    return normalized, tokens
+
+
+def inspect_scripts_for_secrets(
+    html: str,
+    page_url: str,
+    findings: List[SecretFinding],
+    logger: logging.Logger,
+    token_sources: TokenStore,
+) -> None:
+    """Parse script tags and extract suspicious keys from JSON/config blobs."""
+
+    for blob in extract_script_blobs(html):
+        is_json_type = "json" in blob["type"].lower()
+        candidates = extract_candidate_json_strings(blob["text"], is_json_type)
+        for candidate in candidates:
+            obj = safe_json_loads(candidate)
+            if obj is None:
+                continue
+            hits = find_candidate_keys(obj, KEY_CANDIDATES)
+            for key_path, key_name, value in hits:
+                value_text = json.dumps(value, ensure_ascii=False)
+                token_value = value if isinstance(value, str) else value_text
+                if token_value:
+                    record_token(
+                        token_sources, str(token_value), page_url, "key_match"
+                    )
+                findings.append(
+                    {
+                        "page_url": page_url,
+                        "key_name": key_name,
+                        "key_path": key_path,
+                        "value": value_text,
+                        "source_type": "inline_script_json"
+                        if is_json_type
+                        else "config_blob",
+                        "script_index": str(blob["index"]),
+                        "script_id": blob["attrs"].get("id", ""),
+                        "script_type": blob["type"],
+                        "extracted_by": "key_match",
+                    }
+                )
 
 
 def crawl_with_playwright(
@@ -305,10 +608,10 @@ def crawl_with_playwright(
             page = browser.new_page(ignore_https_errors=True)
 
             def handle_response(response):
-                resp_url = normalize_product_url(response.url)
-                if should_skip_url(resp_url):
-                    logger.info("Skipping noisy host: %s", resp_url)
+                resp_url = normalize_for_visit(response.url)
+                if resp_url in visited_urls or should_skip_url(resp_url):
                     return
+                visited_urls.add(resp_url)
                 try:
                     content_type = response.headers.get("content-type")
                 except Exception:
@@ -328,8 +631,8 @@ def crawl_with_playwright(
                     bodies.append((resp_url, body_text))
 
             def handle_request(request):
-                req_url = normalize_product_url(request.url)
-                if should_skip_url(req_url):
+                req_url = normalize_for_visit(request.url)
+                if req_url in visited_urls or should_skip_url(req_url):
                     return
                 try:
                     accept_header = request.headers.get("accept")
@@ -367,20 +670,36 @@ def gather_tokens_from_page(
     session: requests.Session,
     url: str,
     logger: logging.Logger,
-    seen_urls: Set[str],
-    token_sources: Dict[str, Set[str]],
+    token_sources: TokenStore,
     errors: List[str],
+    findings: List[SecretFinding],
 ) -> Set[str]:
     tokens: Set[str] = set()
 
+    normalized_url = normalize_for_visit(url)
+    if normalized_url in visited_urls:
+        logger.info("Skipping already visited: %s", normalized_url)
+        return tokens
+    if should_skip_url(normalized_url):
+        logger.info("Skipping disallowed URL: %s", normalized_url)
+        visited_urls.add(normalized_url)
+        return tokens
+    visited_urls.add(normalized_url)
+
     html, responses, pending_urls, request_urls = crawl_with_playwright(
-        url, logger, errors
+        normalized_url, logger, errors
     )
     if not html:
-        html = fetch_text(session, url, logger)
+        html = fetch_text(session, normalized_url, logger, respect_visited=False)
     if html:
-        normalized_html = process_text_blob(url, html, token_sources, logger)
-        tokens.update(extract_tokens(normalized_html))
+        page_html_cache[normalized_url] = html
+        normalized_html, token_hits = process_text_blob(
+            normalized_url, html, token_sources, logger
+        )
+        tokens.update(token_hits)
+        inspect_scripts_for_secrets(
+            normalized_html, normalized_url, findings, logger, token_sources
+        )
     else:
         return tokens
 
@@ -393,11 +712,13 @@ def gather_tokens_from_page(
 
     # Process responses captured during Playwright navigation first.
     for resp_url, body in responses:
-        if resp_url in seen_urls:
+        if resp_url in visited_urls or should_skip_url(resp_url):
             continue
-        seen_urls.add(resp_url)
-        normalized_body = process_text_blob(resp_url, body, token_sources, logger)
-        tokens.update(extract_tokens(normalized_body))
+        visited_urls.add(resp_url)
+        normalized_body, token_hits = process_text_blob(
+            resp_url, body, token_sources, logger
+        )
+        tokens.update(token_hits)
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, resp_url))
             + list(iter_network_urls(normalized_body, resp_url))
@@ -405,14 +726,15 @@ def gather_tokens_from_page(
 
     # Fetch any response URLs that failed to provide a body via Playwright.
     for pending in pending_urls:
-        if pending in seen_urls:
+        if pending in visited_urls or should_skip_url(pending):
             continue
-        seen_urls.add(pending)
         body = fetch_text(session, pending, logger)
         if not body:
             continue
-        normalized_body = process_text_blob(pending, body, token_sources, logger)
-        tokens.update(extract_tokens(normalized_body))
+        normalized_body, token_hits = process_text_blob(
+            pending, body, token_sources, logger
+        )
+        tokens.update(token_hits)
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, pending))
             + list(iter_network_urls(normalized_body, pending))
@@ -420,14 +742,15 @@ def gather_tokens_from_page(
 
     # Fetch textual/keyword URLs captured from requests (without responses).
     for req_url in request_urls:
-        if req_url in seen_urls:
+        if req_url in visited_urls or should_skip_url(req_url):
             continue
-        seen_urls.add(req_url)
         body = fetch_text(session, req_url, logger)
         if not body:
             continue
-        normalized_body = process_text_blob(req_url, body, token_sources, logger)
-        tokens.update(extract_tokens(normalized_body))
+        normalized_body, token_hits = process_text_blob(
+            req_url, body, token_sources, logger
+        )
+        tokens.update(token_hits)
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, req_url))
             + list(iter_network_urls(normalized_body, req_url))
@@ -435,33 +758,36 @@ def gather_tokens_from_page(
 
     # Fetch any additional discovered URLs not yet seen.
     for candidate in candidate_urls:
-        if candidate in seen_urls:
+        if candidate in visited_urls or should_skip_url(candidate):
             continue
-        seen_urls.add(candidate)
         body = fetch_text(session, candidate, logger)
         if not body:
             continue
-        normalized_body = process_text_blob(candidate, body, token_sources, logger)
-        tokens.update(extract_tokens(normalized_body))
+        normalized_body, token_hits = process_text_blob(
+            candidate, body, token_sources, logger
+        )
+        tokens.update(token_hits)
     return tokens
 
 
 def gather_tokens(
     session: requests.Session, collection_url: str, logger: logging.Logger
-) -> Dict[str, Set[str]]:
-    all_tokens: Dict[str, Set[str]] = {}
-    seen_urls: Set[str] = set()
+) -> Tuple[TokenStore, List[SecretFinding]]:
+    all_tokens: TokenStore = {}
+    secrets: List[SecretFinding] = []
     errors: List[str] = []
 
     logger.info("Fetching collection page: %s", collection_url)
     collection_tokens = gather_tokens_from_page(
-        session, collection_url, logger, seen_urls, all_tokens, errors
+        session, collection_url, logger, all_tokens, errors, secrets
     )
     logger.info(
         "%s tokens collected from collection page and scripts", len(collection_tokens)
     )
 
-    collection_html = fetch_text(session, collection_url, logger)
+    collection_html = page_html_cache.get(normalize_for_visit(collection_url))
+    if not collection_html:
+        collection_html = fetch_text(session, collection_url, logger)
     handles = extract_handles(collection_html, collection_url)
     logger.info("Discovered %s product handles", len(handles))
 
@@ -472,7 +798,7 @@ def gather_tokens(
         pdp_url = f"{base}/products/{handle}"
         logger.info("Processing PDP: %s", pdp_url)
         gather_tokens_from_page(
-            session, pdp_url, logger, seen_urls, all_tokens, errors
+            session, pdp_url, logger, all_tokens, errors, secrets
         )
 
     if errors:
@@ -480,7 +806,7 @@ def gather_tokens(
         for err in errors:
             logger.info("Error: %s", err)
 
-    return all_tokens
+    return all_tokens, secrets
 
 
 # ---------------------------------------------------------------------------
@@ -488,22 +814,58 @@ def gather_tokens(
 # ---------------------------------------------------------------------------
 
 
-def write_excel(tokens: Dict[str, Set[str]], output_path: Path, logger: logging.Logger) -> None:
+def write_excel(
+    tokens: TokenStore,
+    secrets: List[SecretFinding],
+    output_path: Path,
+    logger: logging.Logger,
+) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Tokens"
-    ws.append(["token", "sources", "all_tokens_concatenated"])
+    ws.append(["token", "sources", "reasons", "all_tokens_concatenated"])
 
     sorted_tokens = sorted(tokens.keys())
     joined = ", ".join(f'"{tok}"' for tok in sorted_tokens)
     first = True
     for tok in sorted_tokens:
-        sources = "; ".join(sorted(tokens.get(tok, [])))
+        record = tokens.get(tok, {})
+        sources = "; ".join(sorted(record.get("sources", [])))
+        reasons = "; ".join(sorted(record.get("reasons", [])))
         if first:
-            ws.append([tok, sources, joined])
+            ws.append([tok, sources, reasons, joined])
             first = False
         else:
-            ws.append([tok, sources, ""])
+            ws.append([tok, sources, reasons, ""])
+
+    secrets_ws = wb.create_sheet("Secrets")
+    secrets_ws.append(
+        [
+            "page_url",
+            "key_name",
+            "key_path",
+            "value",
+            "source_type",
+            "script_index",
+            "script_id",
+            "script_type",
+            "extracted_by",
+        ]
+    )
+    for finding in secrets:
+        secrets_ws.append(
+            [
+                finding.get("page_url", ""),
+                finding.get("key_name", ""),
+                finding.get("key_path", ""),
+                finding.get("value", ""),
+                finding.get("source_type", ""),
+                finding.get("script_index", ""),
+                finding.get("script_id", ""),
+                finding.get("script_type", ""),
+                finding.get("extracted_by", ""),
+            ]
+        )
     try:
         wb.save(output_path)
         logger.info("Workbook written: %s", output_path.resolve())
@@ -527,11 +889,12 @@ def main() -> None:
     logger = configure_logger()
     session = build_session()
 
-    token_sources = gather_tokens(session, COLLECTION_URL, logger)
+    token_sources, secrets = gather_tokens(session, COLLECTION_URL, logger)
     logger.info("Total unique tokens: %s", len(token_sources))
+    logger.info("Total secret key hits: %s", len(secrets))
 
     excel_path = OUTPUT_DIR / EXCEL_BASENAME
-    write_excel(token_sources, excel_path, logger)
+    write_excel(token_sources, secrets, excel_path, logger)
 
 
 if __name__ == "__main__":
