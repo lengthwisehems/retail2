@@ -1,10 +1,11 @@
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import pandas as pd
 import requests
@@ -22,6 +23,9 @@ ONLINE_STORE_BASE = "https://askkny.com"
 COLLECTION_URL = "https://askkny.com/collections/jeans/products.json"
 MARKET_ID = "2005008642"
 RR_HOST = "https://app.restockrocket.io"
+DEMAND_HOST = "https://app.stoqapp.com/api/v1/external"
+DEMAND_TOKEN_ENV_VARS = ["RR_DEMAND_API_TOKEN", "RESTOCK_ROCKET_DEMAND_TOKEN", "STOQ_API_TOKEN"]
+DEMAND_PAGE_SIZE = 500
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -70,19 +74,26 @@ def request_with_retry(
     url: str,
     logger: logging.Logger,
     *,
+    headers: Optional[Dict[str, Any]] = None,
     params: Optional[Dict[str, Any]] = None,
+    retry_statuses: Optional[Set[int]] = None,
     timeout: float = 30.0,
 ) -> requests.Response:
+    retry_statuses = retry_statuses or {429, 500, 502, 503, 504}
     backoff = 1.0
     for attempt in range(5):
         try:
-            resp = session.get(url, params=params, timeout=timeout, verify=False)
-            if resp.status_code in {429, 500, 502, 503, 504}:
+            resp = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+            if resp.status_code in retry_statuses:
                 raise ProbeError(f"Transient status {resp.status_code}")
             resp.raise_for_status()
             return resp
         except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status in retry_statuses or isinstance(exc, ProbeError)
             logger.warning("Request failed (%s) attempt %s: %s", url, attempt + 1, exc)
+            if not retryable:
+                raise
             time.sleep(backoff)
             backoff *= 2
     raise ProbeError(f"Failed after retries: {url}")
@@ -153,6 +164,80 @@ def fetch_rr_variant_data(
     return {}
 
 
+def resolve_demand_api_token(settings: Optional[Dict[str, Any]], logger: logging.Logger) -> Optional[str]:
+    if settings:
+        for key in ["external_api_key", "demand_api_key", "api_token", "apiKey"]:
+            token = settings.get(key)
+            if token:
+                logger.info("Using demand API token from settings key '%s'", key)
+                return str(token)
+
+    for env_key in DEMAND_TOKEN_ENV_VARS:
+        env_val = os.environ.get(env_key)
+        if env_val:
+            logger.info("Using demand API token from env %s", env_key)
+            return env_val
+
+    logger.warning("No demand API token provided; demand report will be skipped")
+    return None
+
+
+def fetch_demand_report(
+    session: requests.Session,
+    logger: logging.Logger,
+    api_token: Optional[str],
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    per_page: int = DEMAND_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    if not api_token:
+        return []
+
+    headers = {"X-Auth-Token": api_token}
+    params: Dict[str, Any] = {
+        "per_page": per_page,
+        "page": 1,
+    }
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+
+    results: List[Dict[str, Any]] = []
+    while True:
+        try:
+            resp = request_with_retry(
+                session,
+                f"{DEMAND_HOST}/intents/products_in_demand",
+                logger,
+                headers=headers,
+                params=params,
+            )
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            logger.error("Demand report request failed (page %s, status %s): %s", params.get("page"), status, exc)
+            break
+        except ProbeError as exc:
+            logger.error("Demand report request failed (page %s): %s", params.get("page"), exc)
+            break
+
+        payload = resp.json()
+        batch = payload.get("product_variants_in_demand", []) if isinstance(payload, dict) else []
+        results.extend(batch)
+        logger.info(
+            "Demand report page %s returned %s variants (running total %s)",
+            params.get("page"),
+            len(batch),
+            len(results),
+        )
+
+        if not payload.get("has_next_page"):
+            break
+        params["page"] = params.get("page", 1) + 1
+    return results
+
+
 def flatten_products(products: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     flattened: List[Dict[str, Any]] = []
     for product in products:
@@ -160,6 +245,16 @@ def flatten_products(products: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
         for variant in variants:
             flattened.append({"product": product, "variant": variant})
     return flattened
+
+
+def build_demand_map(demand_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    demand_map: Dict[str, Dict[str, Any]] = {}
+    for entry in demand_rows or []:
+        vid = entry.get("shopify_variant_id")
+        if vid is None:
+            continue
+        demand_map[str(vid)] = entry
+    return demand_map
 
 
 def build_cached_sets(
@@ -188,6 +283,7 @@ def normalize_rows(
     shipping_texts: Dict[str, Any],
     preorder_limits: Dict[str, Any],
     settings: Dict[str, Any],
+    demand_map: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     preorder_id_set = {str(v) for v in preorder_ids}
@@ -210,6 +306,12 @@ def normalize_rows(
         vid = str(variant.get("id"))
         rr_variant = variant_data_map.get(vid, {})
         preorder_limit_entry = variant_limit_map.get(vid, {}) if isinstance(variant_limit_map.get(vid, {}), dict) else {}
+        demand_entry = demand_map.get(vid, {})
+
+        demand_product_data = demand_entry.get("product_data") if isinstance(demand_entry, dict) else None
+        demand_variant_data = demand_entry.get("variant_data") if isinstance(demand_entry, dict) else None
+        demand_product_json = json.dumps(demand_product_data) if demand_product_data is not None else None
+        demand_variant_json = json.dumps(demand_variant_data) if demand_variant_data is not None else None
 
         rows.append(
             {
@@ -263,12 +365,20 @@ def normalize_rows(
                 "rr.cachedOutOfStockVariantIds": json.dumps(cached_sets.get("cachedOutOfStockVariantIds")),
                 "rr.selected_variant_id": vid,
                 "rr.variant_payload_raw": json.dumps(rr_variant) if rr_variant else None,
+                "demand.total": demand_entry.get("total") if demand_entry else None,
+                "demand.pending": demand_entry.get("pending") if demand_entry else None,
+                "demand.last_requested_at": demand_entry.get("last_requested_at") if demand_entry else None,
+                "demand.shopify_product_id": demand_entry.get("shopify_product_id") if demand_entry else None,
+                "demand.shopify_inventory_item_id": demand_entry.get("shopify_inventory_item_id") if demand_entry else None,
+                "demand.product_data": demand_product_json,
+                "demand.variant_data": demand_variant_json,
+                "demand.source": "demand_report_api" if demand_entry else None,
             }
         )
     return rows
 
 
-def write_excel(rows: List[Dict[str, Any]], logger: logging.Logger) -> Path:
+def write_excel(rows: List[Dict[str, Any]], demand_entries: List[Dict[str, Any]], logger: logging.Logger) -> Path:
     if not rows:
         raise ProbeError("No rows to write")
     df = pd.DataFrame(rows)
@@ -305,6 +415,8 @@ def write_excel(rows: List[Dict[str, Any]], logger: logging.Logger) -> Path:
     out_path = OUTPUT_DIR / f"{BRAND.upper()}_RESTOCKROCKET_{ts}.xlsx"
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="RestockRocket", index=False)
+        if demand_entries:
+            pd.DataFrame(demand_entries).to_excel(writer, sheet_name="DemandReport", index=False)
     logger.info("CSV written: %s", out_path.resolve())
     return out_path
 
@@ -322,6 +434,8 @@ def main() -> None:
     preorder_ids = fetch_rr_preorder_ids(session, logger)
     shipping_texts = fetch_rr_shipping_texts(session, logger)
     preorder_limits = fetch_rr_variant_preorder_limits(session, logger)
+    demand_token = resolve_demand_api_token(settings, logger)
+    demand_entries = fetch_demand_report(session, logger, demand_token)
 
     product_variants = flatten_products(products)
 
@@ -341,8 +455,9 @@ def main() -> None:
         shipping_texts,
         preorder_limits,
         settings,
+        build_demand_map(demand_entries),
     )
-    out_path = write_excel(rows, logger)
+    out_path = write_excel(rows, demand_entries, logger)
     logger.info("Probe completed. Output at %s", out_path.resolve())
 
 

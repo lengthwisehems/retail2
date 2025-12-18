@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
@@ -27,16 +28,13 @@ COLLECTION_URL = [
 ]
 MYSHOPIFY = "citizens-of-humanity.myshopify.com"
 GRAPHQL = "https://citizens-of-humanity.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["02dd60b6d7a54ccb89956663958fb63b","04152f11becf43469768a352c2581442","085346ae5f154a32b6c49789413f62c5","18031546ee651571ed29edbe71a3550b","2102d85c9a5b4768840eb0505eb972f7","23b97d18e2aa74363140dc29c9284e87","2654da3f48af4a94b0327f97c2084d7f","42303a5980ec43678f0b70b02b34986e","457aadbdb6eb49cb996a497b632b21f2","4af8ef69ceed61f6ebb36c9d89db0d0d","5b6f6917e306bc7f24523662663331c0","5f59ad0622e4424d917ec0dbc1e70261","61f100916adc47ea879c71eb67a6a7b8","65b8f6c6a5294bce994f31ef03c8cef8","67cfdf70787445028079d57a71dadbc3","6e71093ff37f6adfc1bed4d89eca9a8f","6exFu3YSAEW7fgmCQIkjlV9xxpxQs1hQ","6XDcm54cuoYklNnEY08jNSEDbsLAjn76","737269a620f34c4cb9ed5ef9f159d67e","7be77dc450614b6a9a896489f691b8c2","812dfd2901144f12b28299c53cfed277","81709d834c684daca6e102b30ccfac0f","8450b52b59e80bfb2255f1e069ee1acd","868ba4fba67d4d5b918ad5290f6a8690","8aa74d230d784c14ab04f889d26615de","8b6426783dec43b58562fe6141a489b4","8fd3566400d6498a9808fce6b6597d88","90924179f94d41589cefc69b0b1bb4eb","94c4c0bf9dd742e3ae8be28fb8cb1b63","97fac35efb92441a8af25dd2a645d39b","9c895ccd1ea54276abc942a1652fdacc","af7a4530d25946529ef19a09f2a7feaa","af97390363f445349ad683773a4608f4","b2a65d1289a64115a94dfb55524271e6","b2a88bafab3e21179ed38636efcd8a93","b706b24dc7c64ea1aab257d31c16bbc2","b822a498753b4ca3aa2013e29a6db705","c0abf6955cd946f18cfd47d22e859e3c","ca16bc87fe92b6042fbaa3acc2fbdaa6","ce16d740aea14a6a86ef6c0cc002bb2e","d48b7a678bf0440989a5c3053ccb1993","d7b6750b54984fa3a15824bc475aface","db5268db924e44cab4c446a364e1a54b","dd6a6df0c2d6496785ddff76054da351","e02c1470229e482da6bf4650fc1dc006","e6b446c1ebe782e2b2fc7eb8ef0dc791","f300cca684872f2df140f714437af558","f5ae3d60fbf04a7d9a0170edda65aeea","f8ce0290b90741b8979324a6033ef416","fe377961d5e0480e86ecc1d45ebf4f9c","L64o399ExoDBrAtWTbff7UCBlo2sgBVM","LzelzhyieMrxXlf4mXeIl9fX7fdtttuw","uyL9sPkNBEn2x04bd6teFHfMRH7D72Yz","WhGJTPmHWfpY8HUpXMRkZEMDH745RmJQ","00fef3a9148643bc8c6155711b43da9d","019ade57efc17a93a1b430689b78f362","01d5695106a4473c851ba7563b2dbc47","027222c591e74cbebe839c2034a13ff0","05ccd6159c754f518d69215076b73e2f","06334f7323ca456f9987be9d2704f9bf","10fca57cb187479499a143846a626325","1198b0b4b2234cc78bd715d758f90806","11aebfe61fa143ee823ae86078cb2630","123dcb89556b409ca6662429bf1d3e39","22f63bb7ba0e4ad88f7bd290df131be3","25f499bd3fc740b58eee0df0a3fa81ac","2632fe16c0754321a88b50b567f42507","26ea3f2ce7974bcf9eb793764d673ecb","2902c2af13384ceea1432b546949afc2","341f379c50ac447d9ee1ffaed43ca4b5","3781872c30fd43c49528f3190ff9ada8","3876c487fea04ec9881f8e0d91587abc","3e71a417b53c4b25ab62dfd7a5df14eb","496f08725baf466f8f3ef077bbbc501a","4b1e0595fcbf419897031173654e8a6a","4c66f7b0d1b54abfa57595fda04649a5","4fc182e832424e6dad7ab6397592e782","5302df74d19111f098a608c0ebac9c80","5302e8e7d19111f098a608c0ebac9c80","532e8e2dae7349c3bd4bdec25d2a16cd","57402401d19111f0829c08c0eb4a1a16","574032f2d19111f0829c08c0eb4a1a16","6da48d42793344bd93d1b6b39fc0aa6f","6e57b04a6c9a4f1481b445abe9912193","700629c007914d48bf246059b5b14f72","74d8e29d60dd43f4a60a456809b81471","7737299c1a3843b694b3194ed3499904","79855cd3ba9545369e478b353b653367","7b6c2cd489624dc6975b870e1f567789","7d130b81244542f2b4a4905651358e17","7d275244589c40a2886185c7bbb82165","800d447849b54e938dee75197dc6ed13","90a0f3fc05224a59a04d70b92a65a8c3","9735a2f307c0427192bd8a8ef7abe7f2","a60046f0de3b4be9a7b31d2c270b6f20","af06f4f5ab3d4b2ab0336e6f5b1fc279","b36f43564ee44102a27af0ce4b97dd0c","b7f96967f56b474fb1525223a0c81338","bb1128960f9c4878a34d4b9b5b98c597","bb64c246bbbf45b8bc72e1715309f021","bcb6184a227d4df0ae433994ba81c618","bd4842a10d194695b15e8bef59727795","be442753c8604bcbaef15b46779118f2","c0031ecf834b423e8ad48456c66e31ac","c1b25de914d14f49a525152467d15727","cbdeada35c8b40d7a6595a8df0b28ddc","d1f4f6c4b5704e9abb09d5ca776d494f","d978d0e061a045888874c66f8c83c4b3","da5cf6b1b76f47b7a7e203a280aa7f8a","db69383b9752485dadd98b1fdb33a66d","e191cf05b894458ab9e6272e69892b33","e19e2756d6ff43c2877acbc886f5980b","e4becdd99d2046889ac847b19d3ab2ff","e82358b5c12c40f88a53af1b85d2da98","e9d6ec96bd2f4c11b2f22e10d22b347c","edb5b5dab6264a9b947cdec3e8f32b12","edf0bd66788b4b3fad943ba3785b7c4f","edf5ab09ae6946f8bc1fe76afa3e332e","ee04b25ab8424e8ba52651041bb53012","f06e6c5085a845c887d021a2b65856fe","f2c7b94f452946b59a8b1cb3ac8356c0","f988c628eec34b6eacd389a0cda9a277","f9fea896907d4ff9a762e410a27ededb","fdf338795c1449f493c2dd11518dc238","d5f4bc2c705b47db94f71d10207acbb8","f3b83c8e592aef14c2204ee437d40785","8oopn70201q17s49oq74o507p2po4s5q","c548259c9a6e8356c38be8e39299dd9d","16453299fecefbc045b2ba3ac8bc7d3b","e6598b60ddc2d20af7eb4144547925a7","3cf6053ab2df4eef3f9454db5056c425","b4b86fe35dcc06fb76043c2151dfa8b5","cce16c45e622d9ceae4b626c9353ecec","194456441b68d14a9a4cef78c4c94dd6","a159433a077330cb40effc1aa1ec774a","12515366660baa1f1280e35581fc4ac8","a1b87221a13b15123b1c8b79a866f388"]
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["a1b87221a13b15123b1c8b79a866f388"]
 GRAPHQL_FILTER_TAG = ""
 STOREFRONT_COLLECTION_HANDLES: List[str] = ["womens-jeans"]
 SEARCHSPRING_SITE_ID = ""
 SEARCHSPRING_URL = ""
-SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {
-    
-}
-
-
+SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -104,6 +102,53 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
         "storeAvailability",
     }
 }
+
+# Additional fields to skip in queries/outputs
+EXTRA_FORBIDDEN_COLUMNS: Set[str] = {
+    "product.collections.pageInfo.endCursor",
+    "product.collections.pageInfo.hasNextPage",
+    "product.encodedVariantAvailability",
+    "product.encodedVariantExistence",
+    "product.featuredImage.height",
+    "product.featuredImage.thumbhash",
+    "product.featuredImage.width",
+    "product.images.pageInfo.endCursor",
+    "product.images.pageInfo.hasNextPage",
+    "product.isGiftCard",
+    "product.media.pageInfo.endCursor",
+    "product.media.pageInfo.hasNextPage",
+    "products_edge_cursor",
+    "variant.currentlyNotInStock",
+    "variant.image.height",
+    "variant.image.id",
+    "variant.image.thumbhash",
+    "variant.image.width",
+    "variant.quantityRule.minimum",
+    "variant_edge_cursor",
+    "variants_endCursor",
+    "variants_hasNextPage",
+}
+
+
+def parse_metafield_identifiers(raw: str) -> List[Tuple[str, str]]:
+    identifiers: List[Tuple[str, str]] = []
+    if not raw:
+        return identifiers
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    seen: Set[Tuple[str, str]] = set()
+    for part in parts:
+        if ":" not in part:
+            continue
+        namespace, key = part.split(":", 1)
+        namespace = namespace.strip()
+        key = key.strip()
+        if not namespace or not key:
+            continue
+        tup = (namespace, key)
+        if tup not in seen:
+            identifiers.append(tup)
+            seen.add(tup)
+    return identifiers
 
 
 def normalize_tokens(value: Any) -> List[str]:
@@ -210,16 +255,32 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
 }
 """
 
-FALLBACK_PRODUCTS_QUERY = """
-query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
-  products(first: $pageSize, after: $cursor, query: $query) {
-    pageInfo {
+def build_metafields_selection() -> str:
+    if not METAFIELD_IDENTIFIERS:
+        return ""
+    identifiers_literal = ", ".join(
+        f'{{namespace: "{ns}", key: "{key}"}}' for ns, key in METAFIELD_IDENTIFIERS
+    )
+    return (
+        "metafields(identifiers: ["
+        + identifiers_literal
+        + "]) {\n  namespace\n  key\n  type\n  value\n}"
+    )
+
+
+def build_fallback_products_query() -> str:
+    metafields_selection = build_metafields_selection()
+    metafields_block = f"\n        {metafields_selection}" if metafields_selection else ""
+    return f"""
+query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {{
+  products(first: $pageSize, after: $cursor, query: $query) {{
+    pageInfo {{
       hasNextPage
       endCursor
-    }
-    edges {
+    }}
+    edges {{
       cursor
-      node {
+      node {{
         id
         handle
         title
@@ -231,29 +292,42 @@ query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {
         createdAt
         updatedAt
         publishedAt
-        variants(first: 100) {
-          pageInfo {
+        collections(first: 50) {{
+          edges {{
+            node {{
+              id
+              handle
+              title
+            }}
+          }}
+        }}
+        options {{
+          name
+          values
+        }}{metafields_block}
+        variants(first: 100) {{
+          pageInfo {{
             hasNextPage
             endCursor
-          }
-          edges {
+          }}
+          edges {{
             cursor
-            node {
+            node {{
               id
               title
               sku
               availableForSale
-              price {
+              price {{
                 amount
                 currencyCode
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
 """
 
 SHOP_PROBE_QUERY = "query { shop { name primaryDomain { url } } }"
@@ -305,7 +379,54 @@ query ($typeName: String!) {
 }
 """
 
+FILTER_PROBE_QUERIES = [
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      filters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+    """
+query FiltersProbe($handle: String!) {
+  collection(handle: $handle) {
+    products(first: 1) {
+      productFilters {
+        id
+        label
+        type
+        values {
+          id
+          label
+          count
+          input
+        }
+      }
+    }
+  }
+}
+    """,
+]
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _primary_collection_url() -> Optional[str]:
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        return COLLECTION_URL[0] if COLLECTION_URL else None
+    return COLLECTION_URL
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +786,9 @@ def finalize_common_row(
             if alt_key not in row and option_key in variant:
                 row[alt_key] = variant.get(option_key)
 
+    for forbidden in list(EXTRA_FORBIDDEN_COLUMNS):
+        row.pop(forbidden, None)
+
 
 def finalize_json_row(row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]) -> None:
     finalize_common_row(row, product, variant, source="json")
@@ -674,6 +798,187 @@ def finalize_storefront_row(
     row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]
 ) -> None:
     finalize_common_row(row, product, variant, source="storefront")
+
+
+def extract_collections(product: Dict[str, Any], collection_info: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    handles: List[str] = []
+    titles: List[str] = []
+    collections = product.get("collections")
+    if isinstance(collections, dict):
+        edges = collections.get("edges") or []
+        nodes = collections.get("nodes") or []
+        if nodes:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+        elif edges:
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                handle = node.get("handle")
+                title = node.get("title")
+                if handle:
+                    handles.append(str(handle))
+                if title:
+                    titles.append(str(title))
+
+    fallback_handle = collection_info.get("collection_handle")
+    fallback_title = collection_info.get("collection_title")
+    if fallback_handle and fallback_handle not in handles:
+        handles.append(fallback_handle)
+    if fallback_title and fallback_title not in titles:
+        titles.append(fallback_title)
+    return handles, titles
+
+
+def collect_metafields(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metafields: List[Dict[str, Any]] = []
+    raw_metafields = product.get("metafields")
+    if isinstance(raw_metafields, list):
+        for mf in raw_metafields:
+            if isinstance(mf, dict):
+                metafields.append(
+                    {
+                        "namespace": mf.get("namespace"),
+                        "key": mf.get("key"),
+                        "type": mf.get("type"),
+                        "value": mf.get("value"),
+                    }
+                )
+    elif isinstance(raw_metafields, dict):
+        # Support alias-based selections like mf_0: metafield(...)
+        for value in raw_metafields.values():
+            if isinstance(value, dict):
+                metafields.append(
+                    {
+                        "namespace": value.get("namespace"),
+                        "key": value.get("key"),
+                        "type": value.get("type"),
+                        "value": value.get("value"),
+                    }
+                )
+    return metafields
+
+
+def derive_filter_values(product: Dict[str, Any], metafields: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    filters: Dict[str, Set[str]] = defaultdict(set)
+    product_type = product.get("productType")
+    vendor = product.get("vendor")
+    tags = product.get("tags") or []
+    options = product.get("options") or []
+
+    if product_type:
+        filters["productType"].add(str(product_type))
+    if vendor:
+        filters["vendor"].add(str(vendor))
+    if isinstance(tags, list):
+        for tag in tags:
+            if tag:
+                filters["tags"].add(str(tag))
+
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            name = opt.get("name") or opt.get("title")
+            values = opt.get("values") or []
+            if not name:
+                continue
+            for val in values:
+                if val:
+                    filters[str(name)].add(str(val))
+
+    for mf in metafields:
+        ns = mf.get("namespace")
+        key = mf.get("key")
+        value = mf.get("value")
+        if ns and key and value not in (None, ""):
+            filters[f"{ns}:{key}"].add(str(value))
+
+    return {k: sorted(v) for k, v in filters.items() if v}
+
+
+def normalize_filter_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+    return cleaned or "unnamed"
+
+
+FILTER_COLUMN_SKIP = {"producttype", "vendor", "tags"}
+
+
+def build_filter_corpus(product: Dict[str, Any]) -> Tuple[str, Set[str]]:
+    parts: List[str] = []
+    for field in ("handle", "title", "productType", "vendor"):
+        val = product.get(field)
+        if isinstance(val, str):
+            parts.append(val)
+    tags = product.get("tags") or []
+    if isinstance(tags, list):
+        parts.extend([t for t in tags if isinstance(t, str)])
+    options = product.get("options") or []
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            values = opt.get("values") or []
+            for val in values:
+                if val:
+                    parts.append(str(val))
+    combined = " ".join(parts).lower()
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", combined)
+    tokens = {tok for tok in normalized_text.split() if tok}
+    return normalized_text, tokens
+
+
+def select_filters_for_product(
+    collection_filters: Dict[str, List[str]],
+    product: Dict[str, Any],
+    derived_filters: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    final_filters: Dict[str, List[str]] = {}
+    normalized_text, tokens = build_filter_corpus(product)
+
+    for key, values in derived_filters.items():
+        if not values:
+            continue
+        final_filters[key] = list(values)
+
+    for key, candidates in (collection_filters or {}).items():
+        if key in final_filters:
+            continue
+        matches: List[str] = []
+        for candidate in candidates or []:
+            cand_str = str(candidate)
+            cand_norm = re.sub(r"[^a-z0-9]+", " ", cand_str.lower()).strip()
+            if not cand_norm:
+                continue
+            cand_tokens = {tok for tok in cand_norm.split() if tok}
+            if cand_norm in normalized_text or cand_tokens.issubset(tokens):
+                matches.append(cand_str)
+        if not matches and candidates and len(candidates) == 1:
+            matches = [str(candidates[0])]
+        if matches:
+            final_filters[key] = matches
+
+    return final_filters
+
+
+def apply_filter_columns(row: Dict[str, Any], filter_values: Dict[str, List[str]]) -> None:
+    for raw_key, values in (filter_values or {}).items():
+        norm_key = normalize_filter_name(raw_key)
+        if norm_key in FILTER_COLUMN_SKIP:
+            continue
+        if not values:
+            continue
+        column = f"filter.{norm_key}"
+        row[column] = ", ".join(values)
 
 
 def build_column_order(
@@ -732,26 +1037,19 @@ def write_sheet(
         sheet.append([normalize_cell(row.get(column)) for column in columns])
 
 
-def normalize_collection_urls() -> List[str]:
-    if isinstance(COLLECTION_URL, str):
-        urls = [COLLECTION_URL]
-    else:
-        urls = [str(url) for url in (COLLECTION_URL or []) if url]
-    return [url.strip() for url in urls if url and url.strip()]
-
-
-def primary_collection_url() -> str:
-    urls = normalize_collection_urls()
-    return urls[0] if urls else ""
-
-
-def fetch_collection_html(
-    session: requests.Session, logger: logging.Logger
-) -> List[Tuple[str, str]]:
-    urls = normalize_collection_urls()
-    if not urls:
+def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> str:
+    url = _primary_collection_url()
+    if not url:
         logger.info("No COLLECTION_URL configured; skipping HTML fetch")
-        return []
+        return ""
+    logger.info("Fetching collection HTML from %s", url)
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as exc:
+        logger.warning("Failed to fetch collection HTML: %s", exc)
+        return ""
 
     html_blobs: List[Tuple[str, str]] = []
     for url in urls:
@@ -764,14 +1062,13 @@ def fetch_collection_html(
             logger.warning("Failed to fetch collection HTML from %s: %s", url, exc)
     return html_blobs
 
-
-def build_products_json_urls() -> List[str]:
-    urls: List[str] = []
-    for url in normalize_collection_urls():
-        parts = urlsplit(url)
-        path = parts.path.rstrip("/") + "/products.json"
-        urls.append(urlunsplit((parts.scheme, parts.netloc, path, "", "")))
-    return urls
+def build_products_json_url() -> Optional[str]:
+    url = _primary_collection_url()
+    if not url:
+        return None
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/") + "/products.json"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
 def derive_tag_group_key(tag: str) -> str:
@@ -902,6 +1199,9 @@ def fetch_collection_json(
         options = list(product.get("options") or [])
         option_columns = build_option_columns(options)
 
+        derived_filters = derive_filter_values(product, [])
+        filter_values = select_filters_for_product({}, product, derived_filters)
+
         images = product_copy.get("images") or []
         first_image_src = None
         if isinstance(images, list) and images:
@@ -921,6 +1221,7 @@ def fetch_collection_json(
         base_row = dict(flat_product)
         if tags:
             base_row["product.tags_all"] = ", ".join(tags)
+        apply_filter_columns(base_row, filter_values)
         for key, value in option_columns.items():
             base_row[key] = value
 
@@ -1403,12 +1704,14 @@ class GraphQLQueryBuilder:
         *,
         max_depth: int = 3,
         forbidden_fields: Optional[Dict[str, Sequence[str]]] = None,
+        metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> None:
         self.session = session
         self.endpoint = endpoint
         self.token = token
         self.logger = logger
         self.max_depth = max_depth
+        self.metafield_identifiers = list(metafield_identifiers or METAFIELD_IDENTIFIERS)
         self.forbidden_fields: Dict[str, Set[str]] = defaultdict(set)
         for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
             self.forbidden_fields[parent].update(names)
@@ -1426,6 +1729,16 @@ class GraphQLQueryBuilder:
         self.product_selection = self._build_type_selection("Product", max_depth)
         if not self.product_selection:
             raise GraphQLIntrospectionError("Unable to build product selection set")
+        metafields_selection = self._build_metafields_selection()
+        collections_selection = self._build_collections_selection()
+        if metafields_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, metafields_selection] if part
+            )
+        if collections_selection:
+            self.product_selection = "\n".join(
+                part for part in [self.product_selection, collections_selection] if part
+            )
         self.collection_query = self._build_collection_query()
         self.products_query = self._build_products_query()
 
@@ -1560,6 +1873,69 @@ class GraphQLQueryBuilder:
             args = self._build_field_args(field)
             return f"{name}{args} {{\n{self._indent(body)}\n}}"
         return None
+
+    def _build_metafields_selection(self) -> str:
+        if not self.metafield_identifiers:
+            return ""
+
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        metafields_field = next(
+            (field for field in fields if field.get("name") == "metafields"), None
+        )
+        metafield_field = next(
+            (field for field in fields if field.get("name") == "metafield"), None
+        )
+
+        selection_body = "namespace\nkey\ntype\nvalue"
+        identifiers_literal = ", ".join(
+            f'{{namespace: "{ns}", key: "{key}"}}'
+            for ns, key in self.metafield_identifiers
+        )
+
+        if metafields_field and any(arg.get("name") == "identifiers" for arg in metafields_field.get("args", [])):
+            return (
+                "metafields(identifiers: ["
+                + identifiers_literal
+                + f"]) {{\n  {selection_body}\n}}"
+            )
+
+        if metafield_field and all(
+            any(arg.get("name") == name for arg in metafield_field.get("args", []))
+            for name in ("namespace", "key")
+        ):
+            lines: List[str] = []
+            for idx, (ns, key) in enumerate(self.metafield_identifiers):
+                alias = f"mf_{idx}"
+                lines.append(
+                    f"{alias}: metafield(namespace: \"{ns}\", key: \"{key}\") {{\n  {selection_body}\n}}"
+                )
+            return "\n".join(lines)
+
+        self.logger.debug(
+            "Metafields selection not added; schema lacks identifiers/namespace+key support"
+        )
+        return ""
+
+    def _build_collections_selection(self) -> str:
+        product_type = self.schema.get_type("Product") or {}
+        fields = product_type.get("fields", [])
+        collections_field = next(
+            (field for field in fields if field.get("name") == "collections"), None
+        )
+        if not collections_field:
+            return ""
+        args = self._build_field_args(collections_field)
+        body = (
+            "edges {\n"
+            "  node {\n"
+            "    id\n"
+            "    handle\n"
+            "    title\n"
+            "  }\n"
+            "}"
+        )
+        return f"collections{args} {{\n{self._indent(body)}\n}}"
 
     def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
         args = self._build_field_args(field)
@@ -1704,6 +2080,54 @@ def apply_tag_filter(product: Dict[str, Any]) -> bool:
     return GRAPHQL_FILTER_TAG.lower() in lowered
 
 
+def probe_collection_filters(
+    session: requests.Session,
+    endpoint: str,
+    token: Optional[str],
+    handle: str,
+    logger: logging.Logger,
+) -> Dict[str, List[str]]:
+    for query in FILTER_PROBE_QUERIES:
+        payload = {"query": query, "variables": {"handle": handle}}
+        response, data = perform_graphql_request(session, endpoint, payload, token)
+        if response is None or not response.ok:
+            continue
+
+        filters_block = None
+        collection = ((data or {}).get("data") or {}).get("collection") if data else None
+        if isinstance(collection, dict):
+            products = collection.get("products")
+            if isinstance(products, dict):
+                filters_block = products.get("filters") or products.get("productFilters")
+
+        if not filters_block:
+            continue
+
+        filters: Dict[str, List[str]] = {}
+        for fil in filters_block:
+            if not isinstance(fil, dict):
+                continue
+            label = fil.get("label") or fil.get("id")
+            values = fil.get("values") or []
+            if not label:
+                continue
+            val_labels: List[str] = []
+            for val in values:
+                if isinstance(val, dict):
+                    if val.get("label"):
+                        val_labels.append(str(val.get("label")))
+                    elif val.get("id"):
+                        val_labels.append(str(val.get("id")))
+            if val_labels:
+                filters[str(label)] = val_labels
+        if filters:
+            logger.info("Discovered %s filter groups for collection %s", len(filters), handle)
+            return filters
+
+    logger.debug("No filters discovered for collection %s", handle)
+    return {}
+
+
 def flatten_graphql_product(
     collection_info: Dict[str, Any],
     edge_cursor: str,
@@ -1711,14 +2135,28 @@ def flatten_graphql_product(
     variant_edge: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
-    row["products_edge_cursor"] = edge_cursor
+    collections_handles, collections_titles = extract_collections(product, collection_info)
+    if collections_handles:
+        row["collections.handle"] = ",".join(collections_handles)
+    if collections_titles:
+        row["collections.title"] = ",".join(collections_titles)
+
+    metafields = collect_metafields(product)
+    if metafields:
+        row["metafields"] = json.dumps(metafields)
 
     product_copy = dict(product)
+    for drop_key in (
+        "encodedVariantAvailability",
+        "encodedVariantExistence",
+        "featuredImage",
+        "images",
+        "media",
+        "isGiftCard",
+    ):
+        product_copy.pop(drop_key, None)
+    product_copy.pop("collections", None)
     variants = product_copy.pop("variants", None)
-    if isinstance(variants, dict):
-        page_info = variants.get("pageInfo") or {}
-        row["variants_hasNextPage"] = page_info.get("hasNextPage")
-        row["variants_endCursor"] = page_info.get("endCursor")
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
 
@@ -1726,12 +2164,18 @@ def flatten_graphql_product(
     for key, value in option_columns.items():
         row[key] = value
 
+    collection_filters = collection_info.get("collection_filters") if isinstance(collection_info, dict) else {}
+    derived_filters = derive_filter_values(product, metafields)
+    filter_values = select_filters_for_product(collection_filters, product, derived_filters)
+    apply_filter_columns(row, filter_values)
+
     if variant_edge is None:
         finalize_storefront_row(row, product, None)
         return row
 
     variant = dict(variant_edge.get("node") or {})
-    row["variant_edge_cursor"] = variant_edge.get("cursor", "")
+    for drop_key in ("quantityRule", "image"):
+        variant.pop(drop_key, None)
     flat_variant = flatten_record({"variant": variant})
     row.update(flat_variant)
     finalize_storefront_row(row, product, variant)
@@ -1758,6 +2202,7 @@ def collect_storefront_from_collections(
                 token,
                 logger,
                 forbidden_fields=forbidden,
+                metafield_identifiers=METAFIELD_IDENTIFIERS,
             )
         except GraphQLIntrospectionError as exc:
             logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
@@ -1767,8 +2212,14 @@ def collect_storefront_from_collections(
         rows: List[Dict[str, Any]] = []
         need_retry = False
         newly_blocked: Dict[str, Set[str]] = defaultdict(set)
+        collection_filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in collection_filters_cache:
+                collection_filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, token, handle, logger
+                )
+            handle_filters = collection_filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -1840,6 +2291,7 @@ def collect_storefront_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
                 products_connection = collection.get("products") or {}
                 edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
@@ -1931,7 +2383,12 @@ def collect_storefront_from_products(
 
     try:
         builder = GraphQLQueryBuilder(
-            session, endpoint, token, logger, forbidden_fields=forbidden
+            session,
+            endpoint,
+            token,
+            logger,
+            forbidden_fields=forbidden,
+            metafield_identifiers=METAFIELD_IDENTIFIERS,
         )
     except GraphQLIntrospectionError as exc:
         logger.debug("Unable to build products query for %s: %s", endpoint, exc)
@@ -2027,8 +2484,14 @@ def fallback_collect_from_collections(
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
         success = True
+        filters_cache: Dict[str, Dict[str, List[str]]] = {}
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
+            if handle not in filters_cache:
+                filters_cache[handle] = probe_collection_filters(
+                    session, endpoint, None, handle, logger
+                )
+            handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
             while True:
                 payload = {
@@ -2069,6 +2532,7 @@ def fallback_collect_from_collections(
                     "collection_id": collection.get("id"),
                     "collection_handle": collection.get("handle"),
                     "collection_title": collection.get("title"),
+                    "collection_filters": handle_filters,
                 }
 
                 products_connection = collection.get("products") or {}
@@ -2136,10 +2600,11 @@ def fallback_collect_from_products(
         rows: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
         first_status: Optional[int] = None
+        fallback_query = build_fallback_products_query()
 
         while True:
             payload = {
-                "query": FALLBACK_PRODUCTS_QUERY,
+                "query": fallback_query,
                 "variables": {
                     "cursor": cursor,
                     "pageSize": GRAPHQL_PAGE_SIZE,
@@ -2388,6 +2853,18 @@ def export_workbook(
 # Main entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Retail data probe")
+    parser.add_argument(
+        "--metafield",
+        dest="metafields",
+        help="Comma-separated list of namespace:key metafields to request via Storefront API",
+        default="",
+    )
+    args = parser.parse_args()
+
+    global METAFIELD_IDENTIFIERS
+    METAFIELD_IDENTIFIERS = parse_metafield_identifiers(args.metafields)
+
     logger = configure_logging()
     session = build_session()
     html_blobs = fetch_collection_html(session, logger)

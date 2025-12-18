@@ -135,21 +135,26 @@ MIN_HEURISTIC_LENGTH = 32
 # objects (inline script JSON/config blobs). Substring, case-insensitive
 # matching is applied.
 KEY_CANDIDATES = [
-    "accessToken",
     "storefront_access_token",
+    "storefrontAccessToken",
+    "x-shopify-storefront-access-token",
+    "accessToken",
     "apiKey",
     "client_secret",
-    "token",
-    "authToken",
-    "storeFrontApi",
-    "X-Shopify-Storefront-Access-Token",
 ]
+
+NOISY_SECRET_KEYS = {
+    "shopifycheckoutapitoken",
+    "checkoutapitoken",
+    "shopify-checkout-api-token",
+}
+
+KNOWN_PUBLIC_TOKENS = set()
 
 # Heuristic literal patterns that often correspond to opaque credentials.
 HEURISTIC_LITERAL_PATTERNS = [
     re.compile(r"shp(?:at|ca|pa|ua)_[0-9a-zA-Z]{32}"),
     re.compile(r"\b[0-9a-f]{32}\b"),
-    re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{31,}"),
 ]
 
 visited_urls: Set[str] = set()
@@ -238,7 +243,10 @@ def normalize_for_visit(url: str) -> str:
 
 def is_binary_url(url: str) -> bool:
     lowered = url.lower()
-    return lowered.startswith("blob:") or any(lowered.endswith(ext) for ext in BINARY_EXTENSIONS)
+    if lowered.startswith("blob:"):
+        return True
+    path = urlparse(lowered).path
+    return any(path.endswith(ext) for ext in BINARY_EXTENSIONS)
 
 
 def should_skip_url(url: str) -> bool:
@@ -308,6 +316,8 @@ def fetch_text(
 
 
 def record_token(tokens: TokenStore, token: str, source_url: str, reason: str) -> None:
+    if token in KNOWN_PUBLIC_TOKENS:
+        return
     entry = tokens.setdefault(token, {"sources": set(), "reasons": set()})
     entry["sources"].add(source_url)
     entry["reasons"].add(reason)
@@ -319,11 +329,14 @@ def extract_literal_tokens(text: str) -> Set[str]:
     hits: Set[str] = set()
     for pattern in HEURISTIC_LITERAL_PATTERNS:
         hits.update(pattern.findall(text))
-    # Also capture any other long alphanumeric-ish literals to avoid missing
-    # tokens with novel prefixes while keeping noise lower than the prior
-    # 20-character threshold.
-    fallback_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{%s,}" % (MIN_HEURISTIC_LENGTH - 1))
-    hits.update(fallback_pattern.findall(text))
+    return hits
+
+
+def extract_literal_tokens_from_scripts(html: str) -> Set[str]:
+    hits: Set[str] = set()
+    for blob in extract_script_blobs(html):
+        if blob["text"]:
+            hits.update(extract_literal_tokens(blob["text"]))
     return hits
 
 
@@ -493,9 +506,15 @@ def find_candidate_keys(obj: Any, key_candidates: Sequence[str], path: str = "")
     hits: List[Tuple[str, str, Any]] = []
     lower_candidates = [kc.lower() for kc in key_candidates]
 
+    def _normalize_key(key: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", key.lower())
+
     if isinstance(obj, dict):
         for k, v in obj.items():
             new_path = f"{path}.{k}" if path else k
+            normalized_key = _normalize_key(k)
+            if normalized_key in NOISY_SECRET_KEYS:
+                continue
             if any(candidate in k.lower() for candidate in lower_candidates):
                 hits.append((new_path, k, v))
             hits.extend(find_candidate_keys(v, key_candidates, new_path))
@@ -518,7 +537,12 @@ def process_text_blob(
     logger: logging.Logger,
 ) -> Tuple[str, Set[str]]:
     normalized = text.replace("\\/", "/")
-    tokens = extract_literal_tokens(normalized)
+    lower_url = source_url.lower()
+    tokens: Set[str] = set()
+    if lower_url.endswith((".js", ".mjs", ".json")):
+        tokens = extract_literal_tokens(normalized)
+    elif "<script" in normalized.lower():
+        tokens = extract_literal_tokens_from_scripts(normalized)
     if tokens:
         logger.info("%s tokens found in %s", len(tokens), source_url)
     for tok in tokens:
