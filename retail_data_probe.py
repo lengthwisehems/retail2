@@ -1551,9 +1551,14 @@ def fetch_searchspring_data(
     return rows, tag_group_columns
 
 
-def make_absolute(url: str, base: str) -> str:
+def make_absolute(url: str, base: Any) -> str:
     if not url:
         return url
+    if isinstance(base, (list, tuple)):
+        base = base[0] if base else ""
+    if not isinstance(base, str) or not base:
+        primary = _primary_collection_url()
+        base = primary or ""
     return urljoin(base, url)
 
 
