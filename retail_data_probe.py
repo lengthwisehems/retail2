@@ -35,6 +35,7 @@ SEARCHSPRING_SITE_ID = ""
 SEARCHSPRING_URL = ""
 SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
 METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
+COLLECTION_TITLE_MAP: Dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -835,6 +836,10 @@ def extract_collections(product: Dict[str, Any], collection_info: Dict[str, Any]
         handles.append(fallback_handle)
     if fallback_title and fallback_title not in titles:
         titles.append(fallback_title)
+    if COLLECTION_TITLE_MAP and handles:
+        for h in handles:
+            if h in COLLECTION_TITLE_MAP and COLLECTION_TITLE_MAP[h] not in titles:
+                titles.append(COLLECTION_TITLE_MAP[h])
     return handles, titles
 
 
@@ -1071,6 +1076,63 @@ def build_products_json_url() -> Optional[str]:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def build_products_json_urls() -> List[str]:
+    urls: List[str] = []
+    if isinstance(COLLECTION_URL, (list, tuple)):
+        for item in COLLECTION_URL:
+            if not item:
+                continue
+            parts = urlsplit(item)
+            path = parts.path.rstrip("/") + "/products.json"
+            urls.append(urlunsplit((parts.scheme, parts.netloc, path, "", "")))
+    else:
+        single = build_products_json_url()
+        if single:
+            urls.append(single)
+    return urls
+
+
+def fetch_collection_titles(session: requests.Session, logger: logging.Logger) -> Dict[str, str]:
+    url = _primary_collection_url()
+    if not url:
+        return {}
+    parts = urlsplit(url)
+    base = f"{parts.scheme}://{parts.netloc}"
+    titles: Dict[str, str] = {}
+    page = 1
+    while True:
+        target = f"{base}/collections.json"
+        params = {"page": page, "limit": 250}
+        try:
+            resp = session.get(target, params=params, timeout=REQUEST_TIMEOUT, verify=False)
+        except requests.RequestException as exc:
+            logger.debug("Failed to fetch collections.json: %s", exc)
+            break
+        if not resp.ok:
+            break
+        try:
+            payload = resp.json()
+        except ValueError:
+            break
+        collections = payload.get("collections") if isinstance(payload, dict) else None
+        if not collections:
+            break
+        for coll in collections:
+            if not isinstance(coll, dict):
+                continue
+            handle = coll.get("handle")
+            title = coll.get("title")
+            if handle and title:
+                titles[str(handle)] = str(title)
+        if len(collections) < 250:
+            break
+        page += 1
+        time.sleep(0.25)
+    if titles:
+        logger.info("Discovered %s collections from collections.json", len(titles))
+    return titles
+
+
 def derive_tag_group_key(tag: str) -> str:
     normalized = str(tag or "").strip().lower()
     if not normalized:
@@ -1125,8 +1187,6 @@ def fetch_collection_json(
         return [], []
 
     all_products: List[Dict[str, Any]] = []
-    seen_handles: Set[str] = set()
-
     for products_json_url in products_json_urls:
         page = 1
         while True:
@@ -1137,44 +1197,27 @@ def fetch_collection_json(
                     products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
                 )
             except requests.RequestException as exc:
-                logger.warning("Collection JSON request failed for %s: %s", products_json_url, exc)
+                logger.warning("Collection JSON request failed: %s", exc)
                 break
 
             if not response.ok:
                 logger.warning(
-                    "Collection JSON request returned status %s for %s",
-                    response.status_code,
-                    products_json_url,
+                    "Collection JSON request returned status %s", response.status_code
                 )
                 break
 
             try:
                 data = response.json()
             except ValueError:
-                logger.warning(
-                    "Collection JSON response was not valid JSON for %s", products_json_url
-                )
+                logger.warning("Collection JSON response was not valid JSON")
                 break
 
             products = data.get("products") or []
             if not products:
-                logger.info(
-                    "No products found on page %s for %s; stopping pagination",
-                    page,
-                    products_json_url,
-                )
+                logger.info("No products found on page %s; stopping pagination", page)
                 break
 
-            for product in products:
-                if not isinstance(product, dict):
-                    continue
-                handle = str(product.get("handle") or "")
-                if handle and handle in seen_handles:
-                    continue
-                if handle:
-                    seen_handles.add(handle)
-                all_products.append(product)
-
+            all_products.extend(products)
             if len(products) < 250:
                 break
             page += 1
@@ -1551,9 +1594,14 @@ def fetch_searchspring_data(
     return rows, tag_group_columns
 
 
-def make_absolute(url: str, base: str) -> str:
+def make_absolute(url: str, base: Any) -> str:
     if not url:
         return url
+    if isinstance(base, (list, tuple)):
+        base = base[0] if base else ""
+    if not isinstance(base, str) or not base:
+        primary = _primary_collection_url()
+        base = primary or ""
     return urljoin(base, url)
 
 
@@ -2867,7 +2915,9 @@ def main() -> None:
 
     logger = configure_logging()
     session = build_session()
-    html_blobs = fetch_collection_html(session, logger)
+    global COLLECTION_TITLE_MAP
+    COLLECTION_TITLE_MAP = fetch_collection_titles(session, logger)
+    html = fetch_collection_html(session, logger)
     json_rows, tag_group_columns = fetch_collection_json(session, logger)
     if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:
         searchspring_rows, searchspring_tag_columns = fetch_searchspring_data(session, logger)
