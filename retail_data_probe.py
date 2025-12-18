@@ -55,8 +55,14 @@ TOKEN_REGEX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 DEFAULT_GRAPHQL_VERSIONS = [
     "api/2025-10/graphql.json",
+    "api/2024-01/graphql.json",
+    "api/2025-01/graphql.json",
     "api/2025-07/graphql.json",
+    "api/2025-04/graphql.json",
     "api/unstable/graphql.json",
+    "api/2024-04/graphql.json",
+    "api/2023-01/graphql.json",
+    "api/2023-04/graphql.json",
 ]
 
 COLUMN_ORDER_BASE: Tuple[str, ...] = (
@@ -172,6 +178,32 @@ def normalize_tokens(value: Any) -> List[str]:
         seen.add(token)
         ordered.append(token)
     return ordered
+
+
+def format_error_note(errors: Optional[List[Dict[str, Any]]]) -> str:
+    """Summarize GraphQL errors for logging and the Storefront_access sheet.
+
+    This keeps the count while appending the first error's path/message so
+    entries like "errors:1" have immediate context when a probe returns HTTP 200
+    but Shopify still reports GraphQL errors.
+    """
+
+    if not errors:
+        return "errors:0"
+
+    first = errors[0] or {}
+    path = first.get("path") or []
+    message = first.get("message") or first.get("error") or ""
+    path_str = ".".join(str(p) for p in path if p is not None)
+
+    details: List[str] = []
+    if path_str:
+        details.append(f"path={path_str}")
+    if message:
+        details.append(f"msg={message}")
+
+    suffix = f":{' | '.join(details)}" if details else ""
+    return f"errors:{len(errors)}{suffix}"
 
 FALLBACK_COLLECTION_QUERY = """
 query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
@@ -1019,6 +1051,16 @@ def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> 
         logger.warning("Failed to fetch collection HTML: %s", exc)
         return ""
 
+    html_blobs: List[Tuple[str, str]] = []
+    for url in urls:
+        logger.info("Fetching collection HTML from %s", url)
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT, verify=False)
+            response.raise_for_status()
+            html_blobs.append((url, response.text))
+        except requests.RequestException as exc:
+            logger.warning("Failed to fetch collection HTML from %s: %s", url, exc)
+    return html_blobs
 
 def build_products_json_url() -> Optional[str]:
     url = _primary_collection_url()
@@ -1077,46 +1119,66 @@ def collect_tag_values(record: Dict[str, Any]) -> List[str]:
 def fetch_collection_json(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    products_json_url = build_products_json_url()
-    if not products_json_url:
+    products_json_urls = build_products_json_urls()
+    if not products_json_urls:
         logger.info("No collection JSON URL computed; skipping JSON extraction")
-        return []
+        return [], []
 
-    page = 1
     all_products: List[Dict[str, Any]] = []
-    while True:
-        params = {"limit": 250, "page": page}
-        logger.info("Fetching collection JSON page %s", page)
-        try:
-            response = session.get(
-                products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
-            )
-        except requests.RequestException as exc:
-            logger.warning("Collection JSON request failed: %s", exc)
-            break
+    seen_handles: Set[str] = set()
 
-        if not response.ok:
-            logger.warning(
-                "Collection JSON request returned status %s", response.status_code
-            )
-            break
+    for products_json_url in products_json_urls:
+        page = 1
+        while True:
+            params = {"limit": 250, "page": page}
+            logger.info("Fetching collection JSON page %s from %s", page, products_json_url)
+            try:
+                response = session.get(
+                    products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
+                )
+            except requests.RequestException as exc:
+                logger.warning("Collection JSON request failed for %s: %s", products_json_url, exc)
+                break
 
-        try:
-            data = response.json()
-        except ValueError:
-            logger.warning("Collection JSON response was not valid JSON")
-            break
+            if not response.ok:
+                logger.warning(
+                    "Collection JSON request returned status %s for %s",
+                    response.status_code,
+                    products_json_url,
+                )
+                break
 
-        products = data.get("products") or []
-        if not products:
-            logger.info("No products found on page %s; stopping pagination", page)
-            break
+            try:
+                data = response.json()
+            except ValueError:
+                logger.warning(
+                    "Collection JSON response was not valid JSON for %s", products_json_url
+                )
+                break
 
-        all_products.extend(products)
-        if len(products) < 250:
-            break
-        page += 1
-        time.sleep(0.5)
+            products = data.get("products") or []
+            if not products:
+                logger.info(
+                    "No products found on page %s for %s; stopping pagination",
+                    page,
+                    products_json_url,
+                )
+                break
+
+            for product in products:
+                if not isinstance(product, dict):
+                    continue
+                handle = str(product.get("handle") or "")
+                if handle and handle in seen_handles:
+                    continue
+                if handle:
+                    seen_handles.add(handle)
+                all_products.append(product)
+
+            if len(products) < 250:
+                break
+            page += 1
+            time.sleep(0.5)
 
     logger.info("Collected %s products from collection JSON", len(all_products))
     rows: List[Dict[str, Any]] = []
@@ -1330,8 +1392,9 @@ def fetch_searchspring_data(
                 params["siteId"] = SEARCHSPRING_SITE_ID
             params.setdefault("resultsFormat", "json")
             params.setdefault("resultsPerPage", 250)
-            if COLLECTION_URL and not params.get("domain"):
-                params["domain"] = COLLECTION_URL
+            primary_url = primary_collection_url()
+            if primary_url and not params.get("domain"):
+                params["domain"] = primary_url
         elif SEARCHSPRING_SITE_ID and not params.get("siteId"):
             params["siteId"] = SEARCHSPRING_SITE_ID
 
@@ -1495,10 +1558,12 @@ def make_absolute(url: str, base: str) -> str:
 
 
 def discover_tokens(
-    session: requests.Session, html: str, logger: logging.Logger
+    session: requests.Session, html_blobs: List[Tuple[str, str]], logger: logging.Logger
 ) -> List[Tuple[str, str]]:
     tokens: Dict[str, str] = {}
-    if html:
+    for base_url, html in html_blobs:
+        if not html:
+            continue
         for token in set(TOKEN_REGEX.findall(html)):
             tokens.setdefault(token, "collection_html")
 
@@ -1507,7 +1572,7 @@ def discover_tokens(
         for script in soup.find_all("script"):
             src = script.get("src")
             if src:
-                absolute = make_absolute(src, COLLECTION_URL)
+                absolute = make_absolute(src, base_url)
                 script_urls.append(absolute)
                 for token in set(TOKEN_REGEX.findall(absolute)):
                     tokens.setdefault(token, f"script_url:{absolute}")
@@ -2002,7 +2067,7 @@ def probe_graphql_endpoints(
                         operational.append(endpoint)
                 else:
                     errors = (data or {}).get("errors") if data else None
-                    entry["note"] = f"errors:{len(errors)}" if errors else "no_shop_data"
+                    entry["note"] = format_error_note(errors) if errors else "no_shop_data"
             access_rows.append(entry)
     return access_rows, operational, success_map
 
@@ -2194,7 +2259,7 @@ def collect_storefront_from_collections(
                                 newly_blocked[target_type].add(field_name)
                                 need_retry = True
                         if unrecoverable:
-                            return [], first_status, f"no_collection_data:{len(errors)}"
+                            return [], first_status, format_error_note(errors)
                         break
                     return [], first_status, "no_collection_data"
 
@@ -2220,7 +2285,7 @@ def collect_storefront_from_collections(
                     if need_retry:
                         break
                     if not new_field_added:
-                        return [], first_status, f"errors:{len(errors)}"
+                        return [], first_status, format_error_note(errors)
 
                 collection_info = {
                     "collection_id": collection.get("id"),
@@ -2351,9 +2416,9 @@ def collect_storefront_from_products(
         products_connection = ((data or {}).get("data") or {}).get("products") if data else None
         if not products_connection:
             errors = (data or {}).get("errors") if data else None
-            return [], first_status, (
-                f"no_products_data:{len(errors)}" if errors else "no_products_data"
-            )
+            if errors:
+                return [], first_status, format_error_note(errors)
+            return [], first_status, "no_products_data"
 
         errors = (data or {}).get("errors") if data else None
         if errors:
@@ -2618,7 +2683,7 @@ def fallback_collect_from_products(
 
 def gather_storefront_data(
     session: requests.Session,
-    html: str,
+    html_blobs: List[Tuple[str, str]],
     logger: logging.Logger,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     endpoints = determine_graphql_endpoints()
@@ -2697,8 +2762,8 @@ def gather_storefront_data(
                 return result, access_rows
 
     discovered_tokens: List[Tuple[Optional[str], str]] = []
-    if html:
-        new_tokens = discover_tokens(session, html, logger)
+    if html_blobs:
+        new_tokens = discover_tokens(session, html_blobs, logger)
         if new_tokens:
             discovery_rows, _ops, discovery_success = probe_graphql_endpoints(
                 session,
@@ -2802,14 +2867,14 @@ def main() -> None:
 
     logger = configure_logging()
     session = build_session()
-    html = fetch_collection_html(session, logger)
+    html_blobs = fetch_collection_html(session, logger)
     json_rows, tag_group_columns = fetch_collection_json(session, logger)
     if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:
         searchspring_rows, searchspring_tag_columns = fetch_searchspring_data(session, logger)
     else:
         logger.info("Searchspring configuration missing; skipping Searchspring extraction")
         searchspring_rows, searchspring_tag_columns = [], []
-    storefront_rows, access_rows = gather_storefront_data(session, html, logger)
+    storefront_rows, access_rows = gather_storefront_data(session, html_blobs, logger)
     output_path = export_workbook(
         json_rows,
         storefront_rows,
