@@ -28,21 +28,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 from urllib.parse import urljoin, urlparse
-
-try:
-    import playwright  # type: ignore
-except ImportError:  # pragma: no cover - environment guard
-    print("Playwright not installed. Run:")
-    print("    pip install playwright")
-    print("    playwright install chromium")
-    sys.exit(1)
 
 import requests
 from bs4 import BeautifulSoup
@@ -62,36 +52,136 @@ OUTPUT_DIR = BASE_DIR / "Output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Set this to the target collection URL before running.
-COLLECTION_URL = "https://www.ebdenim.com/collections/pants"
+COLLECTION_URL = "https://www.aninebing.com/collections/denim-1"
 
-LOG_PATH = BASE_DIR / "token_probe_run.log"
-EXCEL_BASENAME = "graphql_tokens.xlsx"
+LOG_PATH = BASE_DIR / "aninebing_token_probe_run.log"
+EXCEL_BASENAME = "aninebing_graphql_tokens.xlsx"
 
 # Hosts to treat as app endpoints when scanning HTML/script bodies. This lets us
 # probe third-party app URLs seen in page markup without hardcoding per-brand
 # secrets.
 APP_HOST_KEYWORDS = [
-    "rebuyengine.com",
-    "cached.rebuyengine.com",
-    "cdn.rebuyengine.com",
-    "avada.io",
-    "avada.app",
-    "hengam.io",
-    "nice-team.net",
-    "postscript.io",
-    "shopifycloud.com",
-    "shopifycdn.net",
+    "aa.agkn.com",
+    "ad.360yield.com",
+    "ad.tpmn.co.kr",
+    "ad.tpmn.io",
+    "ade.clmbtech.com",
+    "analytics.tiktok.com",
+    "anine-bing-merch.immersiveecommerce.com",
+    "aninebing-us.attn.tv",
+    "api.st2.antavo.com",
+    "api.yotpo.com",
+    "app.consentmo.com",
+    "bat.bing.com",
+    "c.bing.com",
+    "cdn.attn.tv",
+    "cdn.heapanalytics.com",
+    "cdn.jsdelivr.net",
+    "cdn.resonate.com",
+    "cdn.shopify.com",
+    "cdn-loyalty.yotpo.com",
+    "cdn-swell-assets.yotpo.com",
+    "cdn-widgetsrepository.yotpo.com",
+    "cm.g.doubleclick.net",
+    "criteo-partners.tremorhub.com",
+    "criteo-sync.teads.tv",
+    "crossborder-integration.global-e.com",
+    "cs.media.net",
+    "dis.criteo.com",
+    "dpm.demdex.net",
+    "ds.reson8.com",
+    "easygdpr.b-cdn.net",
+    "eb2.3lift.com",
+    "exchange.mediavine.com",
+    "g10300385420.co",
+    "gcc.metizapps.com",
+    "gdprcdn.b-cdn.net",
+    "gum.criteo.com",
+    "he.lijit.com",
+    "heapanalytics.com",
+    "herochat-plugin.chatbotize.com",
+    "i.liadm.com",
+    "ib.adnxs.com",
+    "jadserve.postrelease.com",
+    "js.findmine.com",
+    "lit.findmine.com",
+    "live-chat.chatbotize.com",
+    "login.dotomi.com",
+    "maxcdn.bootstrapcdn.com",
+    "otlp-http-production.shopifysvc.com",
+    "p.yotpo.com",
+    "pagead2.googlesyndication.com",
+    "partner.medialiance.com",
+    "partner.mediawallahscript.com",
+    "pdimg-prod-fmv3.findmine.com",
+    "ping.fastsimon.com",
+    "pippio.com",
+    "pixel.rubiconproject.com",
+    "premcdn.swymrelay.com",
+    "public-prod-dspcookiematching.dmxleo.com",
+    "r.casalemedia.com",
+    "redirectify.app",
+    "rtb-csync.smartadserver.com",
+    "s3.global-e.com",
+    "script.hotjar.com",
+    "sec.webeyez.com",
+    "settings.fastsimon.com",
+    "shop.app",
+    "shopify.rakutenadvertising.io",
+    "shopify-gtm-suite.getelevar.com",
+    "shopify-init.blackcrow.ai",
+    "simage2.pubmatic.com",
+    "simage4.pubmatic.com",
+    "sp.booxi.com",
+    "sslwidget.criteo.com",
+    "static.criteo.net",
+    "static.hotjar.com",
+    "static.klaviyo.com",
+    "static.shopmy.us",
+    "static-autocomplete.fastsimon.com",
+    "static-tracking.klaviyo.com",
+    "staticw2.yotpo.com",
+    "swymstore-v3premium-01.swymrelay.com",
+    "swymv3premium-01.azureedge.net",
+    "sync.1rx.io",
+    "sync.outbrain.com",
+    "sync.targeting.unrulymedia.com",
+    "sync-t1.taboola.com",
+    "szero.narvar.com",
+    "tag.rmp.rakuten.com",
+    "tapestry.tapad.com",
+    "tikjv.aninebing.com",
+    "tr.snapchat.com",
+    "track.securedvisit.com",
+    "trends.revcontent.com",
+    "us3-api.eng.bloomreach.com",
+    "waw.chat.getzowie.com",
+    "webservices.global-e.com",
+    "widget.eu.criteo.com",
+    "www.aninebing.com",
+    "www.booxi.com",
+    "www.youtube.com",
+    "x.bidswitch.net",
 ]
 
 # Hosts to skip fetching entirely (noise / unreachable in automation).
 SKIP_HOSTS = {
     "cct.google",
-    "fonts.shopify.com",
+    "www.google.com",
+    "google.com",
     "monorail-edge-ca.shopifycloud.com",
     "monorail-edge-staging.shopifycloud.com",
     "monorail-edge.shopifysvc.com",
     "analytics.google.com",
     "www.google-analytics.com",
+    "googleads.g.doubleclick.net",
+    "www.googleadservices.com",
+    "www.googletagmanager.com",
+    "fonts.shopify.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "fonts.shopifycdn.com",
+    "fonts.cdnfonts.com",
     "www.merchant-center-analytics.goog",
 }
 
@@ -131,16 +221,26 @@ BINARY_EXTENSIONS = (
 
 MIN_HEURISTIC_LENGTH = 32
 
+HEX_32_PATTERN = re.compile(r"\b[0-9a-f]{32}\b")
+BROAD_32_PATTERN = re.compile(r"(?<![0-9a-z])[0-9a-z]{32}(?![0-9a-z])", re.I)
+PREFIXED_32_PATTERN = re.compile(r"shp(?:at|ca|pa|ua)_[0-9a-zA-Z]{32}")
+
 # Keys that should be treated as suspicious when found inside structured
 # objects (inline script JSON/config blobs). Substring, case-insensitive
 # matching is applied.
 KEY_CANDIDATES = [
-    "storefront_access_token",
-    "storefrontAccessToken",
-    "x-shopify-storefront-access-token",
     "accessToken",
+    "storefront_access_token",
     "apiKey",
     "client_secret",
+    "token",
+    "authToken",
+    "AUTH-TOKEN",
+    "storeFrontApi",
+    "X-Shopify-Storefront-Access-Token",
+    "x-shopify-storefront-access-token",
+    "storefrontaccesstoken",
+    "storefrontAccessToken",
 ]
 
 NOISY_SECRET_KEYS = {
@@ -152,10 +252,7 @@ NOISY_SECRET_KEYS = {
 KNOWN_PUBLIC_TOKENS = set()
 
 # Heuristic literal patterns that often correspond to opaque credentials.
-HEURISTIC_LITERAL_PATTERNS = [
-    re.compile(r"shp(?:at|ca|pa|ua)_[0-9a-zA-Z]{32}"),
-    re.compile(r"\b[0-9a-f]{32}\b"),
-]
+HEURISTIC_LITERAL_PATTERNS = (HEX_32_PATTERN, PREFIXED_32_PATTERN)
 
 visited_urls: Set[str] = set()
 page_html_cache: Dict[str, str] = {}
@@ -245,6 +342,8 @@ def is_binary_url(url: str) -> bool:
     lowered = url.lower()
     if lowered.startswith("blob:"):
         return True
+    if any(ext in lowered for ext in BINARY_EXTENSIONS):
+        return True
     path = urlparse(lowered).path
     return any(path.endswith(ext) for ext in BINARY_EXTENSIONS)
 
@@ -300,15 +399,6 @@ def fetch_text(
         if not is_textual(normalized, content_type):
             return ""
         text = resp.text
-        if normalized.lower().endswith(".js"):
-            lower_text = text.lower()
-            if (
-                len(text) > 250_000
-                and not any(k.lower() in lower_text for k in KEY_CANDIDATES)
-                and not any(p.search(text) for p in HEURISTIC_LITERAL_PATTERNS)
-            ):
-                logger.info("Skipping large script with no key signals: %s", normalized)
-                return ""
         return text
     except requests.RequestException as exc:  # pragma: no cover - network-dependent
         logger.warning("Fetch failed %s -> %s", normalized, exc)
@@ -329,6 +419,68 @@ def extract_literal_tokens(text: str) -> Set[str]:
     hits: Set[str] = set()
     for pattern in HEURISTIC_LITERAL_PATTERNS:
         hits.update(pattern.findall(text))
+    return hits
+
+
+VARIABLE_ASSIGNMENT_RE = re.compile(
+    r"(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*(['\"`])([^'\"`]+)\2"
+)
+
+variable_assignments: Dict[str, Set[str]] = {}
+
+
+def update_variable_assignments(text: str) -> None:
+    for match in VARIABLE_ASSIGNMENT_RE.finditer(text):
+        name = match.group(1)
+        value = match.group(3)
+        if not name or not value:
+            continue
+        variable_assignments.setdefault(name, set()).add(value)
+
+
+def resolve_js_variable_value(text: str, variable_name: str) -> str | None:
+    pattern = re.compile(
+        rf"(?:var|let|const)?\s*{re.escape(variable_name)}\s*=\s*(['\"`])([^'\"`]+)\1"
+    )
+    match = pattern.search(text)
+    if match:
+        return match.group(2)
+    values = variable_assignments.get(variable_name)
+    if values:
+        return sorted(values)[0]
+    return None
+
+
+def extract_key_candidate_values_from_text(
+    text: str,
+    blocked_values: Set[str],
+) -> List[Tuple[str, str, str]]:
+    hits: List[Tuple[str, str, str]] = []
+    for key in KEY_CANDIDATES:
+        if normalize_key(key) in NOISY_SECRET_KEYS:
+            continue
+        key_pattern = re.compile(
+            rf"(?:['\"])?{re.escape(key)}(?:['\"])?\s*:\s*([^,}}]+)",
+            re.I,
+        )
+        for match in key_pattern.finditer(text):
+            if normalize_key(key) in NOISY_SECRET_KEYS:
+                continue
+            raw_value = match.group(1).strip()
+            if raw_value.startswith(("'", '"')):
+                value_match = re.match(r"""['"]([^'"]+)['"]""", raw_value)
+                if not value_match:
+                    continue
+                value = value_match.group(1)
+                extraction = "key_match"
+            else:
+                variable_name = re.sub(r"[^A-Za-z0-9_$]", "", raw_value)
+                if not variable_name:
+                    continue
+                value = resolve_js_variable_value(text, variable_name) or ""
+                extraction = "variable_extraction"
+            if value and value not in blocked_values:
+                hits.append((key, value, extraction))
     return hits
 
 
@@ -500,28 +652,61 @@ def safe_json_loads(blob: str) -> Any | None:
         return None
 
 
-def find_candidate_keys(obj: Any, key_candidates: Sequence[str], path: str = "") -> List[Tuple[str, str, Any]]:
+def normalize_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
+def extract_noisy_meta_tokens(html: str) -> Set[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    noisy_values: Set[str] = set()
+    for tag in soup.find_all("meta"):
+        name = tag.get("name") or tag.get("id") or tag.get("property") or ""
+        if name and normalize_key(name) in NOISY_SECRET_KEYS:
+            content = tag.get("content")
+            if content:
+                noisy_values.add(content)
+    return noisy_values
+
+
+def collect_noisy_values(obj: Any) -> Set[str]:
+    noisy_values: Set[str] = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if normalize_key(k) in NOISY_SECRET_KEYS and isinstance(v, str):
+                noisy_values.add(v)
+            noisy_values.update(collect_noisy_values(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            noisy_values.update(collect_noisy_values(item))
+    return noisy_values
+
+
+def find_candidate_keys(
+    obj: Any,
+    key_candidates: Sequence[str],
+    path: str = "",
+    blocked_values: Set[str] | None = None,
+) -> List[Tuple[str, str, Any]]:
     """Recursively search for keys that include any candidate token."""
 
     hits: List[Tuple[str, str, Any]] = []
     lower_candidates = [kc.lower() for kc in key_candidates]
 
-    def _normalize_key(key: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", key.lower())
-
     if isinstance(obj, dict):
         for k, v in obj.items():
             new_path = f"{path}.{k}" if path else k
-            normalized_key = _normalize_key(k)
+            normalized_key = normalize_key(k)
             if normalized_key in NOISY_SECRET_KEYS:
+                continue
+            if blocked_values and isinstance(v, str) and v in blocked_values:
                 continue
             if any(candidate in k.lower() for candidate in lower_candidates):
                 hits.append((new_path, k, v))
-            hits.extend(find_candidate_keys(v, key_candidates, new_path))
+            hits.extend(find_candidate_keys(v, key_candidates, new_path, blocked_values))
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
             new_path = f"{path}[{idx}]" if path else f"[{idx}]"
-            hits.extend(find_candidate_keys(item, key_candidates, new_path))
+            hits.extend(find_candidate_keys(item, key_candidates, new_path, blocked_values))
 
     return hits
 
@@ -535,19 +720,35 @@ def process_text_blob(
     text: str,
     token_sources: TokenStore,
     logger: logging.Logger,
-) -> Tuple[str, Set[str]]:
+    blocked_values: Set[str] | None = None,
+) -> Tuple[str, Set[str], int]:
     normalized = text.replace("\\/", "/")
     lower_url = source_url.lower()
+    blocked_values = blocked_values or set()
+    update_variable_assignments(normalized)
+    hex_hits = HEX_32_PATTERN.findall(normalized)
+    broad_hits = BROAD_32_PATTERN.findall(normalized)
+    prefixed_hits = PREFIXED_32_PATTERN.findall(normalized)
+    hex_hits += HEX_32_PATTERN.findall(source_url)
+    broad_hits += BROAD_32_PATTERN.findall(source_url)
+    prefixed_hits += PREFIXED_32_PATTERN.findall(source_url)
+    regex_hits = set(hex_hits + broad_hits + prefixed_hits)
+    for tok in regex_hits:
+        record_token(token_sources, tok, source_url, "regex_match")
     tokens: Set[str] = set()
+    key_value_hits = extract_key_candidate_values_from_text(normalized, blocked_values)
+    for _, token_value, extraction in key_value_hits:
+        record_token(token_sources, token_value, source_url, extraction)
+        if extraction == "variable_extraction":
+            logger.info("Resolved variable token from %s", source_url)
     if lower_url.endswith((".js", ".mjs", ".json")):
         tokens = extract_literal_tokens(normalized)
     elif "<script" in normalized.lower():
         tokens = extract_literal_tokens_from_scripts(normalized)
-    if tokens:
-        logger.info("%s tokens found in %s", len(tokens), source_url)
+    regex_count = len(hex_hits) + len(broad_hits) + len(prefixed_hits)
     for tok in tokens:
         record_token(token_sources, tok, source_url, "heuristic_literal")
-    return normalized, tokens
+    return normalized, tokens, regex_count
 
 
 def inspect_scripts_for_secrets(
@@ -556,21 +757,51 @@ def inspect_scripts_for_secrets(
     findings: List[SecretFinding],
     logger: logging.Logger,
     token_sources: TokenStore,
+    blocked_values: Set[str] | None = None,
 ) -> None:
     """Parse script tags and extract suspicious keys from JSON/config blobs."""
 
+    blocked_values = blocked_values or set()
     for blob in extract_script_blobs(html):
         is_json_type = "json" in blob["type"].lower()
+        if blob["text"]:
+            update_variable_assignments(blob["text"])
+            key_value_hits = extract_key_candidate_values_from_text(
+                blob["text"], blocked_values
+            )
+            for key_name, token_value, extraction in key_value_hits:
+                record_token(
+                    token_sources, token_value, page_url, extraction
+                )
+                findings.append(
+                    {
+                        "page_url": page_url,
+                        "key_name": key_name,
+                        "key_path": "",
+                        "value": token_value,
+                        "source_type": "script_text",
+                        "script_index": str(blob["index"]),
+                        "script_id": blob["attrs"].get("id", ""),
+                        "script_type": blob["type"],
+                        "extracted_by": extraction,
+                    }
+                )
         candidates = extract_candidate_json_strings(blob["text"], is_json_type)
         for candidate in candidates:
             obj = safe_json_loads(candidate)
             if obj is None:
                 continue
-            hits = find_candidate_keys(obj, KEY_CANDIDATES)
+            noisy_values = collect_noisy_values(obj)
+            combined_blocked = blocked_values | noisy_values
+            hits = find_candidate_keys(
+                obj,
+                KEY_CANDIDATES,
+                blocked_values=combined_blocked,
+            )
             for key_path, key_name, value in hits:
                 value_text = json.dumps(value, ensure_ascii=False)
                 token_value = value if isinstance(value, str) else value_text
-                if token_value:
+                if token_value and token_value not in combined_blocked:
                     record_token(
                         token_sources, str(token_value), page_url, "key_match"
                     )
@@ -602,6 +833,8 @@ def crawl_with_playwright(
     bodies: List[Tuple[str, str]] = []
     pending_urls: List[str] = []
     request_urls: List[str] = []
+    response_seen: Set[str] = set()
+    request_seen: Set[str] = set()
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -609,9 +842,9 @@ def crawl_with_playwright(
 
             def handle_response(response):
                 resp_url = normalize_for_visit(response.url)
-                if resp_url in visited_urls or should_skip_url(resp_url):
+                if resp_url in response_seen or should_skip_url(resp_url):
                     return
-                visited_urls.add(resp_url)
+                response_seen.add(resp_url)
                 try:
                     content_type = response.headers.get("content-type")
                 except Exception:
@@ -632,8 +865,9 @@ def crawl_with_playwright(
 
             def handle_request(request):
                 req_url = normalize_for_visit(request.url)
-                if req_url in visited_urls or should_skip_url(req_url):
+                if req_url in request_seen or should_skip_url(req_url):
                     return
+                request_seen.add(req_url)
                 try:
                     accept_header = request.headers.get("accept")
                 except Exception:
@@ -675,6 +909,7 @@ def gather_tokens_from_page(
     findings: List[SecretFinding],
 ) -> Set[str]:
     tokens: Set[str] = set()
+    regex_total = 0
 
     normalized_url = normalize_for_visit(url)
     if normalized_url in visited_urls:
@@ -693,12 +928,19 @@ def gather_tokens_from_page(
         html = fetch_text(session, normalized_url, logger, respect_visited=False)
     if html:
         page_html_cache[normalized_url] = html
-        normalized_html, token_hits = process_text_blob(
-            normalized_url, html, token_sources, logger
+        blocked_values = extract_noisy_meta_tokens(html)
+        normalized_html, token_hits, regex_count = process_text_blob(
+            normalized_url, html, token_sources, logger, blocked_values
         )
         tokens.update(token_hits)
+        regex_total += regex_count
         inspect_scripts_for_secrets(
-            normalized_html, normalized_url, findings, logger, token_sources
+            normalized_html,
+            normalized_url,
+            findings,
+            logger,
+            token_sources,
+            blocked_values,
         )
     else:
         return tokens
@@ -711,14 +953,17 @@ def gather_tokens_from_page(
     )
 
     # Process responses captured during Playwright navigation first.
+    processed_responses: Set[str] = set()
     for resp_url, body in responses:
-        if resp_url in visited_urls or should_skip_url(resp_url):
+        if resp_url in processed_responses or should_skip_url(resp_url):
             continue
+        processed_responses.add(resp_url)
         visited_urls.add(resp_url)
-        normalized_body, token_hits = process_text_blob(
+        normalized_body, token_hits, regex_count = process_text_blob(
             resp_url, body, token_sources, logger
         )
         tokens.update(token_hits)
+        regex_total += regex_count
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, resp_url))
             + list(iter_network_urls(normalized_body, resp_url))
@@ -731,10 +976,11 @@ def gather_tokens_from_page(
         body = fetch_text(session, pending, logger)
         if not body:
             continue
-        normalized_body, token_hits = process_text_blob(
+        normalized_body, token_hits, regex_count = process_text_blob(
             pending, body, token_sources, logger
         )
         tokens.update(token_hits)
+        regex_total += regex_count
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, pending))
             + list(iter_network_urls(normalized_body, pending))
@@ -747,10 +993,11 @@ def gather_tokens_from_page(
         body = fetch_text(session, req_url, logger)
         if not body:
             continue
-        normalized_body, token_hits = process_text_blob(
+        normalized_body, token_hits, regex_count = process_text_blob(
             req_url, body, token_sources, logger
         )
         tokens.update(token_hits)
+        regex_total += regex_count
         candidate_urls.extend(
             list(iter_app_urls(normalized_body, req_url))
             + list(iter_network_urls(normalized_body, req_url))
@@ -763,10 +1010,13 @@ def gather_tokens_from_page(
         body = fetch_text(session, candidate, logger)
         if not body:
             continue
-        normalized_body, token_hits = process_text_blob(
+        normalized_body, token_hits, regex_count = process_text_blob(
             candidate, body, token_sources, logger
         )
         tokens.update(token_hits)
+        regex_total += regex_count
+    if regex_total:
+        logger.info("%s tokens found in %s", regex_total, normalized_url)
     return tokens
 
 
@@ -821,22 +1071,46 @@ def write_excel(
     logger: logging.Logger,
 ) -> None:
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Tokens"
-    ws.append(["token", "sources", "reasons", "all_tokens_concatenated"])
+    wb.remove(wb.active)
+
+    def write_token_sheet(title: str, tokens_to_write: List[str]) -> None:
+        ws = wb.create_sheet(title)
+        ws.append(["token", "sources", "reasons", "all_tokens_concatenated"])
+        joined = ", ".join(f'"{tok}"' for tok in tokens_to_write)
+        first = True
+        for tok in tokens_to_write:
+            record = tokens.get(tok, {})
+            sources = "; ".join(sorted(record.get("sources", [])))
+            reasons = "; ".join(sorted(record.get("reasons", [])))
+            if first:
+                ws.append([tok, sources, reasons, joined])
+                first = False
+            else:
+                ws.append([tok, sources, reasons, ""])
 
     sorted_tokens = sorted(tokens.keys())
-    joined = ", ".join(f'"{tok}"' for tok in sorted_tokens)
-    first = True
-    for tok in sorted_tokens:
-        record = tokens.get(tok, {})
-        sources = "; ".join(sorted(record.get("sources", [])))
-        reasons = "; ".join(sorted(record.get("reasons", [])))
-        if first:
-            ws.append([tok, sources, reasons, joined])
-            first = False
-        else:
-            ws.append([tok, sources, reasons, ""])
+    hex_tokens = [tok for tok in sorted_tokens if HEX_32_PATTERN.search(tok)]
+    broad_tokens = [tok for tok in sorted_tokens if BROAD_32_PATTERN.search(tok)]
+    prefixed_tokens = [
+        tok for tok in sorted_tokens if PREFIXED_32_PATTERN.search(tok)
+    ]
+    key_candidate_tokens = [
+        tok
+        for tok in sorted_tokens
+        if tokens.get(tok, {}).get("reasons", set())
+        & {"key_match", "variable_extraction"}
+    ]
+    heuristic_tokens = [
+        tok
+        for tok in sorted_tokens
+        if "heuristic_literal" in tokens.get(tok, {}).get("reasons", set())
+    ]
+
+    write_token_sheet("32 character", hex_tokens)
+    write_token_sheet("32 character - broad", broad_tokens)
+    write_token_sheet("Pre-Fix", prefixed_tokens)
+    write_token_sheet("Key Candidates", key_candidate_tokens)
+    write_token_sheet("heuristic_literal", heuristic_tokens)
 
     secrets_ws = wb.create_sheet("Secrets")
     secrets_ws.append(
