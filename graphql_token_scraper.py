@@ -344,12 +344,18 @@ def is_binary_url(url: str) -> bool:
         return True
     if any(ext in lowered for ext in BINARY_EXTENSIONS):
         return True
-    path = urlparse(lowered).path
+    try:
+        path = urlparse(lowered).path
+    except ValueError:
+        return True
     return any(path.endswith(ext) for ext in BINARY_EXTENSIONS)
 
 
 def should_skip_url(url: str) -> bool:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return True
     host = parsed.netloc.lower()
     scheme = parsed.scheme.lower()
     if host in SKIP_HOSTS:
