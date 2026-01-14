@@ -352,12 +352,16 @@ def is_binary_url(url: str) -> bool:
 
 
 def should_skip_url(url: str) -> bool:
+    if "${" in url or "}" in url:
+        return True
     try:
         parsed = urlparse(url)
     except ValueError:
         return True
     host = parsed.netloc.lower()
     scheme = parsed.scheme.lower()
+    if "global-e.com" in host:
+        return True
     if host in SKIP_HOSTS:
         return True
     if scheme in {"blob", "data"}:
@@ -539,11 +543,27 @@ def iter_script_urls(html: str, base_url: str) -> Iterable[str]:
 def iter_link_urls(html: str, base_url: str) -> Iterable[str]:
     """Pull stylesheet and preload links that may carry app payloads."""
 
-    href_pattern = re.compile(r"<link[^>]+href=\"([^\"]+)\"", re.I)
-    for match in href_pattern.finditer(html):
-        href = match.group(1)
-        candidate = urljoin(base_url, href)
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        base_host = urlparse(base_url).netloc.lower()
+    except ValueError:
+        base_host = ""
+    for tag in soup.find_all("link", href=True):
+        rel = " ".join(tag.get("rel", [])) if tag.get("rel") else ""
+        if "alternate" in rel.lower() or tag.get("hreflang"):
+            continue
+        candidate = urljoin(base_url, tag["href"])
         if should_skip_url(candidate):
+            continue
+        try:
+            host = urlparse(candidate).netloc.lower()
+        except ValueError:
+            continue
+        if host and base_host and not (
+            host == base_host
+            or host.endswith(f".{base_host}")
+            or any(keyword in candidate for keyword in APP_HOST_KEYWORDS)
+        ):
             continue
         yield candidate
 
@@ -1027,10 +1047,14 @@ def gather_tokens_from_page(
 
 
 def gather_tokens(
-    session: requests.Session, collection_url: str, logger: logging.Logger
+    session: requests.Session,
+    collection_url: str,
+    logger: logging.Logger,
+    token_store: TokenStore | None = None,
+    secrets_store: List[SecretFinding] | None = None,
 ) -> Tuple[TokenStore, List[SecretFinding]]:
-    all_tokens: TokenStore = {}
-    secrets: List[SecretFinding] = []
+    all_tokens: TokenStore = token_store if token_store is not None else {}
+    secrets: List[SecretFinding] = secrets_store if secrets_store is not None else []
     errors: List[str] = []
 
     logger.info("Fetching collection page: %s", collection_url)
@@ -1169,7 +1193,17 @@ def main() -> None:
     logger = configure_logger()
     session = build_session()
 
-    token_sources, secrets = gather_tokens(session, COLLECTION_URL, logger)
+    token_sources: TokenStore = {}
+    secrets: List[SecretFinding] = []
+    try:
+        token_sources, secrets = gather_tokens(
+            session, COLLECTION_URL, logger, token_sources, secrets
+        )
+    except KeyboardInterrupt:
+        logger.warning("Interrupted; writing partial results before exit.")
+        excel_path = OUTPUT_DIR / EXCEL_BASENAME
+        write_excel(token_sources, secrets, excel_path, logger)
+        return
     logger.info("Total unique tokens: %s", len(token_sources))
     logger.info("Total secret key hits: %s", len(secrets))
 
