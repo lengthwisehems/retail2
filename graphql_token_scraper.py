@@ -225,6 +225,47 @@ HEX_32_PATTERN = re.compile(r"\b[0-9a-f]{32}\b")
 BROAD_32_PATTERN = re.compile(r"(?<![0-9a-z])[0-9a-z]{32}(?![0-9a-z])", re.I)
 PREFIXED_32_PATTERN = re.compile(r"shp(?:at|ca|pa|ua)_[0-9a-zA-Z]{32}")
 
+ENGLISH_WORD_LIST_PATHS = (
+    "/usr/share/dict/words",
+    "/usr/share/dict/american-english",
+    "/usr/share/dict/british-english",
+)
+FALLBACK_ENGLISH_WORDS = {
+    "about",
+    "admin",
+    "account",
+    "address",
+    "amount",
+    "brand",
+    "cache",
+    "cart",
+    "checkout",
+    "client",
+    "collection",
+    "customer",
+    "debug",
+    "default",
+    "email",
+    "error",
+    "event",
+    "front",
+    "image",
+    "locale",
+    "order",
+    "product",
+    "search",
+    "session",
+    "shop",
+    "store",
+    "tracking",
+    "token",
+    "trace",
+    "variant",
+    "webhook",
+}
+_ENGLISH_WORDS: Set[str] | None = None
+_ENGLISH_WORD_MAX_LEN = 0
+
 # Keys that should be treated as suspicious when found inside structured
 # objects (inline script JSON/config blobs). Substring, case-insensitive
 # matching is applied.
@@ -360,6 +401,8 @@ def should_skip_url(url: str) -> bool:
         return True
     host = parsed.netloc.lower()
     scheme = parsed.scheme.lower()
+    if host.endswith("aninebing.com") and parsed.path.startswith("/en-"):
+        return True
     if "global-e.com" in host:
         return True
     if host in SKIP_HOSTS:
@@ -421,6 +464,40 @@ def record_token(tokens: TokenStore, token: str, source_url: str, reason: str) -
     entry = tokens.setdefault(token, {"sources": set(), "reasons": set()})
     entry["sources"].add(source_url)
     entry["reasons"].add(reason)
+
+
+def _load_english_words() -> Tuple[Set[str], int]:
+    for path in ENGLISH_WORD_LIST_PATHS:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                words = {
+                    line.strip().lower()
+                    for line in handle
+                    if line.strip().isalpha() and len(line.strip()) > 3
+                }
+            if words:
+                return words, max(len(word) for word in words)
+        except OSError:
+            continue
+    fallback = {word.lower() for word in FALLBACK_ENGLISH_WORDS if len(word) > 3}
+    return fallback, max((len(word) for word in fallback), default=0)
+
+
+def contains_english_word(token: str) -> bool:
+    global _ENGLISH_WORDS, _ENGLISH_WORD_MAX_LEN
+    if _ENGLISH_WORDS is None:
+        _ENGLISH_WORDS, _ENGLISH_WORD_MAX_LEN = _load_english_words()
+    if not _ENGLISH_WORDS:
+        return False
+    for chunk in re.findall(r"[a-z]+", token.lower()):
+        if len(chunk) < 4:
+            continue
+        max_len = min(_ENGLISH_WORD_MAX_LEN or len(chunk), len(chunk))
+        for start in range(len(chunk) - 3):
+            for end in range(start + 4, min(len(chunk), start + max_len) + 1):
+                if chunk[start:end] in _ENGLISH_WORDS:
+                    return True
+    return False
 
 
 def extract_literal_tokens(text: str) -> Set[str]:
@@ -758,9 +835,12 @@ def process_text_blob(
     hex_hits += HEX_32_PATTERN.findall(source_url)
     broad_hits += BROAD_32_PATTERN.findall(source_url)
     prefixed_hits += PREFIXED_32_PATTERN.findall(source_url)
-    regex_hits = set(hex_hits + broad_hits + prefixed_hits)
-    for tok in regex_hits:
-        record_token(token_sources, tok, source_url, "regex_match")
+    for tok in set(hex_hits):
+        record_token(token_sources, tok, source_url, "regex_match_32")
+    for tok in set(broad_hits):
+        record_token(token_sources, tok, source_url, "regex_match_32_broad")
+    for tok in set(prefixed_hits):
+        record_token(token_sources, tok, source_url, "regex_match_prefixed_32")
     tokens: Set[str] = set()
     key_value_hits = extract_key_candidate_values_from_text(normalized, blocked_values)
     for _, token_value, extraction in key_value_hits:
@@ -1120,7 +1200,14 @@ def write_excel(
 
     sorted_tokens = sorted(tokens.keys())
     hex_tokens = [tok for tok in sorted_tokens if HEX_32_PATTERN.search(tok)]
-    broad_tokens = [tok for tok in sorted_tokens if BROAD_32_PATTERN.search(tok)]
+    broad_tokens = []
+    for tok in sorted_tokens:
+        if not BROAD_32_PATTERN.search(tok):
+            continue
+        reasons = tokens.get(tok, {}).get("reasons", set())
+        if "regex_match_32_broad" in reasons and contains_english_word(tok):
+            continue
+        broad_tokens.append(tok)
     prefixed_tokens = [
         tok for tok in sorted_tokens if PREFIXED_32_PATTERN.search(tok)
     ]

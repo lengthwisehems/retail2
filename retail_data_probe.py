@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 import urllib3
@@ -36,6 +37,9 @@ SEARCHSPRING_URL = ""
 SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
 METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
+VIEW_JSON_ENRICHMENT_ENABLED = False
+VIEW_JSON_FIELDS: List[str] = []
+VIEW_JSON_PROBE_LIMIT = 5
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -150,6 +154,30 @@ def parse_metafield_identifiers(raw: str) -> List[Tuple[str, str]]:
             identifiers.append(tup)
             seen.add(tup)
     return identifiers
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_view_json_fields(raw: str) -> List[str]:
+    if not raw:
+        return []
+    fields: List[str] = []
+    seen: Set[str] = set()
+    for part in raw.split(","):
+        key = part.strip()
+        if not key or key in seen:
+            continue
+        fields.append(key)
+        seen.add(key)
+    return fields
 
 
 def normalize_tokens(value: Any) -> List[str]:
@@ -703,10 +731,19 @@ def finalize_common_row(
     normalize_money_field(row, "variant.compare_at_price")
 
     if "product.totalInventory" not in row:
-        for candidate in ("product.total_inventory",):
+        for candidate in ("product.total_inventory", "product.ss_available_qty"):
             if candidate in row:
                 row["product.totalInventory"] = row.pop(candidate)
                 break
+
+    if "product.onlineStoreUrl" not in row and "product.url" in row:
+        row["product.onlineStoreUrl"] = row.pop("product.url")
+
+    if "product.id" not in row and "product.ss_id" in row:
+        row["product.id"] = row.pop("product.ss_id")
+
+    if "product.title" not in row and "product.name" in row:
+        row["product.title"] = row.pop("product.name")
 
     if "variant.available" not in row:
         for candidate in (
@@ -1383,25 +1420,52 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                     seen_ids.add(vid)
                 variants.append(variant)
 
-    for size_key in ("ss_size_json", "ss_sizes_json"):
+    for size_key in ("ss_size_json", "ss_sizes_json", "ss_sizes"):
         raw_value = product.pop(size_key, None)
-        if not raw_value or not isinstance(raw_value, str):
+        if raw_value in (None, ""):
             continue
-        try:
-            parsed = json.loads(raw_value)
-        except ValueError:
+
+        parsed: Any = None
+        if isinstance(raw_value, list):
+            parsed = raw_value
+        elif isinstance(raw_value, dict):
+            parsed = [raw_value]
+        elif isinstance(raw_value, str):
+            decoded = html.unescape(raw_value).strip()
+            if not decoded:
+                continue
+            try:
+                parsed = json.loads(decoded)
+            except ValueError:
+                continue
+
+        if not isinstance(parsed, list):
             continue
-        if isinstance(parsed, list):
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                variant = dict(item)
-                vid = variant.get("id")
-                if vid is not None and vid in seen_ids:
-                    continue
-                if vid is not None:
-                    seen_ids.add(vid)
-                variants.append(variant)
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            lowered = {str(k).lower(): v for k, v in item.items()}
+            variant = dict(item)
+
+            label_value = lowered.get("label")
+            if label_value not in (None, "") and "option1" not in variant:
+                variant["option1"] = label_value
+
+            variant_id = lowered.get("variant_id")
+            if variant_id not in (None, "") and "id" not in variant:
+                variant["id"] = variant_id
+
+            available_qty = lowered.get("available")
+            if available_qty not in (None, "") and "inventory_quantity" not in variant:
+                variant["inventory_quantity"] = available_qty
+
+            vid = variant.get("id")
+            if vid is not None and vid in seen_ids:
+                continue
+            if vid is not None:
+                seen_ids.add(vid)
+            variants.append(variant)
 
     return variants
 
@@ -2174,11 +2238,128 @@ def probe_collection_filters(
     return {}
 
 
+class ViewJSONEnrichmentState:
+    def __init__(self, enabled: bool, fields: Sequence[str], probe_limit: int) -> None:
+        self.enabled = bool(enabled)
+        self.fields = [field.strip() for field in fields if str(field).strip()]
+        self.probe_limit = max(int(probe_limit), 0)
+        self.probe_attempts = 0
+        self.probe_hits = 0
+        self.disabled_after_probe = False
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.warned_urls: Set[str] = set()
+
+
+def _normalize_view_json_url(online_store_url: str) -> str:
+    parsed = urlsplit(online_store_url)
+    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "view"]
+    params.append(("view", "json"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), parsed.fragment))
+
+
+def _lookup_view_json_field(payload: Any, field: str) -> Any:
+    current: Any = payload
+    for part in field.split("."):
+        key = part.strip()
+        if not key:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+            continue
+        if isinstance(current, list) and key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(current):
+                current = current[idx]
+                continue
+        return None
+    return current
+
+
+def _extract_view_json_values(payload: Dict[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
+    extracted: Dict[str, Any] = {}
+    for field in fields:
+        value = _lookup_view_json_field(payload, field)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, (dict, list)):
+            extracted[f"viewjson.{field}"] = json.dumps(value, ensure_ascii=False)
+        else:
+            extracted[f"viewjson.{field}"] = str(value)
+    return extracted
+
+
+def _get_view_json_enrichment(
+    session: requests.Session,
+    product: Dict[str, Any],
+    logger: logging.Logger,
+    state: Optional[ViewJSONEnrichmentState],
+) -> Dict[str, Any]:
+    if state is None or not state.enabled or not state.fields:
+        return {}
+    if state.probe_limit and state.probe_attempts >= state.probe_limit and state.probe_hits == 0:
+        state.enabled = False
+        state.disabled_after_probe = True
+        logger.info(
+            "View JSON enrichment disabled after %s probe attempts with no useful fields.",
+            state.probe_attempts,
+        )
+        return {}
+
+    cache_key = str(product.get("id") or product.get("handle") or "")
+    if cache_key and cache_key in state.cache:
+        return dict(state.cache[cache_key])
+
+    online_store_url = str(product.get("onlineStoreUrl") or "").strip()
+    if not online_store_url:
+        if cache_key:
+            state.cache[cache_key] = {}
+        return {}
+
+    view_url = _normalize_view_json_url(online_store_url)
+    response: Optional[requests.Response] = None
+    try:
+        response = session.get(view_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        if view_url not in state.warned_urls:
+            state.warned_urls.add(view_url)
+            logger.warning("View JSON enrichment failed for %s -> %s", view_url, exc)
+        if cache_key:
+            state.cache[cache_key] = {}
+        if state.probe_attempts < state.probe_limit:
+            state.probe_attempts += 1
+        return {}
+
+    if not isinstance(payload, dict):
+        if view_url not in state.warned_urls:
+            state.warned_urls.add(view_url)
+            logger.warning("View JSON enrichment returned non-object JSON for %s", view_url)
+        if cache_key:
+            state.cache[cache_key] = {}
+        if state.probe_attempts < state.probe_limit:
+            state.probe_attempts += 1
+        return {}
+
+    extracted = _extract_view_json_values(payload, state.fields)
+    if state.probe_attempts < state.probe_limit:
+        state.probe_attempts += 1
+        if extracted:
+            state.probe_hits += 1
+    if cache_key:
+        state.cache[cache_key] = extracted
+    return dict(extracted)
+
+
 def flatten_graphql_product(
     collection_info: Dict[str, Any],
     edge_cursor: str,
     product: Dict[str, Any],
     variant_edge: Optional[Dict[str, Any]],
+    *,
+    session: Optional[requests.Session] = None,
+    logger: Optional[logging.Logger] = None,
+    view_json_state: Optional[ViewJSONEnrichmentState] = None,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
     collections_handles, collections_titles = extract_collections(product, collection_info)
@@ -2205,6 +2386,9 @@ def flatten_graphql_product(
     variants = product_copy.pop("variants", None)
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
+
+    if session is not None and logger is not None:
+        row.update(_get_view_json_enrichment(session, product, logger, view_json_state))
 
     option_columns = build_option_columns(product.get("options") or [])
     for key, value in option_columns.items():
@@ -2239,6 +2423,11 @@ def collect_storefront_from_collections(
         forbidden[parent].update(names)
 
     first_status: Optional[int] = None
+    view_json_state = ViewJSONEnrichmentState(
+        VIEW_JSON_ENRICHMENT_ENABLED,
+        VIEW_JSON_FIELDS,
+        VIEW_JSON_PROBE_LIMIT,
+    )
 
     while True:
         try:
@@ -2352,7 +2541,13 @@ def collect_storefront_from_collections(
                     if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
-                                collection_info, edge.get("cursor", ""), product, None
+                                collection_info,
+                                edge.get("cursor", ""),
+                                product,
+                                None,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
                     else:
@@ -2363,6 +2558,9 @@ def collect_storefront_from_collections(
                                     edge.get("cursor", ""),
                                     product,
                                     variant_edge,
+                                    session=session,
+                                    logger=logger,
+                                    view_json_state=view_json_state,
                                 )
                             )
                 page_info = products_connection.get("pageInfo") or {}
@@ -2423,6 +2621,11 @@ def collect_storefront_from_products(
     cursor: Optional[str] = None
     query_string = build_product_query_string()
     first_status: Optional[int] = None
+    view_json_state = ViewJSONEnrichmentState(
+        VIEW_JSON_ENRICHMENT_ENABLED,
+        VIEW_JSON_FIELDS,
+        VIEW_JSON_PROBE_LIMIT,
+    )
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
@@ -2484,14 +2687,26 @@ def collect_storefront_from_products(
             if not variant_entries:
                 rows.append(
                     flatten_graphql_product(
-                        {"collection_handle": ""}, edge.get("cursor", ""), product, None
+                        {"collection_handle": ""},
+                        edge.get("cursor", ""),
+                        product,
+                        None,
+                        session=session,
+                        logger=logger,
+                        view_json_state=view_json_state,
                     )
                 )
             else:
                 for variant_edge in variant_entries:
                     rows.append(
                         flatten_graphql_product(
-                            {"collection_handle": ""}, edge.get("cursor", ""), product, variant_edge
+                            {"collection_handle": ""},
+                            edge.get("cursor", ""),
+                            product,
+                            variant_edge,
+                            session=session,
+                            logger=logger,
+                            view_json_state=view_json_state,
                         )
                     )
         page_info = products_connection.get("pageInfo") or {}
@@ -2531,6 +2746,11 @@ def fallback_collect_from_collections(
         first_status: Optional[int] = None
         success = True
         filters_cache: Dict[str, Dict[str, List[str]]] = {}
+        view_json_state = ViewJSONEnrichmentState(
+            VIEW_JSON_ENRICHMENT_ENABLED,
+            VIEW_JSON_FIELDS,
+            VIEW_JSON_PROBE_LIMIT,
+        )
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
             if handle not in filters_cache:
@@ -2594,7 +2814,13 @@ def fallback_collect_from_collections(
                     if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
-                                collection_info, edge.get("cursor", ""), product, None
+                                collection_info,
+                                edge.get("cursor", ""),
+                                product,
+                                None,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
                     else:
@@ -2605,6 +2831,9 @@ def fallback_collect_from_collections(
                                     edge.get("cursor", ""),
                                     product,
                                     variant_edge,
+                                    session=session,
+                                    logger=logger,
+                                    view_json_state=view_json_state,
                                 )
                             )
 
@@ -2647,6 +2876,11 @@ def fallback_collect_from_products(
         cursor: Optional[str] = None
         first_status: Optional[int] = None
         fallback_query = build_fallback_products_query()
+        view_json_state = ViewJSONEnrichmentState(
+            VIEW_JSON_ENRICHMENT_ENABLED,
+            VIEW_JSON_FIELDS,
+            VIEW_JSON_PROBE_LIMIT,
+        )
 
         while True:
             payload = {
@@ -2692,7 +2926,13 @@ def fallback_collect_from_products(
                 if not variant_entries:
                     rows.append(
                         flatten_graphql_product(
-                            {"collection_handle": ""}, edge.get("cursor", ""), product, None
+                            {"collection_handle": ""},
+                            edge.get("cursor", ""),
+                            product,
+                            None,
+                            session=session,
+                            logger=logger,
+                            view_json_state=view_json_state,
                         )
                     )
                 else:
@@ -2703,6 +2943,9 @@ def fallback_collect_from_products(
                                 edge.get("cursor", ""),
                                 product,
                                 variant_edge,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
 
