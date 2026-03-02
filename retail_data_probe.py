@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import re
@@ -702,6 +703,26 @@ def finalize_common_row(
     normalize_money_field(row, "variant.price")
     normalize_money_field(row, "variant.compare_at_price")
 
+    remap_candidates: Dict[str, Sequence[str]] = {
+        "product.totalInventory": (
+            "product.ss_available_qty",
+            "product.ss_inventory_count",
+        ),
+        "product.onlineStoreUrl": ("product.ss_url",),
+        "product.id": ("product.ss_id",),
+        "product.title": ("product.name",),
+        "product.vendor": ("product.brand",),
+        "variant.id": ("variant.variant_id",),
+    }
+    for target, candidates in remap_candidates.items():
+        if row.get(target) not in (None, ""):
+            continue
+        for candidate in candidates:
+            if row.get(candidate) in (None, ""):
+                continue
+            row[target] = row[candidate]
+            break
+
     if "product.totalInventory" not in row:
         for candidate in ("product.total_inventory",):
             if candidate in row:
@@ -1333,6 +1354,77 @@ def extract_searchspring_results(payload: Any) -> List[Dict[str, Any]]:
 
 
 def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def parse_ss_sizes_payload(raw_value: Any) -> List[Dict[str, Any]]:
+        parsed_variants: List[Dict[str, Any]] = []
+
+        def append_variant(candidate: Dict[str, Any]) -> None:
+            if not isinstance(candidate, dict):
+                return
+            normalized: Dict[str, Any] = {}
+
+            label = candidate.get("label")
+            if label not in (None, ""):
+                normalized["option1"] = str(label)
+
+            variant_id = candidate.get("variant_id")
+            if variant_id in (None, ""):
+                variant_id = candidate.get("id")
+            if variant_id not in (None, ""):
+                normalized["id"] = str(variant_id)
+
+            quantity = candidate.get("available")
+            if quantity in (None, ""):
+                quantity = candidate.get("quantityAvailable")
+            if quantity not in (None, ""):
+                normalized["quantityAvailable"] = quantity
+
+            if normalized:
+                parsed_variants.append(normalized)
+
+        def parse_text_blob(text: str) -> None:
+            if not text:
+                return
+            decoded = html.unescape(text)
+            try:
+                loaded = json.loads(decoded)
+            except ValueError:
+                loaded = None
+
+            if isinstance(loaded, list):
+                for item in loaded:
+                    if isinstance(item, dict):
+                        append_variant(item)
+                if parsed_variants:
+                    return
+
+            for block in re.findall(r"\{[^{}]*\}", decoded):
+                label_match = re.search(r'"?label"?\s*:\s*"([^\"]+)"', block)
+                vid_match = re.search(r'"?(?:variant_id|id)"?\s*:\s*"?(\d+)"?', block)
+                qty_match = re.search(r'"?available"?\s*:\s*(-?\d+)', block)
+                variant: Dict[str, Any] = {}
+                if label_match:
+                    variant["option1"] = label_match.group(1)
+                if vid_match:
+                    variant["id"] = vid_match.group(1)
+                if qty_match:
+                    variant["quantityAvailable"] = int(qty_match.group(1))
+                if variant:
+                    parsed_variants.append(variant)
+
+        if isinstance(raw_value, list):
+            for entry in raw_value:
+                if isinstance(entry, dict):
+                    append_variant(entry)
+                elif isinstance(entry, str):
+                    parse_text_blob(entry)
+            return parsed_variants
+        if isinstance(raw_value, dict):
+            append_variant(raw_value)
+            return parsed_variants
+        if isinstance(raw_value, str):
+            parse_text_blob(raw_value)
+        return parsed_variants
+
     variants: List[Dict[str, Any]] = []
     seen_ids: Set[Any] = set()
     candidate_keys = [
@@ -1383,25 +1475,19 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                     seen_ids.add(vid)
                 variants.append(variant)
 
-    for size_key in ("ss_size_json", "ss_sizes_json"):
+    for size_key in ("ss_size_json", "ss_sizes_json", "ss_sizes"):
         raw_value = product.pop(size_key, None)
-        if not raw_value or not isinstance(raw_value, str):
+        if not raw_value:
             continue
-        try:
-            parsed = json.loads(raw_value)
-        except ValueError:
-            continue
-        if isinstance(parsed, list):
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                variant = dict(item)
-                vid = variant.get("id")
-                if vid is not None and vid in seen_ids:
-                    continue
-                if vid is not None:
-                    seen_ids.add(vid)
-                variants.append(variant)
+        parsed = parse_ss_sizes_payload(raw_value)
+        for item in parsed:
+            variant = dict(item)
+            vid = variant.get("id")
+            dedupe_key = vid if vid not in (None, "") else json.dumps(variant, sort_keys=True)
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            variants.append(variant)
 
     return variants
 
