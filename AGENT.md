@@ -4149,3 +4149,21 @@ Paginating resources using a [range search](https://shopify.dev/docs/api/usage/s
 * [Backward pagination](https://shopify.dev/docs/api/usage/pagination-graphql.md#backward-pagination)
 * [Connection edges](https://shopify.dev/docs/api/usage/pagination-graphql.md#connection-edges)
 * [Search performance considerations](https://shopify.dev/docs/api/usage/pagination-graphql.md#search-performance-considerations)
+
+## SFCC API references (added for Reformation/Demandware work)
+
+For SFCC projects, review these official references before implementing new probes:
+
+- B2C Developer Documentation index: https://salesforcecommercecloud.github.io/b2c-dev-doc/index.html
+- Salesforce Commerce API (SCAPI) reference index: https://developer.salesforce.com/docs/commerce/commerce-api/references/about-commerce-api/scapi-api-doc.html
+
+### Quick coverage map to use during scraping/debugging
+- **SFRA / Storefront controllers** (e.g., `Product-Variation`, `Search-UpdateGrid`, `Cart-AddProduct`, `Cart-Show`) for storefront behavior and basket analytics leaks.
+- **Shopper APIs (SCAPI)** for standardized shopper resources when exposed by a site:
+  - Products, Search, Carts, Checkout, Orders, Customers, Promotions, Pricing.
+- **Admin APIs (SCAPI)** for management-side resources (inventory, catalogs, price books, promotions, etc.) when credentials are available.
+- **Auth model**: OAuth scopes/tenants/site IDs and environment-specific access rules can differ from SFRA storefront endpoints.
+
+### Probe guidance for this repo
+- For Reformation-like SFCC sites, first test storefront endpoints and cart analytics payloads (`basketInventory`) to capture warehouse-level metrics (`alloc`, `preOrder`, `onOrder`, `turnover`, `customATS`).
+- Prefer batched cart-based extraction when available (faster) and fall back to variant-by-variant `Product-Variation` probes only if needed.

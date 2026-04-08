@@ -12,31 +12,79 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from requests.adapters import HTTPAdapter, Retry
 
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "Citizens_of_Humanity"
+BRAND = "paige"
 COLLECTION_URL = [
-    "https://citizensofhumanity.com/collections/womens-jeans",
+    "https://paige.com/collection/women-denim",
 ]
-MYSHOPIFY = "citizens-of-humanity.myshopify.com"
-GRAPHQL = "https://citizens-of-humanity.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["a1b87221a13b15123b1c8b79a866f388"]
+MYSHOPIFY = "paige-7873.myshopify.com"
+GRAPHQL = "https://paige-7873.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["383d494a76122b5e6cadffc2c7667ef2"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["womens-jeans"]
-SEARCHSPRING_SITE_ID = ""
-SEARCHSPRING_URL = ""
-SEARCHSPRING_EXTRA_PARAMS: Dict[str, Any] = {}
-METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["women-denim"]
+ALGOLIA_APP_ID = "DK4YY42827"
+ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
+ALGOLIA_INDEX = "production_products"
+ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
+ALGOLIA_EXTRA_PARAMS: Dict[str, Any] = {}
+ALGOLIA_QUERY = ""
+ALGOLIA_HITS_PER_PAGE = 1000
+ALGOLIA_DISTINCT = "true"
+ALGOLIA_DISTINCT_PASSES: List[str] = ["true", "false"]
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = [
+    ("custom", "colorVariants"),
+    ("custom", "inseamVariants"),
+    ("custom", "fitVariants"),
+    ("custom", "fabricationVariants"),
+    ("custom", "shopTheLook"),
+    ("custom", "specs"),
+    ("custom", "fit"),
+    ("custom", "rise"),
+    ("custom", "denimFabric"),
+    ("custom", "gender"),
+    ("custom", "categoryPrimary"),
+    ("custom", "sizeType"),
+    ("custom", "sku"),
+    ("custom", "stretch"),
+    ("custom", "styleContent"),
+    ("custom", "color"),
+    ("custom", "colorCategory"),
+    ("custom", "colorCategory2"),
+    ("custom", "dressLength"),
+    ("custom", "wash"),
+    ("custom", "closure"),
+    ("custom", "sleeveLength"),
+    ("custom", "length"),
+    ("custom", "clothingType"),
+    ("custom", "clothingFamily"),
+    ("custom", "category"),
+    ("custom", "productType"),
+]
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
+VIEW_JSON_ENRICHMENT_ENABLED = False
+VIEW_JSON_FIELDS = [
+    "metafields.0.product_measurements",
+    "metafields.0.origin",
+    "metafields.0.fabric",
+    "metafields.0.color",
+    "metafields.0.color_file",
+    "metafields.0.details",
+]
+VIEW_JSON_PROBE_LIMIT = 6
+METAFIELD_AUTO_DISCOVER = True
+METAFIELD_DISCOVERY_MAX_SCRIPTS = 60
+METAFIELD_DEFAULT_NAMESPACE = "custom"
 
 # ---------------------------------------------------------------------------
 # Derived paths and constants
@@ -101,7 +149,6 @@ DEFAULT_FORBIDDEN_FIELDS: Dict[str, Set[str]] = {
         "quantityPriceBreaks",
         "sellingPlanAllocations",
         "sellingPlanGroups",
-        "storeAvailability",
     }
 }
 
@@ -151,6 +198,30 @@ def parse_metafield_identifiers(raw: str) -> List[Tuple[str, str]]:
             identifiers.append(tup)
             seen.add(tup)
     return identifiers
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_view_json_fields(raw: str) -> List[str]:
+    if not raw:
+        return []
+    fields: List[str] = []
+    seen: Set[str] = set()
+    for part in raw.split(","):
+        key = part.strip()
+        if not key or key in seen:
+            continue
+        fields.append(key)
+        seen.add(key)
+    return fields
 
 
 def normalize_tokens(value: Any) -> List[str]:
@@ -705,11 +776,15 @@ def finalize_common_row(
 
     remap_candidates: Dict[str, Sequence[str]] = {
         "product.totalInventory": (
-            "product.ss_available_qty",
-            "product.ss_inventory_count",
+            "product.algolia_available_qty",
+            "product.total_inventory",
+            "product.algolia_inventory_count",
         ),
-        "product.onlineStoreUrl": ("product.ss_url",),
-        "product.id": ("product.ss_id",),
+        "product.onlineStoreUrl": (
+            "product.algolia_url",
+            "product.url",
+        ),
+        "product.id": ("product.algolia_id",),
         "product.title": ("product.name",),
         "product.vendor": ("product.brand",),
         "variant.id": ("variant.variant_id",),
@@ -722,12 +797,6 @@ def finalize_common_row(
                 continue
             row[target] = row[candidate]
             break
-
-    if "product.totalInventory" not in row:
-        for candidate in ("product.total_inventory",):
-            if candidate in row:
-                row["product.totalInventory"] = row.pop(candidate)
-                break
 
     if "variant.available" not in row:
         for candidate in (
@@ -820,6 +889,7 @@ def finalize_storefront_row(
     row: Dict[str, Any], product: Dict[str, Any], variant: Optional[Dict[str, Any]]
 ) -> None:
     finalize_common_row(row, product, variant, source="storefront")
+    transform_store_availability_columns(row)
 
 
 def extract_collections(product: Dict[str, Any], collection_info: Dict[str, Any]) -> Tuple[List[str], List[str]]:
@@ -891,6 +961,76 @@ def collect_metafields(product: Dict[str, Any]) -> List[Dict[str, Any]]:
                     }
                 )
     return metafields
+
+
+def _safe_metafield_token(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-zA-Z0-9_]+", "_", text)
+    return text.strip("_")
+
+
+def apply_metafield_columns(row: Dict[str, Any], metafields: Sequence[Dict[str, Any]]) -> None:
+    for metafield in metafields:
+        if not isinstance(metafield, dict):
+            continue
+        namespace = _safe_metafield_token(metafield.get("namespace"))
+        key = _safe_metafield_token(metafield.get("key"))
+        value = metafield.get("value")
+        if not namespace or not key or value in (None, ""):
+            continue
+        row[f"product.metafield.{namespace}.{key}"] = value
+
+
+def apply_expected_metafield_columns(
+    row: Dict[str, Any], identifiers: Sequence[Tuple[str, str]]
+) -> None:
+    for namespace, key in identifiers:
+        ns_token = _safe_metafield_token(namespace)
+        key_token = _safe_metafield_token(key)
+        if not ns_token or not key_token:
+            continue
+        row.setdefault(f"product.metafield.{ns_token}.{key_token}", "")
+
+
+STORE_AVAILABILITY_EDGE_RE = re.compile(
+    r"^variant\.storeAvailability\.edges\[(\d+)\]\.node\.(.+)$"
+)
+
+
+def transform_store_availability_columns(row: Dict[str, Any]) -> None:
+    edge_data: Dict[str, Dict[str, Any]] = defaultdict(dict)
+    for key, value in list(row.items()):
+        match = STORE_AVAILABILITY_EDGE_RE.match(key)
+        if not match:
+            continue
+        edge_idx, suffix = match.groups()
+        edge_data[edge_idx][suffix] = value
+
+    for edge_idx, data in edge_data.items():
+        location_id_raw = str(data.get("location.id") or "").strip()
+        location_name = str(data.get("location.name") or "").strip()
+        qty = data.get("quantityAvailable")
+        location_id = location_id_raw.replace("gid://shopify/Location/", "")
+        if location_name and location_id and qty not in (None, ""):
+            compact_name = location_name.replace(".", "_")
+            row[
+                f"variant.storeAvailability.{compact_name}.{location_id}"
+            ] = qty
+
+        # Remove noisy/raw edge-level columns after pivoting.
+        for suffix in (
+            "location.id",
+            "location.name",
+            "location.address.city",
+            "location.address.country",
+            "pickUpTime",
+            "quantityAvailable",
+            "available",
+        ):
+            row.pop(f"variant.storeAvailability.edges[{edge_idx}].node.{suffix}", None)
+        row.pop(f"variant.storeAvailability.edges[{edge_idx}].cursor", None)
 
 
 def derive_filter_values(product: Dict[str, Any], metafields: List[Dict[str, Any]]) -> Dict[str, List[str]]:
@@ -1063,6 +1203,27 @@ def write_sheet(
         sheet.append([normalize_cell(row.get(column)) for column in columns])
 
 
+def group_tag_columns(sheet, columns: Sequence[str]) -> None:
+    tag_indexes = [index for index, name in enumerate(columns, start=1) if name.startswith("tags_group_")]
+    if not tag_indexes:
+        return
+
+    start = tag_indexes[0]
+    end = start
+    for index in tag_indexes[1:]:
+        if index == end + 1:
+            end = index
+            continue
+        sheet.column_dimensions.group(
+            get_column_letter(start), get_column_letter(end), outline_level=1, hidden=False
+        )
+        start = index
+        end = index
+    sheet.column_dimensions.group(
+        get_column_letter(start), get_column_letter(end), outline_level=1, hidden=False
+    )
+
+
 def fetch_collection_html(session: requests.Session, logger: logging.Logger) -> List[Tuple[str, str]]:
     urls: List[str] = []
     if isinstance(COLLECTION_URL, (list, tuple)):
@@ -1198,7 +1359,10 @@ def collect_tag_values(record: Dict[str, Any]) -> List[str]:
 
 
 def fetch_collection_json(
-    session: requests.Session, logger: logging.Logger
+    session: requests.Session,
+    logger: logging.Logger,
+    *,
+    fallback_online_store_urls: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     products_json_urls = build_products_json_urls()
     if not products_json_urls:
@@ -1206,6 +1370,7 @@ def fetch_collection_json(
         return [], []
 
     all_products: List[Dict[str, Any]] = []
+    saw_collection_json_404 = False
     for products_json_url in products_json_urls:
         page = 1
         while True:
@@ -1223,6 +1388,8 @@ def fetch_collection_json(
                 logger.warning(
                     "Collection JSON request returned status %s", response.status_code
                 )
+                if response.status_code == 404:
+                    saw_collection_json_404 = True
                 break
 
             try:
@@ -1241,6 +1408,69 @@ def fetch_collection_json(
                 break
             page += 1
             time.sleep(0.5)
+
+    if saw_collection_json_404 and fallback_online_store_urls:
+        def canonicalize_online_store_url(raw_url: str) -> str:
+            candidate = str(raw_url or "").strip()
+            if not candidate:
+                return ""
+            absolute = make_absolute(candidate, _primary_collection_url() or "")
+            parts = urlsplit(absolute)
+            path = parts.path.rstrip("/")
+            if not path:
+                return ""
+            # Product JSON fallback only needs scheme + host + path.
+            return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+        deduped_product_urls: List[str] = []
+        seen_product_keys: Set[str] = set()
+        for online_store_url in fallback_online_store_urls:
+            canonical = canonicalize_online_store_url(str(online_store_url or ""))
+            if not canonical:
+                continue
+            parts = urlsplit(canonical)
+            dedupe_key = parts.path.rstrip("/").lower() or canonical.lower()
+            if dedupe_key in seen_product_keys:
+                continue
+            seen_product_keys.add(dedupe_key)
+            deduped_product_urls.append(canonical)
+
+        logger.info(
+            "Collection JSON 404 fallback deduped %s URLs -> %s unique product URLs",
+            len(list(fallback_online_store_urls)),
+            len(deduped_product_urls),
+        )
+
+        seen_handles: Set[str] = set()
+        for normalized in deduped_product_urls:
+            product_json_url = f"{normalized}.json"
+            logger.info("Collection JSON 404 fallback: fetching %s", product_json_url)
+            try:
+                response = session.get(product_json_url, timeout=REQUEST_TIMEOUT, verify=False)
+            except requests.RequestException as exc:
+                logger.warning("Fallback product JSON request failed for %s: %s", product_json_url, exc)
+                continue
+            if not response.ok:
+                logger.warning(
+                    "Fallback product JSON request returned status %s for %s",
+                    response.status_code,
+                    product_json_url,
+                )
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.warning("Fallback product JSON response was not valid JSON for %s", product_json_url)
+                continue
+            product = payload.get("product") if isinstance(payload, dict) else None
+            if not isinstance(product, dict):
+                continue
+            handle = str(product.get("handle") or "").strip().lower()
+            if handle and handle in seen_handles:
+                continue
+            if handle:
+                seen_handles.add(handle)
+            all_products.append(product)
 
     logger.info("Collected %s products from collection JSON", len(all_products))
     rows: List[Dict[str, Any]] = []
@@ -1328,38 +1558,28 @@ def fetch_collection_json(
     return rows, tag_group_columns
 
 
-def extract_searchspring_results(payload: Any) -> List[Dict[str, Any]]:
+def extract_algolia_results(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, dict):
-        ss_data = payload.get("ssData")
-        if isinstance(ss_data, dict):
-            nested_results = extract_searchspring_results(ss_data)
-            if nested_results:
-                return nested_results
-        primary = payload.get("results")
-        if isinstance(primary, list):
-            return [item for item in primary if isinstance(item, dict)]
-        if isinstance(primary, dict):
-            aggregated: List[Dict[str, Any]] = []
-            for value in primary.values():
-                if isinstance(value, list):
-                    aggregated.extend([item for item in value if isinstance(item, dict)])
-            if aggregated:
-                return aggregated
-        for key, value in payload.items():
-            if isinstance(value, list):
-                candidates = [item for item in value if isinstance(item, dict)]
-                if candidates:
-                    return candidates
+        hits = payload.get("hits")
+        if isinstance(hits, list):
+            return [item for item in hits if isinstance(item, dict)]
+        # multi-query response shape
+        results = payload.get("results")
+        if isinstance(results, list):
+            for entry in results:
+                if isinstance(entry, dict) and isinstance(entry.get("hits"), list):
+                    return [item for item in entry["hits"] if isinstance(item, dict)]
     return []
 
 
-def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
-    def parse_ss_sizes_payload(raw_value: Any) -> List[Dict[str, Any]]:
+def extract_algolia_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def parse_algolia_sizes_payload(raw_value: Any) -> List[Dict[str, Any]]:
         parsed_variants: List[Dict[str, Any]] = []
 
         def append_variant(candidate: Dict[str, Any]) -> None:
             if not isinstance(candidate, dict):
                 return
+
             normalized: Dict[str, Any] = {}
 
             label = candidate.get("label")
@@ -1372,11 +1592,11 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
             if variant_id not in (None, ""):
                 normalized["id"] = str(variant_id)
 
-            quantity = candidate.get("available")
-            if quantity in (None, ""):
-                quantity = candidate.get("quantityAvailable")
-            if quantity not in (None, ""):
-                normalized["quantityAvailable"] = quantity
+            available = candidate.get("available")
+            if available in (None, ""):
+                available = candidate.get("quantityAvailable")
+            if available not in (None, ""):
+                normalized["quantityAvailable"] = available
 
             if normalized:
                 parsed_variants.append(normalized)
@@ -1384,7 +1604,11 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
         def parse_text_blob(text: str) -> None:
             if not text:
                 return
-            decoded = html.unescape(text)
+
+            decoded = html.unescape(text).strip()
+            if not decoded:
+                return
+
             try:
                 loaded = json.loads(decoded)
             except ValueError:
@@ -1401,6 +1625,7 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                 label_match = re.search(r'"?label"?\s*:\s*"([^\"]+)"', block)
                 vid_match = re.search(r'"?(?:variant_id|id)"?\s*:\s*"?(\d+)"?', block)
                 qty_match = re.search(r'"?available"?\s*:\s*(-?\d+)', block)
+
                 variant: Dict[str, Any] = {}
                 if label_match:
                     variant["option1"] = label_match.group(1)
@@ -1412,17 +1637,25 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                     parsed_variants.append(variant)
 
         if isinstance(raw_value, list):
+            string_parts: List[str] = []
             for entry in raw_value:
                 if isinstance(entry, dict):
                     append_variant(entry)
                 elif isinstance(entry, str):
+                    string_parts.append(entry)
                     parse_text_blob(entry)
+
+            if string_parts:
+                parse_text_blob(",".join(string_parts))
             return parsed_variants
+
         if isinstance(raw_value, dict):
             append_variant(raw_value)
             return parsed_variants
+
         if isinstance(raw_value, str):
             parse_text_blob(raw_value)
+
         return parsed_variants
 
     variants: List[Dict[str, Any]] = []
@@ -1437,7 +1670,7 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
             "variantlist",
             "skus",
             "sku_list",
-            "ss_variants",
+            "algolia_variants",
         }
     ]
     for key in candidate_keys:
@@ -1448,10 +1681,10 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                     continue
                 variant = dict(item)
                 vid = variant.get("id")
-                if vid is not None and vid in seen_ids:
+                dedupe_key = vid if vid not in (None, "") else json.dumps(variant, sort_keys=True)
+                if dedupe_key in seen_ids:
                     continue
-                if vid is not None:
-                    seen_ids.add(vid)
+                seen_ids.add(dedupe_key)
                 variants.append(variant)
         elif isinstance(value, dict):
             nodes = value.get("nodes") if isinstance(value.get("nodes"), list) else None
@@ -1461,26 +1694,26 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
                         continue
                     variant = dict(item)
                     vid = variant.get("id")
-                    if vid is not None and vid in seen_ids:
+                    dedupe_key = vid if vid not in (None, "") else json.dumps(variant, sort_keys=True)
+                    if dedupe_key in seen_ids:
                         continue
-                    if vid is not None:
-                        seen_ids.add(vid)
+                    seen_ids.add(dedupe_key)
                     variants.append(variant)
             else:
                 variant = dict(value)
                 vid = variant.get("id")
-                if vid is not None and vid in seen_ids:
+                dedupe_key = vid if vid not in (None, "") else json.dumps(variant, sort_keys=True)
+                if dedupe_key in seen_ids:
                     continue
-                if vid is not None:
-                    seen_ids.add(vid)
+                seen_ids.add(dedupe_key)
                 variants.append(variant)
 
-    for size_key in ("ss_size_json", "ss_sizes_json", "ss_sizes"):
+    for size_key in ("algolia_size_json", "algolia_sizes_json", "algolia_sizes", "ss_size_json"):
         raw_value = product.pop(size_key, None)
-        if not raw_value:
+        if raw_value in (None, ""):
             continue
-        parsed = parse_ss_sizes_payload(raw_value)
-        for item in parsed:
+
+        for item in parse_algolia_sizes_payload(raw_value):
             variant = dict(item)
             vid = variant.get("id")
             dedupe_key = vid if vid not in (None, "") else json.dumps(variant, sort_keys=True)
@@ -1492,189 +1725,347 @@ def extract_searchspring_variants(product: Dict[str, Any]) -> List[Dict[str, Any
     return variants
 
 
-def fetch_searchspring_data(
+def fetch_algolia_data(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    if not SEARCHSPRING_SITE_ID or not SEARCHSPRING_URL:
+    if not ALGOLIA_APP_ID or not ALGOLIA_API_KEY or not ALGOLIA_SEARCH_URL:
         return [], []
 
-    page = 1
-    rows: List[Dict[str, Any]] = []
-    tag_group_counts: Counter[str] = Counter()
-    base_url = SEARCHSPRING_URL.strip()
+    endpoint = ALGOLIA_SEARCH_URL.strip()
 
-    parsed = urlsplit(base_url)
-    base_query: Dict[str, Any] = {
-        key: value for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    filters: Optional[str] = None
+    handles = [handle.strip() for handle in STOREFRONT_COLLECTION_HANDLES if handle.strip()]
+    if handles:
+        filters = " OR ".join(f"collections:{handle}" for handle in handles)
+    extra_filters = ALGOLIA_EXTRA_PARAMS.get("filters")
+    if extra_filters:
+        filters = str(extra_filters)
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Algolia-Application-Id": ALGOLIA_APP_ID,
+        "X-Algolia-API-Key": ALGOLIA_API_KEY,
     }
-    endpoint = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", parsed.fragment))
-    is_searchspring_host = "searchspring" in (parsed.netloc or "")
 
-    while True:
-        params: Dict[str, Any] = dict(base_query)
-        params.update(SEARCHSPRING_EXTRA_PARAMS or {})
+    def row_identity(row: Dict[str, Any]) -> str:
+        variant_id = str(row.get("variant.id") or "").strip()
+        if variant_id:
+            return f"variant:{variant_id}"
+        product_id = str(row.get("product.id") or row.get("product.algolia_id") or "").strip()
+        variant_sku = str(row.get("variant.sku") or "").strip()
+        variant_title = str(row.get("variant.title") or "").strip()
+        variant_option1 = str(row.get("variant.option1") or "").strip()
+        if product_id and (variant_sku or variant_title or variant_option1):
+            return f"pv:{product_id}|{variant_sku}|{variant_title}|{variant_option1}"
+        handle = str(row.get("product.handle") or "").strip()
+        if handle and (variant_sku or variant_title or variant_option1):
+            return f"hv:{handle}|{variant_sku}|{variant_title}|{variant_option1}"
+        if product_id:
+            return f"product:{product_id}"
+        if handle:
+            return f"handle:{handle}"
+        return json.dumps(row, sort_keys=True, default=str)
 
-        if is_searchspring_host:
-            if SEARCHSPRING_SITE_ID and not params.get("siteId"):
-                params["siteId"] = SEARCHSPRING_SITE_ID
-            params.setdefault("resultsFormat", "json")
-            params.setdefault("resultsPerPage", 250)
-            primary_url = primary_collection_url()
-            if primary_url and not params.get("domain"):
-                params["domain"] = primary_url
-        elif SEARCHSPRING_SITE_ID and not params.get("siteId"):
-            params["siteId"] = SEARCHSPRING_SITE_ID
+    def product_identity(row: Dict[str, Any]) -> str:
+        product_id = str(row.get("product.id") or row.get("product.algolia_id") or "").strip()
+        if product_id:
+            return f"product:{product_id}"
+        handle = str(row.get("product.handle") or "").strip()
+        if handle:
+            return f"handle:{handle}"
+        return ""
 
-        params["page"] = page
+    def looks_like_variant_row(row: Dict[str, Any]) -> bool:
+        for key in ("variant.id", "variant.sku", "variant.option1", "variant.title"):
+            if str(row.get(key) or "").strip():
+                return True
+        return False
 
-        logger.info("Fetching Searchspring page %s", page)
-        try:
-            response = session.get(endpoint, params=params, timeout=REQUEST_TIMEOUT, verify=False)
-        except requests.RequestException as exc:
-            logger.warning("Searchspring request failed on page %s: %s", page, exc)
-            break
+    def merge_rows(preferred: Dict[str, Any], supplement: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(preferred)
+        for key, value in supplement.items():
+            if key not in merged or merged.get(key) in (None, "", []):
+                merged[key] = value
+        return merged
 
-        if not response.ok:
-            logger.warning(
-                "Searchspring request returned status %s on page %s", response.status_code, page
-            )
-            break
+    def fetch_for_distinct(distinct_value: str) -> Tuple[List[Dict[str, Any]], Counter[str]]:
+        page = 0
+        pass_rows: List[Dict[str, Any]] = []
+        pass_tag_counts: Counter[str] = Counter()
 
-        try:
-            payload = response.json()
-        except ValueError:
-            logger.warning("Searchspring response on page %s was not valid JSON", page)
-            break
-
-        results = extract_searchspring_results(payload)
-        if not results:
-            logger.info("Searchspring page %s returned no results; stopping", page)
-            break
-
-        for product in results:
-            if not isinstance(product, dict):
-                continue
-            product_copy = dict(product)
-            variants = extract_searchspring_variants(product_copy)
-
-            tags = collect_tag_values(product)
-            tag_groups = group_tags_for_columns(tags)
-
-            def attach_tag_groups(target_row: Dict[str, Any]) -> None:
-                for column_name, tag_values in tag_groups.items():
-                    joined = ", ".join(tag_values)
-                    target_row[column_name] = joined
-                    tag_group_counts[column_name] += 1
-
-            image_candidates = [
-                product_copy.get(key)
-                for key in (
-                    "image",
-                    "image_url",
-                    "imageUrl",
-                    "image_link",
-                    "thumbnail",
-                    "thumbnail_url",
-                    "thumbnailImageUrl",
-                )
-            ]
-            image_src = next((candidate for candidate in image_candidates if candidate), None)
-            if image_src:
-                product_copy.setdefault("images", [{"src": image_src}])
-
-            flat_product = flatten_record({"product": product_copy})
-            base_row = dict(flat_product)
-            if tags:
-                base_row["product.tags_all"] = ", ".join(tags)
-
-            for key in (
-                "product.image",
-                "product.image_url",
-                "product.imageUrl",
-                "product.image_link",
-                "product.thumbnail",
-                "product.thumbnail_url",
-                "product.thumbnailImageUrl",
-            ):
-                if key in base_row and not base_row.get("product.images[0].src"):
-                    base_row["product.images[0].src"] = base_row[key]
-
-            if not variants:
-                attach_tag_groups(base_row)
-                finalize_json_row(base_row, product, None)
-                rows.append(base_row)
-                continue
-
-            for variant in variants:
-                if not isinstance(variant, dict):
+        while True:
+            params: Dict[str, Any] = {
+                "query": ALGOLIA_QUERY,
+                "page": page,
+                "hitsPerPage": ALGOLIA_HITS_PER_PAGE,
+                "distinct": str(distinct_value),
+                "analytics": "false",
+                "clickAnalytics": "false",
+                "enablePersonalization": "false",
+            }
+            if filters:
+                params["filters"] = filters
+            for key, value in ALGOLIA_EXTRA_PARAMS.items():
+                if key in {"filters", "distinct"}:
                     continue
-                variant_copy = dict(variant)
-                if "inventory_quantity" not in variant_copy:
-                    for candidate in (
-                        "inventory_quantity",
-                        "inventoryQuantity",
-                        "inventory",
-                        "qty",
-                        "quantity",
-                        "available_quantity",
-                    ):
-                        value = variant_copy.get(candidate)
-                        if value not in (None, ""):
-                            variant_copy["inventory_quantity"] = value
-                            break
-                if "availableForSale" not in variant_copy and isinstance(
-                    variant_copy.get("available"), bool
+                params[key] = value
+
+            payload_body = {"params": urlencode(params, doseq=True)}
+            logger.info("Fetching Algolia page %s (distinct=%s)", page + 1, distinct_value)
+            try:
+                response = session.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload_body,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=False,
+                )
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Algolia request failed on page %s (distinct=%s): %s",
+                    page + 1,
+                    distinct_value,
+                    exc,
+                )
+                break
+
+            if not response.ok:
+                logger.warning(
+                    "Algolia request returned status %s on page %s (distinct=%s)",
+                    response.status_code,
+                    page + 1,
+                    distinct_value,
+                )
+                break
+
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.warning(
+                    "Algolia response on page %s was not valid JSON (distinct=%s)",
+                    page + 1,
+                    distinct_value,
+                )
+                break
+
+            results = extract_algolia_results(payload)
+            if not results:
+                logger.info(
+                    "Algolia page %s returned no results (distinct=%s); stopping",
+                    page + 1,
+                    distinct_value,
+                )
+                break
+
+            for product in results:
+                if not isinstance(product, dict):
+                    continue
+                product_copy = dict(product)
+                raw_id = product_copy.get("id")
+                if raw_id not in (None, ""):
+                    product_copy.setdefault("variant_id", raw_id)
+                product_copy.setdefault(
+                    "algolia_id", product_copy.get("objectID") or product_copy.get("id")
+                )
+                if (
+                    "inventory_quantity" in product_copy
+                    and "variants_inventory_count" not in product_copy
                 ):
-                    variant_copy["availableForSale"] = variant_copy.get("available")
+                    product_copy.setdefault(
+                        "variants_inventory_count", product_copy.get("inventory_quantity")
+                    )
+                if "url" not in product_copy and product_copy.get("handle"):
+                    product_copy["url"] = f"/products/{product_copy['handle']}"
+                if product_copy.get("body_html_safe") and not product_copy.get("description"):
+                    product_copy["description"] = BeautifulSoup(
+                        str(product_copy.get("body_html_safe")), "html.parser"
+                    ).get_text(" ", strip=True)
+                if product_copy.get("body_html_safe") and not product_copy.get("descriptionHtml"):
+                    product_copy["descriptionHtml"] = product_copy.get("body_html_safe")
+                if product_copy.get("inventory_available") is not None:
+                    product_copy.setdefault(
+                        "availableForSale", product_copy.get("inventory_available")
+                    )
 
-                flat_variant = flatten_record({"variant": variant_copy})
-                row = dict(base_row)
-                row.update(flat_variant)
-                attach_tag_groups(row)
-                finalize_json_row(row, product, variant_copy)
-                rows.append(row)
+                variant_seed: Dict[str, Any] = {
+                    "variant_id": product_copy.get("id"),
+                    "id": product_copy.get("id"),
+                    "title": product_copy.get("variant_title") or product_copy.get("option1"),
+                    "option1": product_copy.get("option1")
+                    or (product_copy.get("options") or {}).get("size"),
+                    "option2": product_copy.get("option2"),
+                    "option3": product_copy.get("option3"),
+                    "price": product_copy.get("price"),
+                    "compare_at_price": product_copy.get("compare_at_price"),
+                    "inventory_quantity": product_copy.get("inventory_quantity"),
+                    "availableForSale": product_copy.get("inventory_available"),
+                    "sku": product_copy.get("sku"),
+                    "barcode": product_copy.get("barcode"),
+                }
+                variants = [variant_seed]
+                parsed_variants = extract_algolia_variants(product_copy)
+                if parsed_variants:
+                    variants.extend(parsed_variants)
 
-        pagination = payload.get("pagination") if isinstance(payload, dict) else None
-        next_page: Optional[int] = None
-        if isinstance(pagination, dict):
-            candidate = pagination.get("nextPage")
-            if isinstance(candidate, int):
-                next_page = candidate
-            elif isinstance(candidate, str) and candidate.isdigit():
-                next_page = int(candidate)
-            elif pagination.get("page") and pagination.get("totalPages"):
-                try:
-                    current_page = int(pagination.get("page"))
-                    total_pages = int(pagination.get("totalPages"))
-                    if current_page < total_pages:
-                        next_page = current_page + 1
-                except (TypeError, ValueError):
-                    next_page = None
+                tags = collect_tag_values(product_copy)
+                tag_groups = group_tags_for_columns(tags)
 
-        if next_page:
-            page = next_page
-            time.sleep(0.5)
+                def attach_tag_groups(target_row: Dict[str, Any]) -> None:
+                    for column_name, tag_values in tag_groups.items():
+                        joined = ", ".join(tag_values)
+                        target_row[column_name] = joined
+                        pass_tag_counts[column_name] += 1
+
+                image_candidates = [
+                    product_copy.get(key)
+                    for key in (
+                        "image",
+                        "image_url",
+                        "imageUrl",
+                        "image_link",
+                        "thumbnail",
+                        "thumbnail_url",
+                        "thumbnailImageUrl",
+                    )
+                ]
+                image_src = next((candidate for candidate in image_candidates if candidate), None)
+                if image_src:
+                    product_copy.setdefault("images", [{"src": image_src}])
+
+                flat_product = flatten_record({"product": product_copy})
+                base_row = dict(flat_product)
+                if tags:
+                    base_row["product.tags_all"] = ", ".join(tags)
+
+                for key in (
+                    "product.image",
+                    "product.image_url",
+                    "product.imageUrl",
+                    "product.image_link",
+                    "product.thumbnail",
+                    "product.thumbnail_url",
+                    "product.thumbnailImageUrl",
+                ):
+                    if key in base_row and not base_row.get("product.images[0].src"):
+                        base_row["product.images[0].src"] = base_row[key]
+
+                if not variants:
+                    attach_tag_groups(base_row)
+                    finalize_json_row(base_row, product_copy, None)
+                    pass_rows.append(base_row)
+                    continue
+
+                seen_variant_keys: Set[str] = set()
+                for variant in variants:
+                    if not isinstance(variant, dict):
+                        continue
+                    variant_copy = dict(variant)
+                    dedupe_key = json.dumps(variant_copy, sort_keys=True, default=str)
+                    if dedupe_key in seen_variant_keys:
+                        continue
+                    seen_variant_keys.add(dedupe_key)
+                    if "inventory_quantity" not in variant_copy:
+                        for candidate in (
+                            "inventory_quantity",
+                            "inventoryQuantity",
+                            "inventory",
+                            "qty",
+                            "quantity",
+                            "available_quantity",
+                        ):
+                            value = variant_copy.get(candidate)
+                            if value not in (None, ""):
+                                variant_copy["inventory_quantity"] = value
+                                break
+                    if "availableForSale" not in variant_copy and isinstance(
+                        variant_copy.get("available"), bool
+                    ):
+                        variant_copy["availableForSale"] = variant_copy.get("available")
+
+                    flat_variant = flatten_record({"variant": variant_copy})
+                    row = dict(base_row)
+                    row.update(flat_variant)
+                    attach_tag_groups(row)
+                    finalize_json_row(row, product_copy, variant_copy)
+                    pass_rows.append(row)
+
+            nb_pages = payload.get("nbPages") if isinstance(payload, dict) else None
+            if isinstance(nb_pages, int) and page + 1 < nb_pages:
+                page += 1
+                time.sleep(0.5)
+                continue
+            break
+        return pass_rows, pass_tag_counts
+
+    pass_values = [str(v).strip().lower() for v in ALGOLIA_DISTINCT_PASSES if str(v).strip()]
+    if not pass_values:
+        pass_values = [str(ALGOLIA_DISTINCT).strip().lower() or "true"]
+
+    all_pass_rows: List[List[Dict[str, Any]]] = []
+    all_pass_tag_counts: List[Counter[str]] = []
+    for distinct_value in pass_values:
+        pass_rows, pass_tag_counts = fetch_for_distinct(distinct_value)
+        all_pass_rows.append(pass_rows)
+        all_pass_tag_counts.append(pass_tag_counts)
+        logger.info(
+            "Algolia pass complete (distinct=%s): rows=%s", distinct_value, len(pass_rows)
+        )
+
+    if not all_pass_rows:
+        return [], []
+
+    # Primary row set should be variant-level output (distinct=false where configured).
+    primary_index = len(all_pass_rows) - 1
+    for index, value in enumerate(pass_values):
+        if value == "false":
+            primary_index = index
+            break
+
+    primary_rows_raw = all_pass_rows[primary_index] if all_pass_rows else []
+    variant_primary_rows = [row for row in primary_rows_raw if looks_like_variant_row(row)]
+    if variant_primary_rows:
+        primary_rows = variant_primary_rows
+    else:
+        primary_rows = primary_rows_raw
+
+    # Index supplemental rows by row identity and by product identity.
+    supplemental_by_row_key: Dict[str, Dict[str, Any]] = {}
+    supplemental_by_product_key: Dict[str, Dict[str, Any]] = {}
+    for pass_index, pass_rows in enumerate(all_pass_rows):
+        if pass_index == primary_index:
             continue
+        for row in pass_rows:
+            rkey = row_identity(row)
+            existing = supplemental_by_row_key.get(rkey)
+            supplemental_by_row_key[rkey] = merge_rows(existing or {}, row)
 
-        per_page_param = params.get("resultsPerPage")
-        try:
-            per_page_int = int(per_page_param)
-        except (TypeError, ValueError):
-            per_page_int = None
-        if per_page_int and len(results) >= per_page_int:
-            page += 1
-            time.sleep(0.5)
-            continue
+            pkey = product_identity(row)
+            if pkey:
+                p_existing = supplemental_by_product_key.get(pkey)
+                supplemental_by_product_key[pkey] = merge_rows(p_existing or {}, row)
 
-        break
+    # Preserve every primary row (variant-level) and enrich from supplemental passes.
+    rows: List[Dict[str, Any]] = []
+    for primary_row in primary_rows:
+        row = dict(primary_row)
+        key = row_identity(row)
+        same_variant = supplemental_by_row_key.get(key)
+        if same_variant:
+            row = merge_rows(row, same_variant)
+        pkey = product_identity(row)
+        if pkey and pkey in supplemental_by_product_key:
+            row = merge_rows(row, supplemental_by_product_key[pkey])
+        rows.append(row)
+
+    tag_group_counts: Counter[str] = Counter()
+    for counter in all_pass_tag_counts:
+        tag_group_counts.update(counter)
 
     if not rows:
         return [], []
-
     columns = {key for row in rows for key in row.keys()}
     tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
     tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
-
     return rows, tag_group_columns
 
 
@@ -1734,6 +2125,241 @@ def discover_tokens(
 
     logger.info("Discovered %s potential tokens", len(tokens))
     return [(token, source) for token, source in tokens.items()]
+
+
+METAFIELD_IDENTIFIERS_BLOCK_RE = re.compile(
+    r"metafields\s*\(\s*identifiers\s*:\s*\[(.*?)\]\s*\)", re.IGNORECASE | re.DOTALL
+)
+METAFIELD_PAIR_RE = re.compile(
+    r"\{\s*namespace\s*:\s*(?P<ns>\"[^\"]+\"|'[^']+'|\$\{[^}]+\})\s*,\s*key\s*:\s*(?P<key>\"[^\"]+\"|'[^']+')\s*\}",
+    re.IGNORECASE,
+)
+METAFIELD_SINGLE_RE = re.compile(
+    r"metafield\s*\(\s*namespace\s*:\s*(?P<ns>\"[^\"]+\"|'[^']+'|\$\{[^}]+\})\s*,\s*key\s*:\s*(?P<key>\"[^\"]+\"|'[^']+')\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _strip_js_quote(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    if (token.startswith('"') and token.endswith('"')) or (
+        token.startswith("'") and token.endswith("'")
+    ):
+        return token[1:-1]
+    return token
+
+
+def extract_metafield_identifiers_from_text(
+    text: str,
+    *,
+    default_namespace: str,
+) -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    if not text:
+        return found
+
+    def push(ns_raw: str, key_raw: str) -> None:
+        namespace = _strip_js_quote(ns_raw)
+        key = _strip_js_quote(key_raw)
+        if namespace.startswith("${"):
+            namespace = default_namespace
+        if namespace and key:
+            found.append((namespace, key))
+
+    for block in METAFIELD_IDENTIFIERS_BLOCK_RE.findall(text):
+        for match in METAFIELD_PAIR_RE.finditer(block):
+            push(match.group("ns"), match.group("key"))
+
+    for match in METAFIELD_SINGLE_RE.finditer(text):
+        push(match.group("ns"), match.group("key"))
+
+    return found
+
+
+def fetch_sample_product_handle(
+    session: requests.Session,
+    endpoint: str,
+    token: Optional[str],
+    logger: logging.Logger,
+) -> Optional[str]:
+    # Try configured collection handles first.
+    for handle in STOREFRONT_COLLECTION_HANDLES:
+        payload = {
+            "query": (
+                "query ProbeHandle($handle: String!) {\n"
+                "  collection(handle: $handle) {\n"
+                "    products(first: 1) {\n"
+                "      nodes { handle }\n"
+                "    }\n"
+                "  }\n"
+                "}"
+            ),
+            "variables": {"handle": handle},
+        }
+        response, data = perform_graphql_request(session, endpoint, payload, token)
+        if response is None or not response.ok:
+            continue
+        nodes = (
+            (((data or {}).get("data") or {}).get("collection") or {})
+            .get("products", {})
+            .get("nodes", [])
+        )
+        if nodes and isinstance(nodes[0], dict):
+            value = str(nodes[0].get("handle") or "").strip()
+            if value:
+                return value
+
+    # Fallback to any product.
+    payload = {"query": "query { products(first: 1) { nodes { handle } } }"}
+    response, data = perform_graphql_request(session, endpoint, payload, token)
+    if response is None or not response.ok:
+        return None
+    nodes = (((data or {}).get("data") or {}).get("products") or {}).get("nodes", [])
+    if nodes and isinstance(nodes[0], dict):
+        value = str(nodes[0].get("handle") or "").strip()
+        if value:
+            return value
+    logger.debug("Unable to determine sample product handle for metafield probing")
+    return None
+
+
+def probe_metafield_identifiers(
+    session: requests.Session,
+    endpoint: str,
+    token: Optional[str],
+    identifiers: Sequence[Tuple[str, str]],
+    logger: logging.Logger,
+) -> List[Tuple[str, str]]:
+    sample_handle = fetch_sample_product_handle(session, endpoint, token, logger)
+    if not sample_handle:
+        logger.info("Metafield auto-discovery probe skipped; no sample handle found")
+        return []
+
+    unique_identifiers: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for ns, key in identifiers:
+        tup = (str(ns).strip(), str(key).strip())
+        if not tup[0] or not tup[1] or tup in seen:
+            continue
+        seen.add(tup)
+        unique_identifiers.append(tup)
+
+    valid: List[Tuple[str, str]] = []
+    for start in range(0, len(unique_identifiers), 20):
+        chunk = unique_identifiers[start : start + 20]
+        literal = ", ".join(
+            f'{{namespace: "{ns}", key: "{key}"}}' for ns, key in chunk
+        )
+        payload = {
+            "query": (
+                "query ProbeMetafields($handle: String!) {\n"
+                "  product(handle: $handle) {\n"
+                f"    metafields(identifiers: [{literal}]) {{ namespace key value }}\n"
+                "  }\n"
+                "}"
+            ),
+            "variables": {"handle": sample_handle},
+        }
+        response, data = perform_graphql_request(session, endpoint, payload, token)
+        if response is None or not response.ok:
+            continue
+        rows = (((data or {}).get("data") or {}).get("product") or {}).get("metafields", [])
+        if not isinstance(rows, list):
+            continue
+        for entry in rows:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("value") in (None, ""):
+                continue
+            ns = str(entry.get("namespace") or "").strip()
+            key = str(entry.get("key") or "").strip()
+            if ns and key:
+                valid.append((ns, key))
+
+    # Preserve order and uniqueness.
+    ordered_valid: List[Tuple[str, str]] = []
+    seen_valid: Set[Tuple[str, str]] = set()
+    for item in valid:
+        if item in seen_valid:
+            continue
+        seen_valid.add(item)
+        ordered_valid.append(item)
+    return ordered_valid
+
+
+def discover_metafield_identifiers(
+    session: requests.Session,
+    html_blobs: List[Tuple[str, str]],
+    endpoint: str,
+    token: Optional[str],
+    logger: logging.Logger,
+    seed_identifiers: Sequence[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = list(seed_identifiers)
+    if not METAFIELD_AUTO_DISCOVER:
+        return candidates
+
+    script_urls: List[Tuple[str, str]] = []
+    for base_url, html_text in html_blobs:
+        candidates.extend(
+            extract_metafield_identifiers_from_text(
+                html_text, default_namespace=METAFIELD_DEFAULT_NAMESPACE
+            )
+        )
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        for script in soup.find_all("script"):
+            src = script.get("src")
+            if src:
+                script_urls.append((base_url, make_absolute(src, base_url)))
+            script_body = script.string or script.get_text() or ""
+            candidates.extend(
+                extract_metafield_identifiers_from_text(
+                    script_body, default_namespace=METAFIELD_DEFAULT_NAMESPACE
+                )
+            )
+
+    for _base, script_url in script_urls[:METAFIELD_DISCOVERY_MAX_SCRIPTS]:
+        try:
+            resp = session.get(script_url, timeout=REQUEST_TIMEOUT, verify=False)
+        except requests.RequestException:
+            continue
+        if not resp.ok:
+            continue
+        candidates.extend(
+            extract_metafield_identifiers_from_text(
+                resp.text, default_namespace=METAFIELD_DEFAULT_NAMESPACE
+            )
+        )
+
+    # Deduplicate prior to probing.
+    deduped: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for ns, key in candidates:
+        tup = (str(ns).strip(), str(key).strip())
+        if not tup[0] or not tup[1] or tup in seen:
+            continue
+        seen.add(tup)
+        deduped.append(tup)
+
+    if not deduped:
+        return list(seed_identifiers)
+
+    valid = probe_metafield_identifiers(session, endpoint, token, deduped, logger)
+    if not valid:
+        logger.info(
+            "Metafield auto-discovery found %s candidates but none returned non-null values.",
+            len(deduped),
+        )
+        return list(seed_identifiers)
+
+    logger.info(
+        "Metafield auto-discovery: %s candidates, %s validated non-null identifiers",
+        len(deduped),
+        len(valid),
+    )
+    return valid
 
 
 def determine_graphql_endpoints() -> List[str]:
@@ -2071,16 +2697,51 @@ class GraphQLQueryBuilder:
 
     def _build_variants_field(self, field: Dict[str, Any]) -> Optional[str]:
         args = self._build_field_args(field)
+        store_availability_block = self._build_store_availability_selection()
+        store_availability_fragment = (
+            f"\n{self._indent(store_availability_block, 4)}"
+            if store_availability_block
+            else ""
+        )
         body = (
             "pageInfo {\n  hasNextPage\n  endCursor\n}\n"
             "edges {\n"
             "  cursor\n"
             "  node {\n"
-            f"{self._indent(self.variant_selection, 4)}\n"
+            f"{self._indent(self.variant_selection, 4)}"
+            f"{store_availability_fragment}\n"
             "  }\n"
             "}"
         )
         return f"variants{args} {{\n{self._indent(body)}\n}}"
+
+    def _build_store_availability_selection(self) -> str:
+        variant_type = self.schema.get_type("ProductVariant") or {}
+        fields = variant_type.get("fields", [])
+        store_field = next(
+            (field for field in fields if field.get("name") == "storeAvailability"), None
+        )
+        if not store_field:
+            return ""
+        args = self._build_field_args(store_field)
+        body = (
+            "edges {\n"
+            "  node {\n"
+            "    available\n"
+            "    quantityAvailable\n"
+            "    pickUpTime\n"
+            "    location {\n"
+            "      id\n"
+            "      name\n"
+            "      address {\n"
+            "        city\n"
+            "        country\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        return f"storeAvailability{args} {{\n{self._indent(body)}\n}}"
 
     def _build_type_selection(
         self,
@@ -2156,7 +2817,7 @@ def probe_graphql_endpoints(
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Set[Optional[str]]]]:
     access_rows: List[Dict[str, Any]] = []
     operational: List[str] = []
-    success_map: Dict[str, Set[Optional[str]]] = {endpoint: set() for endpoint in endpoints}
+    succealgolia_map: Dict[str, Set[Optional[str]]] = {endpoint: set() for endpoint in endpoints}
 
     deduped_tokens: List[Tuple[Optional[str], str]] = []
     seen_keys: Set[Tuple[Optional[str], str]] = set()
@@ -2194,14 +2855,14 @@ def probe_graphql_endpoints(
                     entry["shop_name"] = shop.get("name")
                     entry["primary_domain"] = (shop.get("primaryDomain") or {}).get("url")
                     entry["note"] = "success"
-                    success_map.setdefault(endpoint, set()).add(token)
+                    succealgolia_map.setdefault(endpoint, set()).add(token)
                     if token is None and endpoint not in operational:
                         operational.append(endpoint)
                 else:
                     errors = (data or {}).get("errors") if data else None
                     entry["note"] = format_error_note(errors) if errors else "no_shop_data"
             access_rows.append(entry)
-    return access_rows, operational, success_map
+    return access_rows, operational, succealgolia_map
 
 
 def apply_tag_filter(product: Dict[str, Any]) -> bool:
@@ -2260,13 +2921,131 @@ def probe_collection_filters(
     return {}
 
 
+class ViewJSONEnrichmentState:
+    def __init__(self, enabled: bool, fields: Sequence[str], probe_limit: int) -> None:
+        self.enabled = bool(enabled)
+        self.fields = [field.strip() for field in fields if str(field).strip()]
+        self.probe_limit = max(int(probe_limit), 0)
+        self.probe_attempts = 0
+        self.probe_hits = 0
+        self.disabled_after_probe = False
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.warned_urls: Set[str] = set()
+
+
+def _normalize_view_json_url(online_store_url: str) -> str:
+    parsed = urlsplit(online_store_url)
+    params = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "view"]
+    params.append(("view", "json"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), parsed.fragment))
+
+
+def _lookup_view_json_field(payload: Any, field: str) -> Any:
+    current: Any = payload
+    for part in field.split("."):
+        key = part.strip()
+        if not key:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+            continue
+        if isinstance(current, list) and key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(current):
+                current = current[idx]
+                continue
+        return None
+    return current
+
+
+def _extract_view_json_values(payload: Dict[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
+    extracted: Dict[str, Any] = {}
+    for field in fields:
+        value = _lookup_view_json_field(payload, field)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, (dict, list)):
+            extracted[f"viewjson.{field}"] = json.dumps(value, ensure_ascii=False)
+        else:
+            extracted[f"viewjson.{field}"] = str(value)
+    return extracted
+
+
+def _get_view_json_enrichment(
+    session: requests.Session,
+    product: Dict[str, Any],
+    logger: logging.Logger,
+    state: Optional[ViewJSONEnrichmentState],
+) -> Dict[str, Any]:
+    if state is None or not state.enabled or not state.fields:
+        return {}
+    if state.probe_limit and state.probe_attempts >= state.probe_limit and state.probe_hits == 0:
+        state.enabled = False
+        state.disabled_after_probe = True
+        logger.info(
+            "View JSON enrichment disabled after %s probe attempts with no useful fields.",
+            state.probe_attempts,
+        )
+        return {}
+
+    cache_key = str(product.get("id") or product.get("handle") or "")
+    if cache_key and cache_key in state.cache:
+        return dict(state.cache[cache_key])
+
+    online_store_url = str(product.get("onlineStoreUrl") or "").strip()
+    if not online_store_url:
+        if cache_key:
+            state.cache[cache_key] = {}
+        return {}
+
+    view_url = _normalize_view_json_url(online_store_url)
+    response: Optional[requests.Response] = None
+    try:
+        response = session.get(view_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        if view_url not in state.warned_urls:
+            state.warned_urls.add(view_url)
+            logger.warning("View JSON enrichment failed for %s -> %s", view_url, exc)
+        if cache_key:
+            state.cache[cache_key] = {}
+        if state.probe_attempts < state.probe_limit:
+            state.probe_attempts += 1
+        return {}
+
+    if not isinstance(payload, dict):
+        if view_url not in state.warned_urls:
+            state.warned_urls.add(view_url)
+            logger.warning("View JSON enrichment returned non-object JSON for %s", view_url)
+        if cache_key:
+            state.cache[cache_key] = {}
+        if state.probe_attempts < state.probe_limit:
+            state.probe_attempts += 1
+        return {}
+
+    extracted = _extract_view_json_values(payload, state.fields)
+    if state.probe_attempts < state.probe_limit:
+        state.probe_attempts += 1
+        if extracted:
+            state.probe_hits += 1
+    if cache_key:
+        state.cache[cache_key] = extracted
+    return dict(extracted)
+
+
 def flatten_graphql_product(
     collection_info: Dict[str, Any],
     edge_cursor: str,
     product: Dict[str, Any],
     variant_edge: Optional[Dict[str, Any]],
+    *,
+    session: Optional[requests.Session] = None,
+    logger: Optional[logging.Logger] = None,
+    view_json_state: Optional[ViewJSONEnrichmentState] = None,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = dict(collection_info)
+    apply_expected_metafield_columns(row, METAFIELD_IDENTIFIERS)
     collections_handles, collections_titles = extract_collections(product, collection_info)
     if collections_handles:
         row["collections.handle"] = ",".join(collections_handles)
@@ -2276,6 +3055,7 @@ def flatten_graphql_product(
     metafields = collect_metafields(product)
     if metafields:
         row["metafields"] = json.dumps(metafields)
+        apply_metafield_columns(row, metafields)
 
     product_copy = dict(product)
     for drop_key in (
@@ -2291,6 +3071,9 @@ def flatten_graphql_product(
     variants = product_copy.pop("variants", None)
     flat_product = flatten_record({"product": product_copy})
     row.update(flat_product)
+
+    if session is not None and logger is not None:
+        row.update(_get_view_json_enrichment(session, product, logger, view_json_state))
 
     option_columns = build_option_columns(product.get("options") or [])
     for key, value in option_columns.items():
@@ -2319,12 +3102,18 @@ def collect_storefront_from_collections(
     endpoint: str,
     token: Optional[str],
     logger: logging.Logger,
+    metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[int], str]:
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
 
     first_status: Optional[int] = None
+    view_json_state = ViewJSONEnrichmentState(
+        VIEW_JSON_ENRICHMENT_ENABLED,
+        VIEW_JSON_FIELDS,
+        VIEW_JSON_PROBE_LIMIT,
+    )
 
     while True:
         try:
@@ -2334,7 +3123,7 @@ def collect_storefront_from_collections(
                 token,
                 logger,
                 forbidden_fields=forbidden,
-                metafield_identifiers=METAFIELD_IDENTIFIERS,
+                metafield_identifiers=metafield_identifiers or METAFIELD_IDENTIFIERS,
             )
         except GraphQLIntrospectionError as exc:
             logger.debug("Unable to build collection query for %s: %s", endpoint, exc)
@@ -2438,7 +3227,13 @@ def collect_storefront_from_collections(
                     if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
-                                collection_info, edge.get("cursor", ""), product, None
+                                collection_info,
+                                edge.get("cursor", ""),
+                                product,
+                                None,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
                     else:
@@ -2449,6 +3244,9 @@ def collect_storefront_from_collections(
                                     edge.get("cursor", ""),
                                     product,
                                     variant_edge,
+                                    session=session,
+                                    logger=logger,
+                                    view_json_state=view_json_state,
                                 )
                             )
                 page_info = products_connection.get("pageInfo") or {}
@@ -2504,11 +3302,17 @@ def collect_storefront_from_products(
     endpoint: str,
     token: Optional[str],
     logger: logging.Logger,
+    metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[int], str]:
     rows: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     query_string = build_product_query_string()
     first_status: Optional[int] = None
+    view_json_state = ViewJSONEnrichmentState(
+        VIEW_JSON_ENRICHMENT_ENABLED,
+        VIEW_JSON_FIELDS,
+        VIEW_JSON_PROBE_LIMIT,
+    )
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
@@ -2520,7 +3324,7 @@ def collect_storefront_from_products(
             token,
             logger,
             forbidden_fields=forbidden,
-            metafield_identifiers=METAFIELD_IDENTIFIERS,
+            metafield_identifiers=metafield_identifiers or METAFIELD_IDENTIFIERS,
         )
     except GraphQLIntrospectionError as exc:
         logger.debug("Unable to build products query for %s: %s", endpoint, exc)
@@ -2570,14 +3374,26 @@ def collect_storefront_from_products(
             if not variant_entries:
                 rows.append(
                     flatten_graphql_product(
-                        {"collection_handle": ""}, edge.get("cursor", ""), product, None
+                        {"collection_handle": ""},
+                        edge.get("cursor", ""),
+                        product,
+                        None,
+                        session=session,
+                        logger=logger,
+                        view_json_state=view_json_state,
                     )
                 )
             else:
                 for variant_edge in variant_entries:
                     rows.append(
                         flatten_graphql_product(
-                            {"collection_handle": ""}, edge.get("cursor", ""), product, variant_edge
+                            {"collection_handle": ""},
+                            edge.get("cursor", ""),
+                            product,
+                            variant_edge,
+                            session=session,
+                            logger=logger,
+                            view_json_state=view_json_state,
                         )
                     )
         page_info = products_connection.get("pageInfo") or {}
@@ -2617,6 +3433,11 @@ def fallback_collect_from_collections(
         first_status: Optional[int] = None
         success = True
         filters_cache: Dict[str, Dict[str, List[str]]] = {}
+        view_json_state = ViewJSONEnrichmentState(
+            VIEW_JSON_ENRICHMENT_ENABLED,
+            VIEW_JSON_FIELDS,
+            VIEW_JSON_PROBE_LIMIT,
+        )
 
         for handle in STOREFRONT_COLLECTION_HANDLES:
             if handle not in filters_cache:
@@ -2680,7 +3501,13 @@ def fallback_collect_from_collections(
                     if not variant_entries:
                         rows.append(
                             flatten_graphql_product(
-                                collection_info, edge.get("cursor", ""), product, None
+                                collection_info,
+                                edge.get("cursor", ""),
+                                product,
+                                None,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
                     else:
@@ -2691,6 +3518,9 @@ def fallback_collect_from_collections(
                                     edge.get("cursor", ""),
                                     product,
                                     variant_edge,
+                                    session=session,
+                                    logger=logger,
+                                    view_json_state=view_json_state,
                                 )
                             )
 
@@ -2705,7 +3535,7 @@ def fallback_collect_from_collections(
                 break
 
         if rows and success:
-            access_entry = {
+            accealgolia_entry = {
                 "endpoint": endpoint,
                 "token": "",
                 "token_source": "fallback_unauthenticated",
@@ -2713,7 +3543,7 @@ def fallback_collect_from_collections(
                 "ok": True,
                 "note": "fallback_success",
             }
-            return rows, access_entry
+            return rows, accealgolia_entry
 
     return [], None
 
@@ -2733,6 +3563,11 @@ def fallback_collect_from_products(
         cursor: Optional[str] = None
         first_status: Optional[int] = None
         fallback_query = build_fallback_products_query()
+        view_json_state = ViewJSONEnrichmentState(
+            VIEW_JSON_ENRICHMENT_ENABLED,
+            VIEW_JSON_FIELDS,
+            VIEW_JSON_PROBE_LIMIT,
+        )
 
         while True:
             payload = {
@@ -2778,7 +3613,13 @@ def fallback_collect_from_products(
                 if not variant_entries:
                     rows.append(
                         flatten_graphql_product(
-                            {"collection_handle": ""}, edge.get("cursor", ""), product, None
+                            {"collection_handle": ""},
+                            edge.get("cursor", ""),
+                            product,
+                            None,
+                            session=session,
+                            logger=logger,
+                            view_json_state=view_json_state,
                         )
                     )
                 else:
@@ -2789,6 +3630,9 @@ def fallback_collect_from_products(
                                 edge.get("cursor", ""),
                                 product,
                                 variant_edge,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
                             )
                         )
 
@@ -2800,7 +3644,7 @@ def fallback_collect_from_products(
                 break
 
         if rows:
-            access_entry = {
+            accealgolia_entry = {
                 "endpoint": endpoint,
                 "token": "",
                 "token_source": "fallback_unauthenticated",
@@ -2808,7 +3652,7 @@ def fallback_collect_from_products(
                 "ok": True,
                 "note": "fallback_success",
             }
-            return rows, access_entry
+            return rows, accealgolia_entry
 
     return [], None
 
@@ -2826,23 +3670,25 @@ def gather_storefront_data(
     provided_tokens = [
         (token, "provided_token") for token in normalize_tokens(X_SHOPIFY_STOREFRONT_ACCESS_TOKEN)
     ]
-    access_rows, _operational, success_map = probe_graphql_endpoints(
+    access_rows, _operational, succealgolia_map = probe_graphql_endpoints(
         session, endpoints, provided_tokens, logger
     )
     endpoints_to_use = list(dict.fromkeys(endpoints))
-    token_success_map: Dict[str, Set[Optional[str]]] = {
-        endpoint: set(tokens) for endpoint, tokens in success_map.items()
+    token_succealgolia_map: Dict[str, Set[Optional[str]]] = {
+        endpoint: set(tokens) for endpoint, tokens in succealgolia_map.items()
     }
+    metafield_identifier_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
 
     def attempt_with_token(
         token: Optional[str], source: str
     ) -> Optional[List[Dict[str, Any]]]:
+        global METAFIELD_IDENTIFIERS
         endpoints_iterable = endpoints_to_use
         if token is not None:
             eligible = [
                 endpoint
                 for endpoint in endpoints_to_use
-                if token in token_success_map.get(endpoint, set())
+                if token in token_succealgolia_map.get(endpoint, set())
             ]
             if not eligible:
                 logger.debug(
@@ -2853,13 +3699,35 @@ def gather_storefront_data(
             endpoints_iterable = eligible
 
         for endpoint in endpoints_iterable:
+            cache_key = (endpoint, token or "")
+            if cache_key not in metafield_identifier_cache:
+                discovered_identifiers = discover_metafield_identifiers(
+                    session,
+                    html_blobs,
+                    endpoint,
+                    token,
+                    logger,
+                    METAFIELD_IDENTIFIERS,
+                )
+                metafield_identifier_cache[cache_key] = discovered_identifiers
+            effective_metafields = metafield_identifier_cache[cache_key]
+            METAFIELD_IDENTIFIERS = list(effective_metafields)
+
             if STOREFRONT_COLLECTION_HANDLES:
                 rows, status, note = collect_storefront_from_collections(
-                    session, endpoint, token, logger
+                    session,
+                    endpoint,
+                    token,
+                    logger,
+                    metafield_identifiers=effective_metafields,
                 )
             else:
                 rows, status, note = collect_storefront_from_products(
-                    session, endpoint, token, logger
+                    session,
+                    endpoint,
+                    token,
+                    logger,
+                    metafield_identifiers=effective_metafields,
                 )
 
             access_rows.append(
@@ -2907,7 +3775,7 @@ def gather_storefront_data(
             access_rows.extend(discovery_rows)
             for endpoint, tokens in discovery_success.items():
                 if tokens:
-                    token_success_map.setdefault(endpoint, set()).update(tokens)
+                    token_succealgolia_map.setdefault(endpoint, set()).update(tokens)
         discovered_tokens.extend(new_tokens)
 
     for token, source in discovered_tokens:
@@ -2941,10 +3809,10 @@ def export_workbook(
     json_rows: List[Dict[str, Any]],
     storefront_rows: List[Dict[str, Any]],
     access_rows: List[Dict[str, Any]],
-    searchspring_rows: List[Dict[str, Any]],
+    algolia_rows: List[Dict[str, Any]],
     *,
     json_priority_columns: Optional[Sequence[str]] = None,
-    searchspring_priority_columns: Optional[Sequence[str]] = None,
+    algolia_priority_columns: Optional[Sequence[str]] = None,
 ) -> Path:
     workbook = Workbook()
     sheet = workbook.active
@@ -2955,16 +3823,18 @@ def export_workbook(
         else list(COLUMN_ORDER_BASE)
     )
     write_sheet(sheet, json_rows, column_order=json_columns)
+    group_tag_columns(sheet, json_columns)
 
-    searchspring_sheet = workbook.create_sheet("SearchSpring")
-    searchspring_columns = (
+    algolia_sheet = workbook.create_sheet("Algolia")
+    algolia_columns = (
         build_column_order(
-            searchspring_rows, extra_priority=searchspring_priority_columns
+            algolia_rows, extra_priority=algolia_priority_columns
         )
-        if searchspring_rows
+        if algolia_rows
         else list(COLUMN_ORDER_BASE)
     )
-    write_sheet(searchspring_sheet, searchspring_rows, column_order=searchspring_columns)
+    write_sheet(algolia_sheet, algolia_rows, column_order=algolia_columns)
+    group_tag_columns(algolia_sheet, algolia_columns)
 
     storefront_sheet = workbook.create_sheet("Storefront")
     storefront_columns = (
@@ -3002,20 +3872,29 @@ def main() -> None:
     global COLLECTION_TITLE_MAP
     COLLECTION_TITLE_MAP = fetch_collection_titles(session, logger)
     html_blobs = fetch_collection_html(session, logger)
-    json_rows, tag_group_columns = fetch_collection_json(session, logger)
-    if SEARCHSPRING_SITE_ID and SEARCHSPRING_URL:
-        searchspring_rows, searchspring_tag_columns = fetch_searchspring_data(session, logger)
-    else:
-        logger.info("Searchspring configuration missing; skipping Searchspring extraction")
-        searchspring_rows, searchspring_tag_columns = [], []
     storefront_rows, access_rows = gather_storefront_data(session, html_blobs, logger)
+    fallback_urls = [
+        str(row.get("product.onlineStoreUrl") or "").strip()
+        for row in storefront_rows
+        if isinstance(row, dict)
+    ]
+    json_rows, tag_group_columns = fetch_collection_json(
+        session,
+        logger,
+        fallback_online_store_urls=fallback_urls,
+    )
+    if ALGOLIA_APP_ID and ALGOLIA_SEARCH_URL:
+        algolia_rows, algolia_tag_columns = fetch_algolia_data(session, logger)
+    else:
+        logger.info("Algolia configuration missing; skipping Algolia extraction")
+        algolia_rows, algolia_tag_columns = [], []
     output_path = export_workbook(
         json_rows,
         storefront_rows,
         access_rows,
-        searchspring_rows,
+        algolia_rows,
         json_priority_columns=tag_group_columns,
-        searchspring_priority_columns=searchspring_tag_columns,
+        algolia_priority_columns=algolia_tag_columns,
     )
     logger.info("Workbook written to %s", output_path.as_posix())
 
