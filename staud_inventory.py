@@ -1,565 +1,769 @@
 #!/usr/bin/env python3
-"""
-Inventory + catalog exporter for https://staud.clothing/ STAID denim collection.
-
-Pulls the jeans collection feed for catalog level data and augments each variant
-with inventory details from the per-product JSON endpoint.
-Outputs a timestamped CSV alongside a simple run log.
-"""
-
 from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import re
 import time
+from collections import Counter, defaultdict
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from fractions import Fraction
 from pathlib import Path
-from html import unescape
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import requests
-from urllib.parse import urlparse, urlunparse
+from bs4 import BeautifulSoup
 
-BASE_URL = "https://staud.clothing"
-COLLECTION_PATH = "/collections/staud-jeans/products.json"
+BRAND = "STAUD"
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+LOG_PATH = BASE_DIR / f"{BRAND}_run.log"
 
-GRAPHQL_ENDPOINT = "https://staud-clothing.myshopify.com/api/2025-10/graphql.json"
-GRAPHQL_TOKEN_ENV_VARS = [
-    "STAUD_SHOPIFY_STOREFRONT_TOKEN",
-    "STAUD_SHOPIFY_GRAPHQL_TOKEN",
-    "STAUD_GRAPHQL_TOKEN",
+HOST_ROTATION = [
+    "https://staud.clothing",
+    "https://www.staud.clothing",
+    "https://staud-clothing.myshopify.com",
 ]
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = SCRIPT_DIR / "Output"
-LOG_PATH = SCRIPT_DIR / "staud_run.log"
+COLLECTION_HANDLES = ["staud-jeans", "sale"]
+GRAPHQL_ENDPOINT = "https://staud-clothing.myshopify.com/api/unstable/graphql.json"
+GRAPHQL_TOKEN_ENV_VARS = [
+    "X_SHOPIFY_STOREFRONT_ACCESS_TOKEN",
+    "SHOPIFY_STOREFRONT_ACCESS_TOKEN",
+    "STAUD_STOREFRONT_TOKEN",
+    "x-shopify-storefront-access-token",
+]
+HARDCODED_TOKENS = ["ff6b027455fec0e6fcaad09c69088b1e"]
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/127.0.0.0 Safari/537.36"
-)
-
-HOST_FALLBACKS = {
-    "staud.clothing": ["www.staud.clothing", "staud-clothing.myshopify.com"],
-    "www.staud.clothing": ["staud.clothing", "staud-clothing.myshopify.com"],
-    "staud-clothing.myshopify.com": ["staud.clothing", "www.staud.clothing"],
+FILTER_HANDLE_SUBSTRINGS = [
+    "dress", "top", "sweater", "jacket", "shoe", "heel", "sandal", "ankle-boot",
+    "over-the-knee-boot", "platform", "pump", "wedge", "sling-back", "pullover",
+    "romper", "bag", "blazer", "bodysuit", "capri", "carryall", "carry-all", "coat",
+    "combat-boot", "skirt", "accessories", "rompers", "shorts", "ballet-flat", "hat",
+    "scarf", "scrunchie", "tank", "tee", "thong", "unitard",
+]
+FILTER_TITLE_WORDS = {"short", "skirt", "capri", "romper", "jacket"}
+ALLOWED_PRODUCT_TYPE = "denim"
+FILTER_PRODUCT_TYPE_WORDS = {
+    "dresses", "tops", "sweaters", "jackets", "fashion core handbags", "shoes",
+    "fashion handbags", "pants", "core handbags", "skirts", "accessories", "rompers",
+    "shorts", "sweater",
 }
 
-TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
-
-DNS_ERROR_KEYWORDS = [
-    "failed to resolve",
-    "name or service not known",
-    "temporary failure in name resolution",
-    "getaddrinfo failed",
-    "nodename nor servname provided",
-    "unreachable network",
-    "connection aborted",
+STYLE_REMOVE_TERMS = [
+    "Accent Hardware", "Beaded", "Corduroy", "Cuff", "Cuffed", "Darted", "Destroyed", "Distressed",
+    "Flap Pocket", "Flap", "Frayed Seam", "Front Yoke", "w/ Slit Hem", "Leather", "Lightweight",
+    "low and loose", "patch", "petite", "Pintucked", "Raw Hem", "Seam", "Seamed Front Yoke",
+    "Seamed", "Side Seam Snaps", "Split", "Snake Print", "Track Pant", "Vegan Leather", "vent",
+    "slit", "W/ Contrast Front Panel", "w/ Cuff", "w/ Flap Jean", "W/ Stud Detailing", "W/ Wide Cuff",
+    "W/Flap", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper", "BELTED", "CROP", "CUTOFF",
+    "FLAG", "FLIP", "KRYSTAL", "CRYSTAL", "PANEL", "PLAID", "RENAISSANCE", "RINSE", "RIPPED",
+    "SADDLE", "SEQUIN", "SOTT", "SPARK", "SPARKLE", "SPLICED", "STUDDED", "TRASHED", "WAX",
+    "COATED", "FRONTIER", "LO", "SELVEDGE", "CRUSHED", "REPAIR", "SLICE", "PLUS", "ANKLE",
 ]
 
 CSV_HEADERS = [
-    "Style Id",
-    "Handle",
-    "Published At",
-    "Product",
-    "Style Name",
-    "Product Type",
-    "Tags",
-    "Vendor",
-    "Description",
-    "Variant Title",
-    "Color",
-    "Size",
-    "Inseam",
-    "Price",
-    "Compare at Price",
-    "Available for Sale",
-    "Quantity Price Breaks",
-    "Quantity Available",
-    "Old Quantity Available",
-    "Quantity of style",
-    "SKU - Shopify",
-    "SKU - Brand",
-    "Barcode",
-    "Image URL",
-    "SKU URL",
+    "Style Id", "Handle", "Published At", "Created At", "Product", "Style Name", "Product Type", "Tags", "Vendor",
+    "Description", "Variant Title", "Color", "Size", "Rise", "Inseam", "Price", "Compare at Price",
+    "Available for Sale", "Quantity Available", "Quantity of style", "SKU - Shopify", "SKU - Brand", "Barcode",
+    "Image URL", "SKU URL", "Jean Style", "Inseam Style", "Rise Label", "Color - Standardized", "Stretch",
 ]
 
+GRAPHQL_COLLECTION_QUERY = """
+query CollectionProducts($handle: String!, $cursor: String) {
+  collection(handle: $handle) {
+    products(first: 100, after: $cursor) {
+      nodes {
+        id
+        handle
+        title
+        productType
+        tags
+        vendor
+        description
+        publishedAt
+        createdAt
+        totalInventory
+        onlineStoreUrl
+        featuredImage { url }
+        variants(first: 100) {
+          nodes {
+            id
+            title
+            sku
+            barcode
+            availableForSale
+            quantityAvailable
+            price { amount }
+            compareAtPrice { amount }
+            selectedOptions { name value }
+          }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
 
-_session: Optional[requests.Session] = None
+GRAPHQL_PRODUCT_QUERY = """
+query ProductByHandle($handle: String!) {
+  product(handle: $handle) {
+    id
+    handle
+    title
+    productType
+    tags
+    vendor
+    description
+    publishedAt
+    createdAt
+    totalInventory
+    onlineStoreUrl
+    featuredImage { url }
+    variants(first: 100) {
+      nodes {
+        id
+        title
+        sku
+        barcode
+        availableForSale
+        quantityAvailable
+        price { amount }
+        compareAtPrice { amount }
+        selectedOptions { name value }
+      }
+    }
+  }
+}
+"""
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
 
 
-def _get_env_token() -> Optional[str]:
+def configure_logging() -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
+    )
+
+
+def graphql_token() -> str:
     for key in GRAPHQL_TOKEN_ENV_VARS:
-        token = os.getenv(key)
-        if token:
-            return token.strip()
-    return None
+        value = os.getenv(key)
+        if value:
+            return value.strip()
+    return HARDCODED_TOKENS[0]
 
 
-def get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        s = requests.Session()
-        s.headers.update({"User-Agent": USER_AGENT})
-        # Ensure the container proxy does not interfere with outbound requests.
-        s.trust_env = False
-        _session = s
-    return _session
+def normalize_text(text: str) -> str:
+    t = (text or "").lower().replace("-", " ")
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def log(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
-    print(line, flush=True)
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
+def contains_any(text: str, phrases: Sequence[str]) -> bool:
+    n = normalize_text(text)
+    return any(normalize_text(p) in n for p in phrases)
 
 
-def iter_url_candidates(url: str) -> List[str]:
-    parsed = urlparse(url)
-    netloc = parsed.netloc
-    candidates = [netloc]
-    candidates.extend(HOST_FALLBACKS.get(netloc.lower(), []))
-    seen: set[str] = set()
-    results: List[str] = []
-    for host in candidates:
-        if not host:
+def parse_number_with_fraction(text: str) -> str:
+    raw = (text or "").replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4").replace('"', " ")
+    total = 0.0
+    for tok in re.split(r"\s+", raw.strip()):
+        if not tok:
             continue
-        key = host.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(urlunparse(parsed._replace(netloc=host)))
-    return results
-
-
-def is_name_resolution_error(exc: Exception) -> bool:
-    parts: List[str] = []
-    current: Optional[BaseException] = exc
-    visited: set[int] = set()
-    while current and id(current) not in visited:
-        visited.add(id(current))
-        parts.append(str(current))
-        parts.append(repr(current))
-        current = getattr(current, "__cause__", None)
-    combined = " ".join(parts).lower()
-    return any(keyword in combined for keyword in DNS_ERROR_KEYWORDS)
-
-
-def polite_get(
-    url: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-    max_retries: int = 5,
-    backoff: float = 1.0,
-) -> requests.Response:
-    session = get_session()
-    candidates = iter_url_candidates(url)
-    last_exc: Optional[Exception] = None
-
-    for idx, candidate in enumerate(candidates):
-        for attempt in range(max_retries):
+        if re.fullmatch(r"\d+/\d+", tok):
+            total += float(Fraction(tok))
+        else:
             try:
-                resp = session.get(candidate, params=params, timeout=45)
-            except requests.RequestException as exc:
-                last_exc = exc
-                if attempt == max_retries - 1:
-                    log(f"[error] {candidate} exhausted retries due to {exc!r}")
-                    break
-                sleep_for = backoff * (2 ** attempt)
-                log(
-                    f"[retry] {candidate} due to error: {exc!r} -> sleeping {sleep_for:.1f}s"
-                )
-                time.sleep(sleep_for)
-                continue
-
-            if resp.status_code == 200:
-                if candidate != url:
-                    log(f"[fallback] succeeded via {candidate}")
-                return resp
-
-            if resp.status_code in TRANSIENT_STATUSES:
-                sleep_for = backoff * (2 ** attempt)
-                log(
-                    f"[wait] {resp.status_code} on {candidate} -> sleeping {sleep_for:.1f}s"
-                )
-                time.sleep(sleep_for)
-                continue
-
-            resp.raise_for_status()
-
-        if (
-            idx + 1 < len(candidates)
-            and last_exc is not None
-            and is_name_resolution_error(last_exc)
-        ):
-            next_candidate = candidates[idx + 1]
-            log(f"[retry] switching host for {url} -> {next_candidate}")
-            continue
-        break
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("polite_get retry loop exhausted without response")
-
-
-def parse_collection_products() -> List[Dict[str, Any]]:
-    all_products: List[Dict[str, Any]] = []
-    seen_handles: set[str] = set()
-    page = 1
-
-    while True:
-        params = {"limit": 250, "page": page}
-        url = f"{BASE_URL}{COLLECTION_PATH}"
-        log(f"[pull] collection page {page}")
-        resp = polite_get(url, params=params)
-        payload = resp.json()
-        products = payload.get("products") or []
-
-        if not products:
-            log("[done] no products returned -> stop pagination")
-            break
-
-        new_products = [p for p in products if p.get("handle") not in seen_handles]
-        for prod in new_products:
-            seen_handles.add(prod.get("handle", ""))
-        all_products.extend(new_products)
-
-        log(
-            f"[page] {page} -> {len(new_products)} new / {len(products)} total items"
-        )
-
-        if len(new_products) == 0:
-            log("[done] all remaining handles were duplicates -> stop")
-            break
-
-        page += 1
-        time.sleep(0.5)
-
-    log(f"[summary] total unique products: {len(all_products)}")
-    return all_products
-
-
-def fetch_product_detail(handle: str) -> Dict[str, Any]:
-    url = f"{BASE_URL}/products/{handle}.json"
-    resp = polite_get(url)
-    data = resp.json()
-    product = data.get("product")
-    if not isinstance(product, dict):
-        raise ValueError(f"Unexpected product payload for handle {handle}")
-    return product
-
-
-def clean_html_text(raw_html: str) -> str:
-    if not raw_html:
+                total += float(tok)
+            except Exception:
+                pass
+    if not total:
         return ""
-    unescaped = unescape(raw_html)
-    # Remove script/style and HTML tags.
-    unescaped = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", " ", unescaped, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " ", unescaped)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    rounded = Decimal(str(total)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    if rounded == rounded.to_integral():
+        return str(int(rounded))
+    return format(rounded.normalize(), "f").rstrip("0").rstrip(".")
 
 
-def format_price(value: Any) -> str:
+def normalize_measurement(value: str) -> str:
+    parsed = parse_number_with_fraction(value)
+    if not parsed:
+        return ""
+    try:
+        numeric = float(parsed)
+    except Exception:
+        return parsed
+    if numeric > 38:
+        return f"{numeric / 2.54:.3f}".rstrip("0").rstrip(".")
+    return parsed
+
+
+def to_price(value: Any) -> str:
     if value in (None, ""):
         return ""
-    if isinstance(value, (int, float)):
-        number = float(value)
-        if number > 999:  # treat as cents
-            return f"${number / 100:.2f}"
-        return f"${number:.2f}"
-
-    text = str(value).strip()
-    if not text:
-        return ""
-    if text.startswith("$"):
-        return text
-
-    cleaned = text.replace(",", "")
     try:
-        number = float(cleaned)
+        num = float(str(value).replace(",", "").strip())
     except Exception:
-        return text
+        return ""
+    if abs(num - int(num)) < 1e-9:
+        return f"${int(num):,}"
+    return f"${num:,.2f}"
 
-    if number > 999:  # treat as cents
-        return f"${number / 100:.2f}"
-    return f"${number:.2f}"
 
-
-def parse_published_at(iso_string: Optional[str]) -> str:
-    if not iso_string:
+def format_date(value: Optional[str]) -> str:
+    if not value:
         return ""
     try:
-        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
-        return dt.strftime("%m/%d/%y")
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return f"{dt.month}/{dt.day}/{dt.year}"
     except Exception:
-        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", iso_string)
-        if match:
-            y, m, d = match.groups()
-            return f"{m}/{d}/{y[-2:]}"
         return ""
 
 
-def style_name_from_title(title: str) -> str:
-    if not title:
+def strip_gid(value: str, prefix: str) -> str:
+    if not value:
         return ""
-    return title.split(" |")[0].strip()
+    return value.replace(prefix, "") if value.startswith(prefix) else value.split("/")[-1]
 
 
-def normalize_quantity_price_breaks(raw_value: Any) -> str:
-    if raw_value in (None, ""):
-        return ""
-    if isinstance(raw_value, (list, dict)):
+def request_with_rotation(path_or_url: str, *, method: str = "GET", headers: Optional[dict] = None, payload: Optional[dict] = None, params: Optional[dict] = None, timeout: int = 45) -> requests.Response:
+    urls: List[str] = []
+    if path_or_url.startswith("http"):
+        urls = [path_or_url]
+    else:
+        urls = [f"{host.rstrip('/')}/{path_or_url.lstrip('/')}" for host in HOST_ROTATION]
+    last: Optional[Exception] = None
+    for url in urls:
         try:
-            return json.dumps(raw_value, ensure_ascii=False)
-        except Exception:
-            return str(raw_value)
-    return str(raw_value)
+            if method == "POST":
+                resp = SESSION.post(url, headers=headers, json=payload, params=params, timeout=timeout)
+            else:
+                resp = SESSION.get(url, headers=headers, params=params, timeout=timeout)
+            if resp.status_code in {404, 410}:
+                continue
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            logging.warning("Request failed %s: %s", url, exc)
+            time.sleep(0.4)
+    raise RuntimeError(f"Failed request: {path_or_url} ({last})")
 
 
-def get_variant_image_url(
-    variant: Dict[str, Any],
-    product_images: List[Dict[str, Any]],
-) -> str:
-    featured = variant.get("featured_image")
-    if isinstance(featured, dict) and featured.get("src"):
-        return featured["src"]
+def fetch_collection_handles_json(collection: str) -> List[str]:
+    out: List[str] = []
+    page = 1
+    while True:
+        products: List[dict] = []
+        for path in (f"/collections/{collection}.json", f"/collections/{collection}/products.json"):
+            try:
+                resp = request_with_rotation(path, params={"limit": 250, "page": page})
+                products = (resp.json() or {}).get("products") or []
+                break
+            except Exception:
+                continue
+        if not products:
+            break
+        out.extend([str(p.get("handle") or "") for p in products if p.get("handle")])
+        page += 1
+    return out
 
-    image_id = variant.get("image_id")
-    if image_id and isinstance(product_images, list):
-        for img in product_images:
-            if str(img.get("id")) == str(image_id) and img.get("src"):
-                return img["src"]
 
-    if product_images:
-        primary = product_images[0]
-        if primary.get("src"):
-            return primary["src"]
+def fetch_collection_products_graphql(collection: str) -> List[dict]:
+    headers = {"X-Shopify-Storefront-Access-Token": graphql_token(), "Content-Type": "application/json"}
+    cursor: Optional[str] = None
+    out: List[dict] = []
+    while True:
+        data = request_with_rotation(
+            GRAPHQL_ENDPOINT, method="POST", headers=headers,
+            payload={"query": GRAPHQL_COLLECTION_QUERY, "variables": {"handle": collection, "cursor": cursor}},
+        ).json()
+        if data.get("errors"):
+            raise RuntimeError(data["errors"])
+        node = (((data.get("data") or {}).get("collection") or {}).get("products") or {})
+        batch = node.get("nodes") or []
+        out.extend(batch)
+        info = node.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            break
+        cursor = info.get("endCursor")
+        if not cursor:
+            break
+    return out
+
+
+def fetch_product_by_handle(handle: str) -> Optional[dict]:
+    headers = {"X-Shopify-Storefront-Access-Token": graphql_token(), "Content-Type": "application/json"}
+    data = request_with_rotation(
+        GRAPHQL_ENDPOINT, method="POST", headers=headers,
+        payload={"query": GRAPHQL_PRODUCT_QUERY, "variables": {"handle": handle}},
+    ).json()
+    return ((data.get("data") or {}).get("product") or None)
+
+
+def option_value(variant: dict, keys: Sequence[str]) -> str:
+    for opt in variant.get("selectedOptions") or []:
+        name = normalize_text(str(opt.get("name") or ""))
+        if name in {normalize_text(k) for k in keys}:
+            return str(opt.get("value") or "")
     return ""
 
 
-def collect_rows() -> tuple[List[Dict[str, Any]], List[str]]:
-    rows: List[Dict[str, Any]] = []
-    failures: List[str] = []
-    products = parse_collection_products()
-
-    for idx, product in enumerate(products, start=1):
-        handle = product.get("handle", "")
-        log(f"[detail] {idx}/{len(products)} handle={handle}")
-        try:
-            detail = fetch_product_detail(handle)
-        except Exception as exc:
-            log(f"[error] failed to fetch detail for {handle}: {exc!r}")
-            if handle:
-                failures.append(handle)
-            continue
-
-        variant_detail_map = {
-            str(variant.get("id")): variant for variant in detail.get("variants", [])
-        }
-        images = detail.get("images") or []
-
-        # Pre-compute style total quantity
-        style_quantity_total = 0
-        for v in variant_detail_map.values():
-            qty = v.get("inventory_quantity")
-            if isinstance(qty, (int, float)):
-                style_quantity_total += int(qty)
-
-        published_at = parse_published_at(product.get("published_at"))
-        description = clean_html_text(product.get("body_html", ""))
-        tags = product.get("tags")
-        if isinstance(tags, list):
-            tags_str = ", ".join(tags)
+def parse_pdp_details(handle: str) -> Dict[str, Any]:
+    resp = request_with_rotation(f"/products/{handle}")
+    html = resp.text
+    soup = BeautifulSoup(html, "lxml")
+    if not soup.find():
+        soup = BeautifulSoup(html, "html.parser")
+    blocks = soup.select("[id^='Details-Content-content_block_'] > div")
+    parts: List[str] = []
+    for block in blocks:
+        lis = block.find_all("li")
+        if lis:
+            parts.extend([li.get_text(" ", strip=True) for li in lis if li.get_text(" ", strip=True)])
         else:
-            tags_str = str(tags or "")
-
-        for variant in product.get("variants", []):
-            vid = str(variant.get("id"))
-            detail_variant = variant_detail_map.get(vid, {})
-
-            row = {
-                "Style Id": product.get("id", ""),
-                "Handle": handle,
-                "Published At": published_at,
-                "Product": product.get("title", ""),
-                "Style Name": style_name_from_title(product.get("title", "")),
-                "Product Type": product.get("product_type", ""),
-                "Tags": tags_str,
-                "Vendor": product.get("vendor", ""),
-                "Description": description,
-                "Variant Title": variant.get("title", ""),
-                "Color": variant.get("option1", ""),
-                "Size": variant.get("option2", ""),
-                "Inseam": variant.get("option3", ""),
-                "Price": format_price(variant.get("price")),
-                "Compare at Price": format_price(variant.get("compare_at_price")),
-                "Available for Sale": "TRUE" if variant.get("available") else "FALSE",
-                "Quantity Price Breaks": normalize_quantity_price_breaks(
-                    detail_variant.get("quantity_price_breaks")
-                ),
-                "Quantity Available": detail_variant.get("inventory_quantity", ""),
-                "Old Quantity Available": detail_variant.get("old_inventory_quantity", ""),
-                "Quantity of style": style_quantity_total,
-                "SKU - Shopify": vid,
-                "SKU - Brand": variant.get("sku", ""),
-                "Barcode": detail_variant.get("barcode", ""),
-                "Image URL": get_variant_image_url(detail_variant, images),
-                "SKU URL": f"{BASE_URL}/products/{handle}",
-            }
-
-            rows.append(row)
-
-    return rows, failures
+            txt = block.get_text(" ", strip=True)
+            if txt:
+                parts.append(txt)
+    txt = " ".join(parts)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    kiwi_fields = extract_kiwi_fields(html)
+    rise_map: Dict[str, str] = {}
+    inseam_map: Dict[str, str] = {}
+    if kiwi_fields:
+        rise_map, inseam_map = fetch_kiwi_measurements(kiwi_fields, handle)
+    return {"details_text": txt, "rise_map": rise_map, "inseam_map": inseam_map}
 
 
-def extract_variant_numeric_id(graphql_id: Optional[str]) -> str:
-    if not graphql_id:
-        return ""
-    if "/" in graphql_id:
-        return graphql_id.rstrip("/").split("/")[-1]
-    return graphql_id
+def extract_kiwi_fields(html: str) -> Optional[Dict[str, str]]:
+    block = re.search(r"KiwiSizing\.data\s*=\s*\{(.*?)\};\s*</script>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not block:
+        return None
+    section = block.group(1)
+    out: Dict[str, str] = {}
+    for key in ("collections", "tags", "product", "vendor", "type", "title"):
+        match = re.search(rf"{key}:\s*\"(.*?)\"", section, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            out[key] = match.group(1).replace("\\/", "/")
+    if not out.get("product"):
+        return None
+    out["shop"] = "staud-clothing.myshopify.com"
+    return out
 
 
-def perform_graphql_fallback() -> List[Dict[str, Any]]:
-    token = _get_env_token()
-    if not token:
-        raise RuntimeError(
-            "GraphQL fallback requested but no Shopify token was found in environment"
-        )
-
-    session = get_session()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Shopify-Storefront-Access-Token": token,
-    }
-    query = """
-    query StaudInventory($first: Int!) {
-      productVariants(first: $first, query: \"available_for_sale:true\") {
-        edges {
-          node {
-            id
-            sku
-            quantityAvailable
-          }
-        }
-        pageInfo {
-          hasNextPage
-        }
-      }
-    }
-    """
-    payload = {"query": query, "variables": {"first": 250}}
-
-    log("[graphql] triggering fallback inventory query")
+def fetch_kiwi_measurements(kiwi_fields: Dict[str, str], handle: str) -> tuple[Dict[str, str], Dict[str, str]]:
     try:
-        response = session.post(
-            GRAPHQL_ENDPOINT,
-            headers=headers,
-            json=payload,
+        resp = SESSION.get(
+            "https://app.kiwisizing.com/kiwiSizing/api/getSizingChart",
+            params={**kiwi_fields, "url": f"https://staud.clothing/products/{handle}"},
             timeout=45,
         )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"GraphQL fallback request failed: {exc!r}") from exc
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Kiwi sizing request failed for %s: %s", handle, exc)
+        return {}, {}
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"GraphQL fallback returned HTTP {response.status_code}: {response.text}"
-        )
+    first_word = normalize_text(handle).split()[0] if normalize_text(handle) else ""
+    rise_by_size: Dict[str, str] = {}
+    inseam_by_size: Dict[str, str] = {}
+    for sizing in payload.get("sizings") or []:
+        for table in (sizing.get("tables") or {}).values():
+            rows = table.get("data") or []
+            size_cols = find_size_row(rows, first_word)
+            if not size_cols:
+                continue
+            rise_vals = find_measurement_row(rows, "RISE")
+            inseam_vals = find_measurement_row(rows, "INSEAM")
+            if rise_vals:
+                for size, raw in zip(size_cols, rise_vals):
+                    value = normalize_measurement(raw)
+                    n_size = normalize_size_token(size)
+                    if n_size and value and n_size not in rise_by_size:
+                        rise_by_size[n_size] = value
+            if inseam_vals:
+                for size, raw in zip(size_cols, inseam_vals):
+                    value = normalize_measurement(raw)
+                    n_size = normalize_size_token(size)
+                    if n_size and value and n_size not in inseam_by_size:
+                        inseam_by_size[n_size] = value
+    return rise_by_size, inseam_by_size
 
+
+def find_size_row(rows: Sequence[Any], first_word: str) -> List[str]:
+    for row in rows:
+        values = [str((cell or {}).get("value") or "").strip() for cell in row]
+        if not values:
+            continue
+        header = normalize_text(values[0])
+        data = [v.strip() for v in values[1:] if str(v).strip()]
+        if not data:
+            continue
+        numeric_like = sum(1 for v in data if re.fullmatch(r"\d{1,2}", v))
+        if not first_word or header.split()[:1] == [first_word]:
+            if numeric_like >= max(4, len(data) // 2):
+                return data
+    for row in rows:
+        values = [str((cell or {}).get("value") or "").strip() for cell in row]
+        data = [v.strip() for v in values[1:] if str(v).strip()]
+        if data and sum(1 for v in data if re.fullmatch(r"\d{1,2}", v)) >= max(4, len(data) // 2):
+            return data
+    return []
+
+
+def find_measurement_row(rows: Sequence[Any], label: str) -> List[str]:
+    for row in rows:
+        values = [str((cell or {}).get("value") or "").strip() for cell in row]
+        if not values:
+            continue
+        header = normalize_text(values[0])
+        if header == normalize_text(label):
+            return [v.strip() for v in values[1:]]
+    return []
+
+
+def normalize_size_token(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"\d+\.0+", raw):
+        return raw.split(".", 1)[0]
+    return raw
+
+
+def is_filtered(handle: str, title: str, product_type: str) -> bool:
+    h = normalize_text(handle)
+    if "wally" in h and "boot" in h:
+        return True
+    if any(normalize_text(x) in h for x in FILTER_HANDLE_SUBSTRINGS):
+        return True
+    t = normalize_text(title)
+    if any(word in t.split() for word in FILTER_TITLE_WORDS):
+        return True
+    pt = normalize_text(product_type)
+    if pt != ALLOWED_PRODUCT_TYPE:
+        return True
+    if any(bad in pt for bad in FILTER_PRODUCT_TYPE_WORDS):
+        return True
+    return False
+
+
+def style_name(title: str) -> str:
+    s = (title or "").split("|")[0]
+    for term in sorted(STYLE_REMOVE_TERMS, key=len, reverse=True):
+        s = re.sub(r"\b" + re.escape(term).replace(r"\ ", r"\s+") + r"\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
+
+
+def parse_inseam(desc: str, option3: str) -> str:
+    if option3:
+        num = parse_number_with_fraction(option3)
+        if num:
+            v = float(num)
+            if v > 38:
+                return f"{v / 2.54:.3f}".rstrip("0").rstrip(".")
+            return num
+    opt_match = re.search(r"inseam\s*options?\s*[:\-]?", desc, flags=re.IGNORECASE)
+    if opt_match:
+        snippet = desc[opt_match.end(): opt_match.end() + 120]
+        stop = re.search(r"(?:\bfit\b|\bmodel\b|\bcontact\b|\bcare\b|\bfabrication\b|\brise\b|[.;])", snippet, flags=re.IGNORECASE)
+        if stop:
+            snippet = snippet[:stop.start()]
+        tokens = re.findall(r"\d+(?:\.\d+)?(?:\s+\d+/\d+|/[0-9]+|\s*[¼½¾])?", snippet)
+        values = [normalize_measurement(tok) for tok in tokens if normalize_measurement(tok)]
+        numeric_values: List[float] = []
+        for v in values:
+            try:
+                numeric_values.append(float(v))
+            except Exception:
+                pass
+        if numeric_values:
+            return str(int(min(numeric_values))) if min(numeric_values).is_integer() else str(min(numeric_values))
+
+    patterns = [
+        r"(?:inseam options|inseam|inleg length|inleg)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?(?:\s+[0-9]+/[0-9]+|/[0-9]+|\s*[¼½¾])?)\s*\"?",
+        r"([0-9]+(?:\.[0-9]+)?)\s*cm\s*/\s*([0-9]+(?:\.[0-9]+)?(?:\s+[0-9]+/[0-9]+|/[0-9]+|\s*[¼½¾])?)\s*\"",
+    ]
+    for pat in patterns:
+        m = re.search(pat, desc, flags=re.IGNORECASE)
+        if m:
+            if len(m.groups()) > 1:
+                return parse_number_with_fraction(m.group(2))
+            return parse_number_with_fraction(m.group(1))
+    return ""
+
+
+def parse_rise(desc: str) -> str:
+    m = re.search(r"rise\s*[:\-]?\s*(?:mid|low|high|ultra high|ultra low)?\s*[,\-(]?\s*([0-9]+(?:\.[0-9]+)?(?:\s+[0-9]+/[0-9]+|/[0-9]+|\s*[¼½¾])?)", desc, flags=re.IGNORECASE)
+    return parse_number_with_fraction(m.group(1)) if m else ""
+
+
+def determine_rise_label(title: str, handle: str, desc: str, tags: str) -> str:
+    if contains_any(title, ["super low rise", "ultra low rise", "super low waist", "ultra low waist"]): return "Ultra Low"
+    if contains_any(title, ["super high rise", "ultra high rise", "super high waist", "ultra high waist"]): return "Ultra High"
+    if contains_any(title, ["mid rise"]): return "Mid"
+    if contains_any(title, ["low rise"]): return "Low"
+    if contains_any(title, ["high rise"]): return "High"
+    if contains_any(handle, ["slr", "ulr", "slw", "ulw", "superlowrise", "ultralowrise"]): return "Ultra Low"
+    if contains_any(handle, ["shr", "uhr", "shw", "uhw", "superhighrise", "ultrahighrise"]): return "Ultra High"
+    if contains_any(handle, ["-mr-", "-mw-", "mid rise", "mid waist"]): return "Mid"
+    if contains_any(handle, ["-lr-", "-lw-", "low rise", "low waist"]): return "Low"
+    if contains_any(handle, ["-hr-", "-hw-", "high rise", "high waist"]): return "High"
+    if contains_any(desc, ["rise: super low", "rise: ultra low", "super low rise", "ultra low rise"]): return "Ultra Low"
+    if contains_any(desc, ["rise: super high", "rise: ultra high", "super high rise", "ultra high rise"]): return "Ultra High"
+    if contains_any(desc, ["rise: mid", "mid rise"]): return "Mid"
+    if contains_any(desc, ["rise: low", "low rise", "low on the hip", "low on the waist"]): return "Low"
+    if contains_any(desc, ["rise: high", "high rise", "high waist", "elevated waistline"]): return "High"
+    if contains_any(tags, ["filter_rise_mid"]): return "Mid"
+    if contains_any(tags, ["filter_rise_low"]): return "Low"
+    if contains_any(tags, ["filter_rise_high"]): return "High"
+    t = normalize_text(tags)
+    if "mid" in t and "low" not in t and "high" not in t: return "Mid"
+    if "low" in t and "mid" not in t and "high" not in t: return "Low"
+    if "high" in t and "mid" not in t and "low" not in t: return "High"
+    return ""
+
+
+def determine_jean_style(title: str, desc: str, tags: str) -> str:
+    if contains_any(title, ["barrel", "bowed", "bow leg", "stovepipe", "stove pipe", "horseshoe"]): return "Barrel"
+    if contains_any(title, ["tapered", "mom"]): return "Tapered"
+    if contains_any(title, ["baggy"]): return "Baggy"
+    if contains_any(title, ["flare"]): return "Flare"
+    if contains_any(title, ["bootcut", "boot"]): return "Bootcut"
+    if contains_any(title, ["skinny"]): return "Skinny"
+    if contains_any(title, ["wide leg"]): return "Wide Leg"
+    if contains_any(title, ["cigarette"]): return "Straight from Knee"
+    if contains_any(title, ["straight"]) and contains_any(desc, ["classic straight-leg", "slim straight", "classic straight fit", "cigarette"]): return "Straight from Knee"
+    if contains_any(title, ["straight"]) and contains_any(desc, ["relaxed straight-leg", "loose", "relaxed straight"]): return "Straight from Thigh"
+    if contains_any(desc, ["barrel", "bowed", "bow leg", "stovepipe", "stove pipe", "horseshoe"]): return "Barrel"
+    if contains_any(desc, ["skinny"]): return "Skinny"
+    if contains_any(desc, ["flare"]): return "Flare"
+    if contains_any(desc, ["bootcut"]): return "Bootcut"
+    if contains_any(desc, ["taper"]): return "Tapered"
+    if contains_any(desc, ["wide leg", "palazzo"]): return "Wide Leg"
+    if contains_any(desc, ["classic straight-leg", "slim straight", "classic straight fit", "cigarette"]): return "Straight from Knee"
+    if contains_any(desc, ["relaxed fit with a 90s inspired"]): return "Straight from Thigh"
+    if contains_any(desc, ["baggy", "relaxed jean", "relaxed fit", "loose fit"]): return "Baggy"
+    if contains_any(tags, ["filter_style_barrel", "barrel", "bowed", "bow leg", "stovepipe", "stove pipe", "horseshoe"]): return "Barrel"
+    if contains_any(tags, ["filter_style_skinny", "filter_style_superskinny", "skinny"]): return "Skinny"
+    if contains_any(tags, ["filter_style_flare", "flare"]): return "Flare"
+    if contains_any(tags, ["filter_style_boot", "bootcut", "boot"]): return "Bootcut"
+    if contains_any(tags, ["taper"]): return "Tapered"
+    if contains_any(tags, ["filter_style_wide", "wide leg", "wide", "palazzo"]): return "Wide Leg"
+    if contains_any(tags, ["filter_style_cigarette", "cigarette"]): return "Straight from Knee"
+    if contains_any(tags, ["straight"]) and contains_any(tags, ["baggy", "relaxed", "loose"]): return "Straight from Thigh"
+    if contains_any(tags, ["baggy", "loose", "relaxed"]): return "Baggy"
+    return ""
+
+
+def determine_inseam_style(title: str, handle: str, desc: str, tags: str, jean_style: str, inseam: str) -> str:
+    if jean_style in {"Skinny", "Tapered"} and contains_any(title, ["ankle"]): return "Full Length"
+    if contains_any(title, ["ankle"]): return "Ankle"
+    if contains_any(title, ["crop"]): return "Cropped"
+    if jean_style in {"Skinny", "Tapered"} and contains_any(handle, ["ankle"]): return "Full Length"
+    if contains_any(handle, ["ankle"]): return "Ankle"
+    if contains_any(handle, ["crop"]): return "Cropped"
+    if contains_any(handle, ["full length"]): return "Full Length"
+    if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and contains_any(desc, ["ankle-grazing", "ankle grazing length", "cropped at the ankle", "drape around the ankle", "hit at the ankle bone", "ankle length", "ankle jean", "tapers to a slim ankle"]): return "Full Length"
+    if contains_any(desc, ["ankle-grazing", "ankle grazing length", "cropped at the ankle", "drape around the ankle", "hit at the ankle bone", "ankle length", "ankle jean"]): return "Ankle"
+    if contains_any(desc, ["stack stylishly above the ankle", "stack at the ankle", "full length", "full-length", "full length at the ankles", "extended inseam", "stack at the hem", "pooling over"]): return "Full Length"
+    if contains_any(desc, ["crop length", "crop-length", "cropped"]): return "Cropped"
     try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError("GraphQL fallback returned non-JSON payload") from exc
-
-    if data.get("errors"):
-        raise RuntimeError(f"GraphQL fallback responded with errors: {data['errors']}")
-
-    product_variants = data.get("data", {}).get("productVariants", {})
-    edges = product_variants.get("edges", []) if isinstance(product_variants, dict) else []
-    page_info = (
-        product_variants.get("pageInfo", {})
-        if isinstance(product_variants, dict)
-        else {}
-    )
-
-    if page_info.get("hasNextPage"):
-        log(
-            "[graphql] warning: fallback response indicates additional pages; only first page was requested"
-        )
-
-    rows: List[Dict[str, Any]] = []
-    for edge in edges:
-        node = edge.get("node", {}) if isinstance(edge, dict) else {}
-        variant_id = extract_variant_numeric_id(node.get("id"))
-        quantity = node.get("quantityAvailable")
-        row = {header: "" for header in CSV_HEADERS}
-        row["SKU - Shopify"] = variant_id
-        if quantity is not None:
-            row["Quantity Available"] = quantity
-        rows.append(row)
-
-    log(f"[graphql] fallback generated {len(rows)} rows")
-    return rows
+        inseam_num = float(inseam) if inseam else None
+    except Exception:
+        inseam_num = None
+    n = normalize_text(tags)
+    if ("full" in n and "ankle" in n) or ("full" in n and "crop" in n and inseam_num and inseam_num >= 30): return "Full Length"
+    if "ankle" in n and jean_style in {"Skinny", "Tapered", "Straight from Knee"}: return "Full Length"
+    if "full" in n and "ankle" not in n and "crop" not in n: return "Full Length"
+    if "ankle" in n and "full" not in n and "crop" not in n: return "Ankle"
+    if "crop" in n and "full" not in n and "ankle" not in n: return "Cropped"
+    return ""
 
 
-def write_csv(rows: List[Dict[str, Any]], *, backup: bool = False) -> str:
-    if not rows:
-        raise ValueError("No data rows available to write")
+def determine_color_standardized(tags: str, color: str) -> str:
+    t = normalize_text(f"{tags} {color}")
+    if "animal print" in t or "leopard" in t or "snake" in t: return "Animal Print"
+    if "colorgroup blue" in t or "filter color blue" in t or "blue" in t: return "Blue"
+    if "colorgroup black" in t or "filter color black" in t or "black" in t: return "Black"
+    if "white" in t or "ecru" in t: return "White"
+    if "grey" in t or "gray" in t: return "Grey"
+    if "green" in t: return "Green"
+    if "brown" in t or "tan" in t or "beige" in t or "khaki" in t: return "Tan"
+    if "red" in t or "wine" in t or "burgundy" in t: return "Red"
+    if "pink" in t: return "Pink"
+    if "purple" in t: return "Purple"
+    if "yellow" in t: return "Yellow"
+    return ""
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    prefix = "STAUD_backup_" if backup else "STAUD_"
-    filename = f"{prefix}{timestamp}.csv"
-    path = os.path.join(OUTPUT_DIR, filename)
 
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_HEADERS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-    log(f"[csv] wrote {len(rows)} rows to {path}")
-    return path
+def determine_stretch(desc: str) -> str:
+    if contains_any(desc, ["rigid"]): return "Rigid"
+    if contains_any(desc, ["super stretch"]): return "High Stretch"
+    if contains_any(desc, ["hint of stretch"]): return "Low Stretch"
+    if contains_any(desc, ["stretch", "some stretch"]): return "Medium Stretch"
+    return ""
 
 
 def main() -> None:
-    start = time.time()
-    try:
-        rows, failures = collect_rows()
-        fallback_needed = not rows or bool(failures)
+    configure_logging()
+    products_by_handle: Dict[str, dict] = {}
+    json_handles: set[str] = set()
+    for c in COLLECTION_HANDLES:
+        for p in fetch_collection_products_graphql(c):
+            h = str(p.get("handle") or "")
+            if h:
+                products_by_handle[h] = p
+        json_handles.update(fetch_collection_handles_json(c))
 
-        if fallback_needed:
-            if failures:
-                log(
-                    f"[warn] Primary scrape skipped {len(failures)} handles -> initiating GraphQL fallback"
-                )
-            else:
-                log("[warn] Primary scrape produced no rows -> initiating GraphQL fallback")
+    missing = sorted(h for h in json_handles if h and h not in products_by_handle)
+    for h in missing:
+        p = fetch_product_by_handle(h)
+        if p:
+            products_by_handle[h] = p
 
-            fallback_rows = perform_graphql_fallback()
-            if not fallback_rows:
-                raise RuntimeError(
-                    "GraphQL fallback returned no data; aborting without CSV output"
-                )
-            csv_path = write_csv(fallback_rows, backup=True)
-        else:
-            csv_path = write_csv(rows)
-        elapsed = time.time() - start
-        log(f"[done] Completed in {elapsed:.1f}s -> {csv_path}")
-    except Exception as exc:
-        log(f"[fatal] {exc!r}")
-        raise
+    rows: List[Dict[str, Any]] = []
+    for handle, product in products_by_handle.items():
+        title = str(product.get("title") or "")
+        ptype = str(product.get("productType") or "")
+        if is_filtered(handle, title, ptype):
+            continue
+
+        graph_desc = str(product.get("description") or "")
+        pdp = parse_pdp_details(handle)
+        details_text = pdp.get("details_text") or ""
+        rise_by_size = pdp.get("rise_map") or {}
+        inseam_by_size = pdp.get("inseam_map") or {}
+        inseam_defaults = {v for v in inseam_by_size.values() if v}
+        inseam_default = next(iter(inseam_defaults)) if len(inseam_defaults) == 1 else ""
+        inseam_mode = ""
+        if inseam_by_size:
+            counts = Counter(v for v in inseam_by_size.values() if v)
+            if counts:
+                mode_value, mode_count = counts.most_common(1)[0]
+                if mode_count / max(1, sum(counts.values())) >= 0.7:
+                    inseam_mode = mode_value
+        description = " ".join([x for x in [graph_desc, details_text] if x]).strip()
+        tags = ", ".join(product.get("tags") or [])
+        style = style_name(title)
+        rise = parse_rise(description)
+        for variant in ((product.get("variants") or {}).get("nodes") or []):
+            option1 = option_value(variant, ["color", "option1"]) or ""
+            option2 = option_value(variant, ["size", "option2"]) or ""
+            option3 = option_value(variant, ["inseam", "length", "option3"]) or ""
+            option2_key = normalize_size_token(option2)
+            inseam = parse_inseam(description, option3)
+            if option2_key in inseam_by_size:
+                inseam = inseam_by_size[option2_key]
+            elif inseam_default:
+                inseam = inseam_default
+            if inseam_mode:
+                inseam = inseam_mode
+            jean_style = determine_jean_style(title, description, tags)
+            inseam_style = determine_inseam_style(title, handle, description, tags, jean_style, inseam)
+            rise_label = determine_rise_label(title, handle, description, tags)
+            sku_brand = str(variant.get("sku") or "")
+            rise_for_row = rise_by_size.get(option2_key, rise)
+            row = {
+                "Style Id": strip_gid(str(product.get("id") or ""), "gid://shopify/Product/"),
+                "Handle": handle,
+                "Published At": format_date(product.get("publishedAt")),
+                "Created At": format_date(product.get("createdAt")),
+                "Product": title.upper(),
+                "Style Name": style,
+                "Product Type": ptype.title() if ptype else "",
+                "Tags": tags,
+                "Vendor": product.get("vendor") or "",
+                "Description": description,
+                "Variant Title": f"{title.split('|')[0].strip().upper()} / {str(variant.get('title') or '').replace(' / ', ' / ')}".strip(" /"),
+                "Color": option1,
+                "Size": option2,
+                "Rise": rise_for_row,
+                "Inseam": inseam,
+                "Price": to_price((variant.get("price") or {}).get("amount")),
+                "Compare at Price": to_price((variant.get("compareAtPrice") or {}).get("amount")),
+                "Available for Sale": str(bool(variant.get("availableForSale"))).upper(),
+                "Quantity Available": variant.get("quantityAvailable") if variant.get("quantityAvailable") is not None else "",
+                "Quantity of style": product.get("totalInventory") if product.get("totalInventory") is not None else "",
+                "SKU - Shopify": strip_gid(str(variant.get("id") or ""), "gid://shopify/ProductVariant/"),
+                "SKU - Brand": sku_brand,
+                "Barcode": variant.get("barcode") or "",
+                "Image URL": ((product.get("featuredImage") or {}).get("url") or ""),
+                "SKU URL": product.get("onlineStoreUrl") or f"https://staud.clothing/products/{handle}",
+                "Jean Style": jean_style,
+                "Inseam Style": inseam_style,
+                "Rise Label": rise_label,
+                "Color - Standardized": determine_color_standardized(tags, option1),
+                "Stretch": determine_stretch(description),
+            }
+            rows.append(row)
+
+    # style-level infer for missing rise/inseam style
+    by_style: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_style[r["Style Name"]].append(r)
+    for r in rows:
+        if not r["Inseam Style"]:
+            peers = [x for x in by_style[r["Style Name"]] if x["Inseam Style"] and x["Inseam"] == r["Inseam"]]
+            if peers and len({x["Inseam Style"] for x in peers}) == 1:
+                r["Inseam Style"] = peers[0]["Inseam Style"]
+        if not r["Rise Label"]:
+            peers = [x for x in by_style[r["Style Name"]] if x["Rise Label"] and x["Rise"] == r["Rise"]]
+            if peers and len({x["Rise Label"] for x in peers}) == 1:
+                r["Rise Label"] = peers[0]["Rise Label"]
+
+    # fill remaining gaps for required downstream columns
+    by_style_size_rise: Dict[tuple[str, str], str] = {}
+    for r in rows:
+        key = (r["Style Name"], r["Size"])
+        if r["Rise"] and key not in by_style_size_rise:
+            by_style_size_rise[key] = r["Rise"]
+    for r in rows:
+        if not r["Rise"]:
+            r["Rise"] = by_style_size_rise.get((r["Style Name"], r["Size"]), "")
+        if not r["Inseam Style"]:
+            try:
+                inseam_num = float(r["Inseam"]) if r["Inseam"] else None
+            except Exception:
+                inseam_num = None
+            if inseam_num is not None:
+                if inseam_num >= 30:
+                    r["Inseam Style"] = "Full Length"
+                elif inseam_num <= 28:
+                    r["Inseam Style"] = "Cropped"
+                else:
+                    r["Inseam Style"] = "Ankle"
+        if not r["Compare at Price"]:
+            r["Compare at Price"] = r["Price"]
+
+    # dedupe
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for r in rows:
+        key = (r["Handle"], r["SKU - Shopify"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out = OUTPUT_DIR / f"{BRAND}_{ts}.csv"
+    with out.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writeheader()
+        writer.writerows(deduped)
+    logging.info("Rows written: %s", len(deduped))
+    logging.info("CSV written: %s", out)
 
 
 if __name__ == "__main__":
