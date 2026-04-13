@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup, FeatureNotFound, Tag
+from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -45,9 +45,6 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
 
 PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
 PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
-CLICK_TARGET_TEXTS: List[str] = ["DETAILS"]
-BROWSER_RENDER_ENABLED = True
-BROWSER_RENDER_TIMEOUT_MS = 45000
 
 CSV_HEADERS = [
     "Style Id",
@@ -403,44 +400,28 @@ def normalize_text(tag: Tag) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def selector_with_dynamic_id_fallbacks(selector: str) -> List[str]:
-    candidates = [selector]
-    normalized_headless = re.sub(
-        r"#headlessui-disclosure-panel-[A-Za-z0-9_-]+",
-        "[id^='headlessui-disclosure-panel-']",
-        selector,
-    )
-    if normalized_headless not in candidates:
-        candidates.append(normalized_headless)
-    return candidates
-
-
-def build_soup_candidates(html_text: str) -> List[BeautifulSoup]:
-    soups: List[BeautifulSoup] = []
-    for parser in ("lxml", "html.parser"):
-        try:
-            soup = BeautifulSoup(html_text, parser)
-        except FeatureNotFound:
-            continue
-        soups.append(soup)
-    if not soups:
-        soups.append(BeautifulSoup(html_text, "html.parser"))
-    return soups
+def strip_html_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    return normalize_text(BeautifulSoup(raw_html, "html.parser"))
 
 
 def extract_pdp_description(html_text: str) -> str:
-    for soup in build_soup_candidates(html_text):
-        for selector in selector_with_dynamic_id_fallbacks(PDP_SELECTOR):
-            matches = [node for node in soup.select(selector) if isinstance(node, Tag)]
-            values = [normalize_text(node) for node in matches if normalize_text(node)]
-            if values:
-                return ", ".join(values)
+    soup = BeautifulSoup(html_text, "html.parser")
+    matches = [node for node in soup.select(PDP_SELECTOR) if isinstance(node, Tag)]
+    values = [normalize_text(node) for node in matches if normalize_text(node)]
+    if values:
+        return ", ".join(values)
 
-        parent = soup.select_one(PDP_PARENT_SELECTOR)
-        if parent is not None:
-            values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
-            if values:
-                return ", ".join(values)
+    parent = soup.select_one(PDP_PARENT_SELECTOR)
+    if parent is not None:
+        values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
+        if values:
+            return ", ".join(values)
+
+    text = normalize_text(soup)
+    if any(token in text.lower() for token in ("front rise", "inseam", "leg opening", "stretch")):
+        return text
 
     return ""
 
@@ -489,99 +470,6 @@ def extract_label_text(text: str, labels: Sequence[str]) -> str:
         if match:
             return match.group(1).strip()
     return ""
-
-
-def render_page_html_with_clicks(url: str) -> Optional[str]:
-    try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        log(f"Playwright unavailable, skipping browser-render pass: {exc}")
-        return None
-
-    def dismiss_known_overlays(page) -> None:
-        for selector in (
-            "#attentive_overlay",
-            "iframe#attentive_creative",
-            "[id*='attentive_overlay']",
-            "[data-testid*='attentive']",
-        ):
-            try:
-                page.evaluate(
-                    """(sel) => {
-                      document.querySelectorAll(sel).forEach((el) => {
-                        try { el.remove(); } catch (e) {}
-                        if (el.style) {
-                          el.style.display = 'none';
-                          el.style.visibility = 'hidden';
-                          el.style.pointerEvents = 'none';
-                        }
-                      });
-                    }""",
-                    selector,
-                )
-            except Exception:
-                continue
-
-    def click_with_fallback(locator) -> bool:
-        try:
-            locator.click(timeout=5000)
-            return True
-        except Exception:
-            pass
-        try:
-            locator.click(timeout=5000, force=True)
-            return True
-        except Exception:
-            pass
-        try:
-            handle = locator.element_handle(timeout=5000)
-            if handle is None:
-                return False
-            locator.page.evaluate("(el) => el.click()", handle)
-            return True
-        except Exception:
-            return False
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_RENDER_TIMEOUT_MS)
-            try:
-                page.wait_for_load_state("networkidle", timeout=min(BROWSER_RENDER_TIMEOUT_MS, 15000))
-            except PlaywrightTimeoutError:
-                pass
-
-            dismiss_known_overlays(page)
-            parent_locator = page.locator(PDP_PARENT_SELECTOR)
-            for idx in range(parent_locator.count()):
-                current = parent_locator.nth(idx)
-                state = (current.get_attribute("data-headlessui-state") or "").strip().lower()
-                if state == "open":
-                    continue
-                nested_button = current.locator("button,[role='button']")
-                if nested_button.count() > 0:
-                    click_with_fallback(nested_button.first)
-
-            for label in CLICK_TARGET_TEXTS:
-                locator = page.locator(f"button:has-text('{label}')")
-                if locator.count() > 0:
-                    first = locator.first
-                    expanded = (first.get_attribute("aria-expanded") or "").strip().lower()
-                    state = (first.get_attribute("data-headlessui-state") or "").strip().lower()
-                    if expanded != "true" and state != "open":
-                        click_with_fallback(first)
-
-            page.wait_for_timeout(500)
-            html_text = page.content()
-            context.close()
-            browser.close()
-            return html_text
-    except Exception as exc:
-        log(f"Browser-render pass failed for {url}: {exc}")
-        return None
 
 
 class PaigeScraper:
@@ -780,50 +668,50 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(self, handle: str) -> Dict[str, str]:
+    def fetch_pdp_fields(self, handle: str, description_seed: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
+        source = "seed"
+        description_parts: List[str] = [description_seed] if description_seed else []
+        description = ", ".join(part for part in description_parts if part)
 
-        html_candidates: List[Tuple[str, str]] = []
-        url = urljoin(PDP_HOST, f"/products/{handle}")
-        try:
-            response = self.session.get(url, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            html_candidates.append((f"http:{PDP_HOST}", response.text))
-        except Exception as exc:
-            log(f"HTTP fetch failed for {url}: {exc}")
-        if BROWSER_RENDER_ENABLED:
-            rendered_html = render_page_html_with_clicks(url)
-            if rendered_html:
-                html_candidates.insert(0, (f"browser_click:{PDP_HOST}", rendered_html))
-
-        details_description = ""
-        source = ""
-        for candidate_source, html_text in html_candidates:
-            text = extract_pdp_description(html_text)
-            if text and len(text) > len(details_description):
-                details_description = text
-                source = candidate_source
-
-        base_description = ""
         try:
             product_json = self.session.get(
                 urljoin(PDP_HOST, f"/products/{handle}.json"),
-                timeout=30,
+                timeout=20,
                 allow_redirects=True,
             )
             if product_json.status_code == 200:
                 body_html = (product_json.json().get("product") or {}).get("body_html") or ""
-                base_description = normalize_text(BeautifulSoup(body_html, "html.parser"))
+                body_text = strip_html_text(body_html)
+                if body_text:
+                    description_parts.append(body_text)
+                    source = "product-json"
         except Exception:
             pass
 
-        description_parts = [part for part in (base_description, details_description) if part]
-        description = ", ".join(description_parts)
-
+        description = ", ".join(part for part in description_parts if part)
         rise = extract_measurement(description, ["Front Rise", "Rise"])
         inseam = extract_measurement(description, ["Inseam", "Inleg"])
         leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+
+        if not (rise and inseam and leg_opening):
+            url = urljoin(PDP_HOST, f"/products/{handle}")
+            try:
+                response = self.session.get(url, timeout=20, allow_redirects=True)
+                response.raise_for_status()
+                details_description = extract_pdp_description(response.text)
+                if details_description:
+                    description_parts.append(details_description)
+                    description = ", ".join(part for part in description_parts if part)
+                    rise = extract_measurement(description, ["Front Rise", "Rise"])
+                    inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                    leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                    source = "pdp-html"
+            except Exception:
+                pass
+
+        description = ", ".join(dict.fromkeys(part for part in description_parts if part))
 
         result = {
             "description": description,
@@ -889,14 +777,19 @@ class PaigeScraper:
                 log(f"No variants returned for style {style_id} ({handle})")
                 continue
 
-            pdp_fields = self.fetch_pdp_fields(handle)
+            style_algolia = algolia_style_map.get(handle, {})
+            seed_description = safe_string(style.get("description", "")) if use_graphql else ""
+            algolia_body_html = safe_string(style_algolia.get("body_html_safe", ""))
+            if algolia_body_html:
+                algolia_text = strip_html_text(algolia_body_html)
+                seed_description = ", ".join(part for part in (seed_description, algolia_text) if part)
+            pdp_fields = self.fetch_pdp_fields(handle, seed_description)
             style_name = derive_style_name_base(title)
             product_type = derive_product_type(tags, title)
             country = extract_tag_value(tags, "country:")
             production_cost = extract_tag_value(tags, "productionCost:")
             site_exclusive = extract_tag_value(tags, "productType:")
             product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
-            style_algolia = algolia_style_map.get(handle, {})
             fit_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("fit", "")
             length_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("length", "")
             rise_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("rise", "")
