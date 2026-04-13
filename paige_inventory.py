@@ -29,6 +29,19 @@ HOST_ROTATION = [
     "https://paige-7873.myshopify.com",
     "https://paige.com",
 ]
+PDP_HOST = "https://shop.paige.com"
+STYLE_NAME_REMOVE_PHRASES: List[str] = [
+    "Accent Hardware", "Ankle", "Belted", "Coated", "Corduroy", "Crop", "Crushed", "Crystal",
+    "Cuff", "Cuffed", "Cutoff", "Darted", "Destroyed", "Fit", "Flag", "Flap Pocket", "Flap",
+    "Flip", "Frayed Seam", "Front Yoke", "Frontier", "High Rise", "Inch", "Inset", "Jean",
+    "Krystal", "Leather", "Lightweight", "Lo", "low and loose", "Low Rise", "Mid Rise", "Panel",
+    "Pant", "Patch", "Petite", "Pintucked", "Plaid", "Plus", "Raw Hem", "Renaissance", "Repair",
+    "Rinse", "Ripped", "Saddle", "Seam", "Seamed Front Yoke", "Seamed", "Selvedge", "Sequin",
+    "Side Seam Snaps", "Skimmer", "Slice", "Snake Print", "Sott", "Spark", "Spliced", "Split",
+    "Studded", "Super", "Track Pant", "Trashed", "Trouser", "Vegan Leather", "vent", "slit",
+    "W/ Contrast Front Panel", "w/ Cuff", "w/ Flap Jean", "w/ Slit Hem", "W/ Stud Detailing",
+    "W/ Wide Cuff", "W/Flap", "Wax", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper",
+]
 
 PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
 PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
@@ -92,11 +105,12 @@ def ensure_directories() -> None:
 
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
     try:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(f"[{timestamp}] {message}\n")
     except PermissionError:
-        print(f"[{timestamp}] {message}")
+        pass
 
 
 def format_price(value: Optional[float]) -> str:
@@ -180,6 +194,16 @@ def derive_product_type(tags: Iterable[str], title: str) -> str:
     if any(tag in tag_set for tag in ("clothingType:Pant", "clothingTypeCode:PAN")):
         return "Pants"
     return ""
+
+
+def derive_style_name_base(product_title: str) -> str:
+    text = (product_title or "").split("-", 1)[0].strip()
+    text = text.replace('"', " ")
+    text = re.sub(r"\b\d+\b", " ", text)
+    for phrase in sorted(STYLE_NAME_REMOVE_PHRASES, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def to_float(value: str) -> Optional[float]:
@@ -761,18 +785,17 @@ class PaigeScraper:
             return self._pdp_cache[handle]
 
         html_candidates: List[Tuple[str, str]] = []
-        for host in HOST_ROTATION:
-            url = urljoin(host, f"/products/{handle}")
-            try:
-                response = self.session.get(url, timeout=30, allow_redirects=True)
-                response.raise_for_status()
-                html_candidates.append((f"http:{host}", response.text))
-            except Exception as exc:
-                log(f"HTTP fetch failed for {url}: {exc}")
-            if BROWSER_RENDER_ENABLED:
-                rendered_html = render_page_html_with_clicks(url)
-                if rendered_html:
-                    html_candidates.insert(0, (f"browser_click:{host}", rendered_html))
+        url = urljoin(PDP_HOST, f"/products/{handle}")
+        try:
+            response = self.session.get(url, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            html_candidates.append((f"http:{PDP_HOST}", response.text))
+        except Exception as exc:
+            log(f"HTTP fetch failed for {url}: {exc}")
+        if BROWSER_RENDER_ENABLED:
+            rendered_html = render_page_html_with_clicks(url)
+            if rendered_html:
+                html_candidates.insert(0, (f"browser_click:{PDP_HOST}", rendered_html))
 
         details_description = ""
         source = ""
@@ -784,18 +807,14 @@ class PaigeScraper:
 
         base_description = ""
         try:
-            for host in HOST_ROTATION:
-                product_json = self.session.get(
-                    urljoin(host, f"/products/{handle}.json"),
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                if product_json.status_code != 200:
-                    continue
+            product_json = self.session.get(
+                urljoin(PDP_HOST, f"/products/{handle}.json"),
+                timeout=30,
+                allow_redirects=True,
+            )
+            if product_json.status_code == 200:
                 body_html = (product_json.json().get("product") or {}).get("body_html") or ""
                 base_description = normalize_text(BeautifulSoup(body_html, "html.parser"))
-                if base_description:
-                    break
         except Exception:
             pass
 
@@ -871,7 +890,7 @@ class PaigeScraper:
                 continue
 
             pdp_fields = self.fetch_pdp_fields(handle)
-            style_name = extract_tag_value(tags, "styleGroup:") or meta_attrs.get("styleGroup", "")
+            style_name = derive_style_name_base(title)
             product_type = derive_product_type(tags, title)
             country = extract_tag_value(tags, "country:")
             production_cost = extract_tag_value(tags, "productionCost:")
@@ -993,8 +1012,58 @@ class PaigeScraper:
             log(f"Processed style {idx}/{len(styles)}: {handle} -> {len(variants)} variants")
             time.sleep(0.2)
 
+        self.apply_style_name_rules(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
+
+    def apply_style_name_rules(self, rows: List[List[str]]) -> None:
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+
+        # Rule 1: unify by first word when leg opening matches and style is most frequent (skip maternity)
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            first_word = (row[idx_product].split(" ", 1)[0] if row[idx_product] else "").strip().lower()
+            if first_word:
+                groups.setdefault(first_word, []).append(row)
+
+        for first_word, group_rows in groups.items():
+            if len(group_rows) < 2:
+                continue
+            if any("maternity" in r[idx_product].lower() for r in group_rows):
+                continue
+            by_leg: Dict[str, List[List[str]]] = {}
+            for r in group_rows:
+                by_leg.setdefault(r[idx_leg], []).append(r)
+            for leg_value, leg_rows in by_leg.items():
+                styles = [r[idx_style_name] for r in leg_rows if r[idx_style_name]]
+                if len(set(styles)) <= 1:
+                    continue
+                most_common = max(set(styles), key=styles.count)
+                for r in leg_rows:
+                    r[idx_style_name] = most_common
+
+        # Rule 2: one-word style names
+        for row in rows:
+            style_name = row[idx_style_name].strip()
+            if not style_name or len(style_name.split()) != 1:
+                continue
+            product_first_word = (row[idx_product].split(" ", 1)[0] if row[idx_product] else "").strip().lower()
+            same_family = [
+                r for r in rows
+                if (r[idx_product].split(" ", 1)[0] if r[idx_product] else "").strip().lower() == product_first_word
+                and r[idx_leg] == row[idx_leg]
+                and len(r[idx_style_name].split()) > 1
+            ]
+            if same_family:
+                candidates = [r[idx_style_name] for r in same_family]
+                row[idx_style_name] = max(set(candidates), key=candidates.count)
+                continue
+            jean_first = (row[idx_jean_style].split(" ", 1)[0] if row[idx_jean_style] else "").strip()
+            if jean_first:
+                row[idx_style_name] = f"{style_name} {jean_first}".strip()
 
     def apply_petite_inseam_rule(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
