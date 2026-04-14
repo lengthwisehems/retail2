@@ -211,8 +211,18 @@ def to_float(value: str) -> Optional[float]:
         return None
 
 
-def derive_jean_style(title: str, description: str, leg_opening: str, fit_hint: str = "") -> str:
-    text_sources = [title.lower(), description.lower(), fit_hint.lower()]
+def contains_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    pattern = re.escape(phrase.strip()).replace(r"\ ", r"\s+")
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text.lower()) is not None
+
+
+def text_has_any(text: str, phrases: Sequence[str]) -> bool:
+    return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+def derive_jean_style(style_name: str, title: str, description: str, leg_opening: str, fit_hint: str = "") -> str:
     lo = to_float(leg_opening)
 
     def straight_bucket() -> str:
@@ -224,44 +234,33 @@ def derive_jean_style(title: str, description: str, leg_opening: str, fit_hint: 
             return "Straight from Knee/Thigh"
         return "Straight from Thigh"
 
-    if any(k in text_sources[0] for k in ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
-        return "Barrel"
-    if any(k in text_sources[0] for k in ("tapered", " mom ")):
-        return "Tapered"
-    if "baggy" in text_sources[0]:
-        return "Baggy"
-    if "flare" in text_sources[0]:
-        return "Flare"
-    if "bootcut" in text_sources[0] or " boot" in text_sources[0]:
-        return "Bootcut"
-    if "skinny" in text_sources[0]:
-        return "Skinny"
-    if "wide leg" in text_sources[0]:
-        return "Wide Leg"
-    if "cigarette" in text_sources[0] or "slim" in text_sources[0]:
-        return "Straight from Knee"
-    if "straight" in text_sources[0]:
-        return straight_bucket()
-
-    for text in text_sources[1:]:
-        if any(k in text for k in ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
+    def map_from_text(text: str) -> str:
+        if text_has_any(text, ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
             return "Barrel"
-        if "skinny" in text:
-            return "Skinny"
-        if "flare" in text:
-            return "Flare"
-        if "bootcut" in text:
-            return "Bootcut"
-        if any(k in text for k in ("taper", "tapering", "tapered")):
+        if text_has_any(text, ("taper", "tapering", "tapered", "mom")):
             return "Tapered"
-        if any(k in text for k in ("wide leg", "wide-leg", "palazzo")):
+        if contains_phrase(text, "baggy") or contains_phrase(text, "loose fit"):
+            return "Baggy"
+        if contains_phrase(text, "flare"):
+            return "Flare"
+        if contains_phrase(text, "bootcut") or contains_phrase(text, "boot"):
+            return "Bootcut"
+        if contains_phrase(text, "skinny"):
+            return "Skinny"
+        if text_has_any(text, ("wide leg", "wide-leg", "palazzo")):
             return "Wide Leg"
-        if "straight" in text:
+        if text_has_any(text, ("cigarette", "slim")):
+            return "Straight from Knee"
+        if contains_phrase(text, "straight"):
             bucket = straight_bucket()
             if bucket:
                 return bucket
-        if "baggy" in text or "loose fit" in text:
-            return "Baggy"
+        return ""
+
+    for source in (style_name, title, description, fit_hint):
+        mapped = map_from_text(source.lower())
+        if mapped:
+            return mapped
     return ""
 
 
@@ -367,13 +366,37 @@ def derive_color_standardized(color: str, description: str, color_hint: str = ""
         (("brown", "cinnamon", "coffee", "espresso"), "Brown"),
     ]
     for keys, out in mapping:
-        if any(k in c for k in keys):
+        if text_has_any(c, keys):
             return out
     for keys, out in mapping:
-        if any(k in d for k in keys):
+        if text_has_any(d, keys):
             return out
+    if text_has_any(
+        d,
+        (
+            "dark base",
+            "acid wash",
+            "dark rinse",
+            "dark stretch denim",
+            "dark washed",
+            "medium-dark",
+            "medium-light",
+            "dark vintage wash",
+            "dark wash",
+            "deep wash",
+            "light vintage wash",
+            "light vintage-inspired wash",
+            "light wash",
+            "light/medium wash",
+            "light-to-medium wash",
+            "medium wash",
+            "medium/dark soft vintage wash",
+            "medium/dark wash",
+        ),
+    ):
+        return "Blue"
     for keys, out in mapping:
-        if any(k in hint for k in keys):
+        if text_has_any(hint, keys):
             return out
     return ""
 
@@ -386,21 +409,21 @@ def derive_color_simplified(color: str, description: str, standardized: str, was
         return "Dark"
     if "white" in s or "tan" in s:
         return "Light"
-    if any(k in c for k in ("wine", "burgundy", "navy", "dark", "deep")):
+    if text_has_any(c, ("wine", "burgundy", "navy", "dark", "deep")):
         return "Dark"
-    if any(k in c for k in ("pastel", "cream", "light")):
+    if text_has_any(c, ("pastel", "cream", "light")):
         return "Light"
-    if any(k in c for k in ("medium", "mid")):
+    if text_has_any(c, ("medium", "mid")):
         return "Medium"
-    if any(k in d for k in ("medium light", "light to medium", "medium to light", "light-medium", "medium/light")):
+    if text_has_any(d, ("medium light", "light to medium", "medium to light", "light-medium", "medium/light")):
         return "Light to Medium"
-    if any(k in d for k in ("medium to dark", "dark to medium", "medium/dark", "dark-medium")):
+    if text_has_any(d, ("medium to dark", "dark to medium", "medium/dark", "dark-medium")):
         return "Medium to Dark"
-    if any(k in d for k in ("dark", "deep", "black", "wine", "burgundy", "midnight blue", "forest green", "navy")):
+    if text_has_any(d, ("dark", "deep", "black", "wine", "burgundy", "midnight blue", "forest green", "navy")):
         return "Dark"
-    if any(k in d for k in ("light blue", "pale blue", "light vintage", "soft blue", "ecru", "white", "acid wash", "light", "khaki", "tan", "ivory")):
+    if text_has_any(d, ("light blue", "pale blue", "light vintage", "soft blue", "ecru", "white", "acid wash", "light", "khaki", "tan", "ivory")):
         return "Light"
-    if any(k in d for k in ("mid blue", "medium stone wash", "classic stone washed blue", "medium blue", "medium wash", "classic blue")):
+    if text_has_any(d, ("mid blue", "medium stone wash", "classic stone washed blue", "medium blue", "medium wash", "classic blue")):
         return "Medium"
     return wash_hint
 
@@ -599,6 +622,12 @@ class PDPBrowserExtractor:
             self._page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
+            try:
+                # warm up first navigation so first PDP is less likely to be blocked/empty
+                self._page.goto(PDP_HOST, wait_until="domcontentloaded", timeout=15000)
+                self._page.wait_for_timeout(250)
+            except Exception:
+                pass
             return True
         except Exception as exc:
             log(f"Playwright launch failed: {exc}")
@@ -636,11 +665,20 @@ class PDPBrowserExtractor:
             return {"details": "", "stretch": "", "description": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
+        checkpoint_seen = False
         for _ in range(5):
             page_title = (self._page.title() or "").lower()
             if "checkpoint" not in page_title:
                 break
+            checkpoint_seen = True
             self._page.wait_for_timeout(400)
+
+        if checkpoint_seen and "checkpoint" in (self._page.title() or "").lower():
+            try:
+                self._page.reload(wait_until="domcontentloaded", timeout=20000)
+                self._page.wait_for_timeout(500)
+            except Exception:
+                pass
 
         self._dismiss_overlays()
 
@@ -1119,7 +1157,7 @@ class PaigeScraper:
 
                 sku_shopify_value = sku_shopify.replace("gid://shopify/ProductVariant/", "")
                 product_line_value = "Maternity" if "maternity" in title.lower() else ""
-                jean_style = derive_jean_style(title, pdp_fields["description"], pdp_fields["leg_opening"], fit_hint)
+                jean_style = derive_jean_style(style_name, title, pdp_fields["description"], pdp_fields["leg_opening"], fit_hint)
                 inseam_label = derive_inseam_label(title, pdp_fields["description"], jean_style, pdp_fields["inseam"])
                 inseam_style = derive_inseam_style(jean_style, inseam_label, pdp_fields["inseam"], length_hint)
                 rise_label = derive_rise_label(title, handle, pdp_fields["description"], rise_hint)
@@ -1185,6 +1223,8 @@ class PaigeScraper:
             time.sleep(0.2)
 
         self.apply_style_name_rules(rows)
+        self.apply_jean_style_inference(rows)
+        self.apply_rise_label_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
 
@@ -1204,17 +1244,18 @@ class PaigeScraper:
         for first_word, group_rows in groups.items():
             if len(group_rows) < 2:
                 continue
-            if any("maternity" in r[idx_product].lower() for r in group_rows):
-                continue
             by_leg: Dict[str, List[List[str]]] = {}
             for r in group_rows:
                 by_leg.setdefault(r[idx_leg], []).append(r)
             for leg_value, leg_rows in by_leg.items():
-                styles = [r[idx_style_name] for r in leg_rows if r[idx_style_name]]
+                non_maternity_rows = [r for r in leg_rows if "maternity" not in r[idx_product].lower()]
+                if not non_maternity_rows:
+                    continue
+                styles = [r[idx_style_name] for r in non_maternity_rows if r[idx_style_name]]
                 if len(set(styles)) <= 1:
                     continue
                 most_common = max(set(styles), key=styles.count)
-                for r in leg_rows:
+                for r in non_maternity_rows:
                     r[idx_style_name] = most_common
 
         # Rule 2: one-word style names
@@ -1236,6 +1277,60 @@ class PaigeScraper:
             jean_first = (row[idx_jean_style].split(" ", 1)[0] if row[idx_jean_style] else "").strip()
             if jean_first:
                 row[idx_style_name] = f"{style_name} {jean_first}".strip()
+
+    def apply_jean_style_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+        idx_product = CSV_HEADERS.index("Product")
+        idx_desc = CSV_HEADERS.index("Description")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_inseam_label = CSV_HEADERS.index("Inseam Label")
+        idx_inseam_style = CSV_HEADERS.index("Inseam Style")
+
+        # Step: infer blank Jean Style from matching style name + leg opening.
+        for row in rows:
+            if row[idx_jean_style]:
+                continue
+            style = row[idx_style_name]
+            leg = row[idx_leg]
+            if not style:
+                continue
+            matches = [
+                r[idx_jean_style]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_leg] == leg and r[idx_jean_style]
+            ]
+            if matches:
+                row[idx_jean_style] = max(set(matches), key=matches.count)
+
+        # Recompute inseam label/style when jean style got updated.
+        for row in rows:
+            jean_style = row[idx_jean_style]
+            row[idx_inseam_label] = derive_inseam_label(row[idx_product], row[idx_desc], jean_style, row[idx_inseam])
+            row[idx_inseam_style] = derive_inseam_style(jean_style, row[idx_inseam_label], row[idx_inseam], "")
+
+    def apply_rise_label_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_rise_label = CSV_HEADERS.index("Rise Label")
+
+        for row in rows:
+            if row[idx_rise_label]:
+                continue
+            style = row[idx_style_name]
+            rise = row[idx_rise]
+            if not style or not rise:
+                continue
+            matches = [
+                r[idx_rise_label]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_rise] == rise and r[idx_rise_label]
+            ]
+            if not matches:
+                continue
+            frequencies = {label: matches.count(label) for label in set(matches)}
+            row[idx_rise_label] = max(frequencies, key=frequencies.get)
 
     def apply_petite_inseam_rule(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
