@@ -1,6 +1,7 @@
 import csv
 import html
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -9,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup, FeatureNotFound, Tag
+from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -45,9 +46,6 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
 
 PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
 PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
-CLICK_TARGET_TEXTS: List[str] = ["DETAILS"]
-BROWSER_RENDER_ENABLED = True
-BROWSER_RENDER_TIMEOUT_MS = 45000
 
 CSV_HEADERS = [
     "Style Id",
@@ -66,6 +64,9 @@ CSV_HEADERS = [
     "Variant Title",
     "Color",
     "Size",
+    "Rise",
+    "Inseam",
+    "Leg Opening",
     "Price",
     "Compare at Price",
     "Available for Sale",
@@ -213,8 +214,18 @@ def to_float(value: str) -> Optional[float]:
         return None
 
 
-def derive_jean_style(title: str, description: str, leg_opening: str, fit_hint: str = "") -> str:
-    text_sources = [title.lower(), description.lower(), fit_hint.lower()]
+def contains_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    pattern = re.escape(phrase.strip()).replace(r"\ ", r"\s+")
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text.lower()) is not None
+
+
+def text_has_any(text: str, phrases: Sequence[str]) -> bool:
+    return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+def derive_jean_style(style_name: str, title: str, description: str, leg_opening: str, fit_hint: str = "") -> str:
     lo = to_float(leg_opening)
 
     def straight_bucket() -> str:
@@ -226,44 +237,33 @@ def derive_jean_style(title: str, description: str, leg_opening: str, fit_hint: 
             return "Straight from Knee/Thigh"
         return "Straight from Thigh"
 
-    if any(k in text_sources[0] for k in ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
-        return "Barrel"
-    if any(k in text_sources[0] for k in ("tapered", " mom ")):
-        return "Tapered"
-    if "baggy" in text_sources[0]:
-        return "Baggy"
-    if "flare" in text_sources[0]:
-        return "Flare"
-    if "bootcut" in text_sources[0] or " boot" in text_sources[0]:
-        return "Bootcut"
-    if "skinny" in text_sources[0]:
-        return "Skinny"
-    if "wide leg" in text_sources[0]:
-        return "Wide Leg"
-    if "cigarette" in text_sources[0] or "slim" in text_sources[0]:
-        return "Straight from Knee"
-    if "straight" in text_sources[0]:
-        return straight_bucket()
-
-    for text in text_sources[1:]:
-        if any(k in text for k in ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
+    def map_from_text(text: str) -> str:
+        if text_has_any(text, ("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe")):
             return "Barrel"
-        if "skinny" in text:
-            return "Skinny"
-        if "flare" in text:
-            return "Flare"
-        if "bootcut" in text:
-            return "Bootcut"
-        if any(k in text for k in ("taper", "tapering", "tapered")):
+        if text_has_any(text, ("taper", "tapering", "tapered", "mom")):
             return "Tapered"
-        if any(k in text for k in ("wide leg", "wide-leg", "palazzo")):
+        if contains_phrase(text, "baggy") or contains_phrase(text, "loose fit"):
+            return "Baggy"
+        if contains_phrase(text, "flare"):
+            return "Flare"
+        if contains_phrase(text, "bootcut") or contains_phrase(text, "boot"):
+            return "Bootcut"
+        if contains_phrase(text, "skinny"):
+            return "Skinny"
+        if text_has_any(text, ("wide leg", "wide-leg", "palazzo")):
             return "Wide Leg"
-        if "straight" in text:
+        if text_has_any(text, ("cigarette", "slim")):
+            return "Straight from Knee"
+        if contains_phrase(text, "straight"):
             bucket = straight_bucket()
             if bucket:
                 return bucket
-        if "baggy" in text or "loose fit" in text:
-            return "Baggy"
+        return ""
+
+    for source in (style_name, title, description, fit_hint):
+        mapped = map_from_text(source.lower())
+        if mapped:
+            return mapped
     return ""
 
 
@@ -276,7 +276,7 @@ def derive_inseam_label(title: str, description: str, jean_style: str, inseam: s
     inseam_value = to_float(inseam)
     if inseam_value is None:
         return "Regular"
-    if jean_style in {"Barrel", "Bootcut", "Flare", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"} and inseam_value >= 33:
+    if jean_style in {"Barrel", "Bootcut", "Flare", "Wide Leg", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"} and inseam_value >= 33:
         return "Long"
     if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and inseam_value >= 30:
         return "Long"
@@ -286,24 +286,33 @@ def derive_inseam_label(title: str, description: str, jean_style: str, inseam: s
 def derive_inseam_style(jean_style: str, inseam_label: str, inseam: str, length_hint: str = "") -> str:
     val = to_float(inseam)
     label = inseam_label or "Regular"
+    wide_group = {"Barrel", "Bootcut", "Flare", "Wide Leg", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"}
+    skinny_group = {"Skinny", "Tapered", "Straight from Knee"}
     if val is not None:
-        wide_group = {"Barrel", "Bootcut", "Flare", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"}
-        skinny_group = {"Skinny", "Tapered", "Straight from Knee"}
         if jean_style in wide_group:
             if label == "Petite":
                 return "Cropped" if val <= 25 else ("Ankle" if val <= 28 else "Full Length")
             if label == "Regular":
                 return "Cropped" if val <= 28 else ("Ankle" if val < 31 else "Full Length")
-            if label == "Long":
-                return "Full Length" if val >= 33 else "Ankle"
+            if label == "Long" and val >= 33:
+                return "Full Length"
         if jean_style in skinny_group:
             if label == "Petite":
                 return "Cropped" if val < 25 else "Full Length"
             if label == "Regular":
-                return "Cropped" if val < 27 else "Full Length"
-            if label == "Long":
+                return "Cropped" if val < 27 else ("Full Length" if val < 30 else "Full Length")
+            if label == "Long" and val >= 30:
                 return "Full Length"
-    return length_hint or ""
+    hint = (length_hint or "").strip()
+    if hint:
+        hint_lower = hint.lower()
+        if jean_style in skinny_group and hint_lower == "ankle":
+            return "Full Length"
+        if jean_style in wide_group and hint_lower == "extra long":
+            return "Full Length"
+        if jean_style in wide_group:
+            return hint
+    return ""
 
 
 def derive_rise_label(title: str, handle: str, description: str, rise_hint: str = "") -> str:
@@ -360,13 +369,37 @@ def derive_color_standardized(color: str, description: str, color_hint: str = ""
         (("brown", "cinnamon", "coffee", "espresso"), "Brown"),
     ]
     for keys, out in mapping:
-        if any(k in c for k in keys):
+        if text_has_any(c, keys):
             return out
     for keys, out in mapping:
-        if any(k in d for k in keys):
+        if text_has_any(d, keys):
             return out
+    if text_has_any(
+        d,
+        (
+            "dark base",
+            "acid wash",
+            "dark rinse",
+            "dark stretch denim",
+            "dark washed",
+            "medium-dark",
+            "medium-light",
+            "dark vintage wash",
+            "dark wash",
+            "deep wash",
+            "light vintage wash",
+            "light vintage-inspired wash",
+            "light wash",
+            "light/medium wash",
+            "light-to-medium wash",
+            "medium wash",
+            "medium/dark soft vintage wash",
+            "medium/dark wash",
+        ),
+    ):
+        return "Blue"
     for keys, out in mapping:
-        if any(k in hint for k in keys):
+        if text_has_any(hint, keys):
             return out
     return ""
 
@@ -379,21 +412,21 @@ def derive_color_simplified(color: str, description: str, standardized: str, was
         return "Dark"
     if "white" in s or "tan" in s:
         return "Light"
-    if any(k in c for k in ("wine", "burgundy", "navy", "dark", "deep")):
+    if text_has_any(c, ("wine", "burgundy", "navy", "dark", "deep")):
         return "Dark"
-    if any(k in c for k in ("pastel", "cream", "light")):
+    if text_has_any(c, ("pastel", "cream", "light")):
         return "Light"
-    if any(k in c for k in ("medium", "mid")):
+    if text_has_any(c, ("medium", "mid")):
         return "Medium"
-    if any(k in d for k in ("medium light", "light to medium", "medium to light", "light-medium", "medium/light")):
+    if text_has_any(d, ("medium light", "light to medium", "medium to light", "light-medium", "medium/light")):
         return "Light to Medium"
-    if any(k in d for k in ("medium to dark", "dark to medium", "medium/dark", "dark-medium")):
+    if text_has_any(d, ("medium to dark", "dark to medium", "medium/dark", "dark-medium")):
         return "Medium to Dark"
-    if any(k in d for k in ("dark", "deep", "black", "wine", "burgundy", "midnight blue", "forest green", "navy")):
+    if text_has_any(d, ("dark", "deep", "black", "wine", "burgundy", "midnight blue", "forest green", "navy")):
         return "Dark"
-    if any(k in d for k in ("light blue", "pale blue", "light vintage", "soft blue", "ecru", "white", "acid wash", "light", "khaki", "tan", "ivory")):
+    if text_has_any(d, ("light blue", "pale blue", "light vintage", "soft blue", "ecru", "white", "acid wash", "light", "khaki", "tan", "ivory")):
         return "Light"
-    if any(k in d for k in ("mid blue", "medium stone wash", "classic stone washed blue", "medium blue", "medium wash", "classic blue")):
+    if text_has_any(d, ("mid blue", "medium stone wash", "classic stone washed blue", "medium blue", "medium wash", "classic blue")):
         return "Medium"
     return wash_hint
 
@@ -403,44 +436,33 @@ def normalize_text(tag: Tag) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def selector_with_dynamic_id_fallbacks(selector: str) -> List[str]:
-    candidates = [selector]
-    normalized_headless = re.sub(
-        r"#headlessui-disclosure-panel-[A-Za-z0-9_-]+",
-        "[id^='headlessui-disclosure-panel-']",
-        selector,
-    )
-    if normalized_headless not in candidates:
-        candidates.append(normalized_headless)
-    return candidates
-
-
-def build_soup_candidates(html_text: str) -> List[BeautifulSoup]:
-    soups: List[BeautifulSoup] = []
-    for parser in ("lxml", "html.parser"):
-        try:
-            soup = BeautifulSoup(html_text, parser)
-        except FeatureNotFound:
-            continue
-        soups.append(soup)
-    if not soups:
-        soups.append(BeautifulSoup(html_text, "html.parser"))
-    return soups
+def strip_html_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    return normalize_text(BeautifulSoup(raw_html, "html.parser"))
 
 
 def extract_pdp_description(html_text: str) -> str:
-    for soup in build_soup_candidates(html_text):
-        for selector in selector_with_dynamic_id_fallbacks(PDP_SELECTOR):
-            matches = [node for node in soup.select(selector) if isinstance(node, Tag)]
-            values = [normalize_text(node) for node in matches if normalize_text(node)]
-            if values:
-                return ", ".join(values)
+    soup = BeautifulSoup(html_text, "html.parser")
+    matches = [node for node in soup.select(PDP_SELECTOR) if isinstance(node, Tag)]
+    values = [normalize_text(node) for node in matches if normalize_text(node)]
+    if values:
+        return ", ".join(values)
 
-        parent = soup.select_one(PDP_PARENT_SELECTOR)
-        if parent is not None:
-            values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
-            if values:
-                return ", ".join(values)
+    parent = soup.select_one(PDP_PARENT_SELECTOR)
+    if parent is not None:
+        values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
+        if values:
+            return ", ".join(values)
+
+    keyword_hits: List[str] = []
+    for node in soup.find_all(["li", "p", "span"]):
+        node_text = normalize_text(node)
+        node_lower = node_text.lower()
+        if any(token in node_lower for token in ("front rise", "rise", "inseam", "leg opening", "stretch")):
+            keyword_hits.append(node_text)
+    if keyword_hits:
+        return ", ".join(dict.fromkeys(keyword_hits))
 
     return ""
 
@@ -471,16 +493,41 @@ def parse_mixed_fraction(raw_value: str) -> Optional[float]:
 
 
 def extract_measurement(text: str, labels: Sequence[str]) -> str:
+    fraction_map = {
+        "¼": " 1/4",
+        "½": " 1/2",
+        "¾": " 3/4",
+        "⅛": " 1/8",
+        "⅜": " 3/8",
+        "⅝": " 5/8",
+        "⅞": " 7/8",
+    }
+    norm_text = text
+    for symbol, replacement in fraction_map.items():
+        norm_text = norm_text.replace(symbol, replacement)
+    number_pattern = r"([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)"
     for label in labels:
-        pattern = rf"{label}\s*:\s*([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)"
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = parse_mixed_fraction(match.group(1))
-        if value is None:
-            continue
-        return f"{value:.3f}"
+        patterns = [
+            rf"{label}\s*:\s*{number_pattern}",
+            rf"{label}\s*[-]?\s*{number_pattern}\s*(?:in|inch|inches|\"|”)?",
+            rf"{number_pattern}\s*(?:in|inch|inches|\"|”)?\s*{label}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, norm_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = parse_mixed_fraction(match.group(1))
+            if value is None:
+                continue
+            return format_decimal(value)
     return ""
+
+
+def format_decimal(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text
 
 
 def extract_label_text(text: str, labels: Sequence[str]) -> str:
@@ -491,97 +538,233 @@ def extract_label_text(text: str, labels: Sequence[str]) -> str:
     return ""
 
 
-def render_page_html_with_clicks(url: str) -> Optional[str]:
-    try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        log(f"Playwright unavailable, skipping browser-render pass: {exc}")
-        return None
+def extract_stretch_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "html.parser")
+    active_dot = soup.select_one(
+        "div[class*='stretch-scale-module'][class*='dot'][class*='active'], "
+        "div[class*='dot'][class*='active']"
+    )
+    if active_dot is None:
+        return ""
+    dot_parent = active_dot.parent
+    if dot_parent is None:
+        return ""
+    sibling_divs = dot_parent.find_all("div", recursive=False)
+    for idx, child in enumerate(sibling_divs, start=1):
+        if child is active_dot:
+            mapping = {
+                1: "High Stretch",
+                3: "Medium to High Stretch",
+                5: "Medium Stretch",
+                7: "Low Stretch",
+                9: "Low Stretch",
+            }
+            return mapping.get(idx, "")
+    return ""
 
-    def dismiss_known_overlays(page) -> None:
-        for selector in (
-            "#attentive_overlay",
-            "iframe#attentive_creative",
-            "[id*='attentive_overlay']",
-            "[data-testid*='attentive']",
-        ):
+
+def normalize_stretch_value(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if "high" in text:
+        return "High Stretch"
+    if "medium to high" in text:
+        return "Medium to High Stretch"
+    if "comfort" in text or "hint of stretch" in text:
+        return "Medium Stretch"
+    if "medium" in text:
+        return "Medium Stretch"
+    if "low" in text:
+        return "Low Stretch"
+    return value.strip()
+
+
+class PDPBrowserExtractor:
+    """Browser-driven PDP extractor for Headless UI DETAILS panels."""
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._init_failed = False
+
+    def _ensure(self) -> bool:
+        if not self.enabled or self._init_failed:
+            return False
+        if self._page is not None:
+            return True
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            log(f"Playwright import failed: {exc}")
+            self._init_failed = True
+            return False
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._context = self._browser.new_context(
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1366, "height": 1800},
+            )
+            self._page = self._context.new_page()
+            self._page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
             try:
-                page.evaluate(
-                    """(sel) => {
-                      document.querySelectorAll(sel).forEach((el) => {
-                        try { el.remove(); } catch (e) {}
-                        if (el.style) {
-                          el.style.display = 'none';
-                          el.style.visibility = 'hidden';
-                          el.style.pointerEvents = 'none';
-                        }
-                      });
-                    }""",
-                    selector,
-                )
+                # warm up first navigation so first PDP is less likely to be blocked/empty
+                self._page.goto(PDP_HOST, wait_until="domcontentloaded", timeout=15000)
+                self._page.wait_for_timeout(250)
             except Exception:
-                continue
-
-    def click_with_fallback(locator) -> bool:
-        try:
-            locator.click(timeout=5000)
+                pass
             return True
-        except Exception:
-            pass
-        try:
-            locator.click(timeout=5000, force=True)
-            return True
-        except Exception:
-            pass
-        try:
-            handle = locator.element_handle(timeout=5000)
-            if handle is None:
-                return False
-            locator.page.evaluate("(el) => el.click()", handle)
-            return True
-        except Exception:
+        except Exception as exc:
+            log(f"Playwright launch failed: {exc}")
+            self._init_failed = True
+            self.close()
             return False
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_RENDER_TIMEOUT_MS)
+    def _dismiss_overlays(self) -> None:
+        if self._page is None:
+            return
+        try:
+            self._page.evaluate(
+                """
+                () => {
+                  document.querySelectorAll(
+                    '#attentive_overlay, iframe#attentive_creative, [id*="attentive_overlay"], [data-testid*="attentive"]'
+                  ).forEach((el) => {
+                    try { el.remove(); } catch (e) {}
+                  });
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def fetch(self, handle: str) -> Dict[str, str]:
+        if not self._ensure():
+            return {"details": "", "stretch": "", "description": ""}
+        assert self._page is not None
+        url = f"{PDP_HOST}/products/{handle}"
+        start = time.time()
+        try:
+            self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception:
+            return {"details": "", "stretch": "", "description": ""}
+
+        # lightweight checkpoint wait; keep bounded for speed.
+        checkpoint_seen = False
+        for _ in range(5):
+            page_title = (self._page.title() or "").lower()
+            if "checkpoint" not in page_title:
+                break
+            checkpoint_seen = True
+            self._page.wait_for_timeout(400)
+
+        if checkpoint_seen and "checkpoint" in (self._page.title() or "").lower():
             try:
-                page.wait_for_load_state("networkidle", timeout=min(BROWSER_RENDER_TIMEOUT_MS, 15000))
-            except PlaywrightTimeoutError:
+                self._page.reload(wait_until="domcontentloaded", timeout=20000)
+                self._page.wait_for_timeout(500)
+            except Exception:
                 pass
 
-            dismiss_known_overlays(page)
-            parent_locator = page.locator(PDP_PARENT_SELECTOR)
-            for idx in range(parent_locator.count()):
-                current = parent_locator.nth(idx)
-                state = (current.get_attribute("data-headlessui-state") or "").strip().lower()
-                if state == "open":
-                    continue
-                nested_button = current.locator("button,[role='button']")
-                if nested_button.count() > 0:
-                    click_with_fallback(nested_button.first)
+        self._dismiss_overlays()
 
-            for label in CLICK_TARGET_TEXTS:
-                locator = page.locator(f"button:has-text('{label}')")
-                if locator.count() > 0:
-                    first = locator.first
-                    expanded = (first.get_attribute("aria-expanded") or "").strip().lower()
-                    state = (first.get_attribute("data-headlessui-state") or "").strip().lower()
-                    if expanded != "true" and state != "open":
-                        click_with_fallback(first)
+        details_text = ""
+        try:
+            btn = self._page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
+            if btn.count() == 0:
+                btn = self._page.locator("button:has-text('DETAILS')")
+            if btn.count():
+                expanded = btn.first.get_attribute("aria-expanded", timeout=500)
+                if expanded != "true":
+                    try:
+                        btn.first.click(timeout=1200)
+                    except Exception:
+                        btn.first.click(timeout=1200, force=True)
+                self._page.wait_for_timeout(120)
 
-            page.wait_for_timeout(500)
-            html_text = page.content()
-            context.close()
-            browser.close()
-            return html_text
-    except Exception as exc:
-        log(f"Browser-render pass failed for {url}: {exc}")
-        return None
+            detail_nodes = self._page.locator(PDP_SELECTOR)
+            count = detail_nodes.count()
+            if count:
+                items = []
+                for i in range(count):
+                    text = detail_nodes.nth(i).inner_text(timeout=600).strip()
+                    if text:
+                        items.append(re.sub(r"\s+", " ", text))
+                details_text = ", ".join(items)
+        except Exception:
+            details_text = ""
+
+        stretch = ""
+        try:
+            active_dot = self._page.locator(
+                "div[class*='womenStretchScale'] > div[class*='dot'][class*='active']"
+            )
+            if active_dot.count():
+                idx = active_dot.first.evaluate(
+                    "el => Array.from(el.parentElement.children).indexOf(el) + 1"
+                )
+                stretch = {
+                    1: "High Stretch",
+                    3: "Medium to High Stretch",
+                    5: "Medium Stretch",
+                    7: "Low Stretch",
+                    9: "Low Stretch",
+                }.get(int(idx), "")
+        except Exception:
+            stretch = ""
+
+        description_text = ""
+        try:
+            # Keep this selector broad but cheap.
+            desc_node = self._page.locator(
+                "div[class*='productDescription'], div[class*='description'] p"
+            ).first
+            if desc_node.count():
+                description_text = re.sub(r"\s+", " ", desc_node.inner_text(timeout=600)).strip()
+        except Exception:
+            description_text = ""
+
+        elapsed = time.time() - start
+        log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
+        return {"details": details_text, "stretch": stretch, "description": description_text}
+
+    def close(self) -> None:
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
 
 
 class PaigeScraper:
@@ -605,6 +788,7 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
+        self.browser_extractor = PDPBrowserExtractor()
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
         response = self.session.post(
@@ -780,57 +964,79 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(self, handle: str) -> Dict[str, str]:
+    def fetch_pdp_fields(self, handle: str, description_seed: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
+        source = "seed"
+        description_parts: List[str] = [description_seed] if description_seed else []
+        description = ", ".join(part for part in description_parts if part)
+        stretch = normalize_stretch_value(extract_label_text(description, ["Stretch"]))
 
-        html_candidates: List[Tuple[str, str]] = []
-        url = urljoin(PDP_HOST, f"/products/{handle}")
-        try:
-            response = self.session.get(url, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            html_candidates.append((f"http:{PDP_HOST}", response.text))
-        except Exception as exc:
-            log(f"HTTP fetch failed for {url}: {exc}")
-        if BROWSER_RENDER_ENABLED:
-            rendered_html = render_page_html_with_clicks(url)
-            if rendered_html:
-                html_candidates.insert(0, (f"browser_click:{PDP_HOST}", rendered_html))
-
-        details_description = ""
-        source = ""
-        for candidate_source, html_text in html_candidates:
-            text = extract_pdp_description(html_text)
-            if text and len(text) > len(details_description):
-                details_description = text
-                source = candidate_source
-
-        base_description = ""
         try:
             product_json = self.session.get(
                 urljoin(PDP_HOST, f"/products/{handle}.json"),
-                timeout=30,
+                timeout=20,
                 allow_redirects=True,
             )
             if product_json.status_code == 200:
                 body_html = (product_json.json().get("product") or {}).get("body_html") or ""
-                base_description = normalize_text(BeautifulSoup(body_html, "html.parser"))
+                body_text = strip_html_text(body_html)
+                if body_text:
+                    description_parts.append(body_text)
+                    source = "product-json"
         except Exception:
             pass
 
-        description_parts = [part for part in (base_description, details_description) if part]
-        description = ", ".join(description_parts)
-
+        description = ", ".join(part for part in description_parts if part)
         rise = extract_measurement(description, ["Front Rise", "Rise"])
         inseam = extract_measurement(description, ["Inseam", "Inleg"])
         leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+
+        if not (rise and inseam and leg_opening):
+            url = urljoin(PDP_HOST, f"/products/{handle}")
+            try:
+                response = self.session.get(url, timeout=20, allow_redirects=True)
+                response.raise_for_status()
+                details_description = extract_pdp_description(response.text)
+                stretch_from_html = extract_stretch_from_html(response.text)
+                if stretch_from_html:
+                    stretch = normalize_stretch_value(stretch_from_html)
+                if details_description:
+                    description_parts.append(details_description)
+                    description = ", ".join(part for part in description_parts if part)
+                    rise = extract_measurement(description, ["Front Rise", "Rise"])
+                    inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                    leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                    source = "pdp-html"
+            except Exception:
+                pass
+
+        # Browser-driven fallback for Headless UI DETAILS disclosure.
+        if not (rise and inseam and leg_opening):
+            browser_data = self.browser_extractor.fetch(handle)
+            browser_desc = browser_data.get("description", "")
+            browser_details = browser_data.get("details", "")
+            if browser_desc:
+                description_parts.insert(0, browser_desc)
+            if browser_details:
+                description_parts.append(browser_details)
+            if browser_data.get("stretch"):
+                stretch = normalize_stretch_value(browser_data["stretch"])
+            description = ", ".join(part for part in description_parts if part)
+            rise = extract_measurement(description, ["Front Rise", "Rise"])
+            inseam = extract_measurement(description, ["Inseam", "Inleg"])
+            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+            if browser_details:
+                source = "pdp-browser"
+
+        description = ", ".join(dict.fromkeys(part for part in description_parts if part))
 
         result = {
             "description": description,
             "rise": rise,
             "inseam": inseam,
             "leg_opening": leg_opening,
-            "stretch": extract_label_text(description, ["Stretch"]),
+            "stretch": stretch or normalize_stretch_value(extract_label_text(description, ["Stretch"])),
         }
         self._pdp_cache[handle] = result
         log(
@@ -889,19 +1095,26 @@ class PaigeScraper:
                 log(f"No variants returned for style {style_id} ({handle})")
                 continue
 
-            pdp_fields = self.fetch_pdp_fields(handle)
+            style_algolia = algolia_style_map.get(handle, {})
+            seed_description = safe_string(style.get("description", "")) if use_graphql else ""
+            algolia_body_html = safe_string(style_algolia.get("body_html_safe", ""))
+            if algolia_body_html:
+                algolia_text = strip_html_text(algolia_body_html)
+                seed_description = ", ".join(part for part in (seed_description, algolia_text) if part)
+            pdp_fields = self.fetch_pdp_fields(handle, seed_description)
             style_name = derive_style_name_base(title)
             product_type = derive_product_type(tags, title)
             country = extract_tag_value(tags, "country:")
             production_cost = extract_tag_value(tags, "productionCost:")
             site_exclusive = extract_tag_value(tags, "productType:")
             product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
-            style_algolia = algolia_style_map.get(handle, {})
             fit_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("fit", "")
             length_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("length", "")
             rise_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("rise", "")
             wash_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("wash", "")
             color_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("colorCategory", "")
+            stretch_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("stretch", "")
+            inseam_hint = safe_string(((style_algolia.get("meta") or {}).get("attributes") or {}).get("inseam", ""))
 
             for variant in variants:
                 raw_size = safe_string(
@@ -947,7 +1160,7 @@ class PaigeScraper:
 
                 sku_shopify_value = sku_shopify.replace("gid://shopify/ProductVariant/", "")
                 product_line_value = "Maternity" if "maternity" in title.lower() else ""
-                jean_style = derive_jean_style(title, pdp_fields["description"], pdp_fields["leg_opening"], fit_hint)
+                jean_style = derive_jean_style(style_name, title, pdp_fields["description"], pdp_fields["leg_opening"], fit_hint)
                 inseam_label = derive_inseam_label(title, pdp_fields["description"], jean_style, pdp_fields["inseam"])
                 inseam_style = derive_inseam_style(jean_style, inseam_label, pdp_fields["inseam"], length_hint)
                 rise_label = derive_rise_label(title, handle, pdp_fields["description"], rise_hint)
@@ -966,12 +1179,12 @@ class PaigeScraper:
                     join_tags(tags),
                     style.get("vendor", ""),
                     pdp_fields["description"],
-                    pdp_fields["rise"],
-                    pdp_fields["inseam"],
-                    pdp_fields["leg_opening"],
                     variant_title,
                     color_value,
                     size_value,
+                    pdp_fields["rise"],
+                    pdp_fields["inseam"] or inseam_hint,
+                    pdp_fields["leg_opening"],
                     format_price(
                         (variant.get("price") or {}).get("amount")
                         if isinstance(variant.get("price"), dict)
@@ -1003,7 +1216,7 @@ class PaigeScraper:
                     color_simplified,
                     color_standardized,
                     country,
-                    pdp_fields.get("stretch", "") or meta_attrs.get("stretch", ""),
+                    normalize_stretch_value(pdp_fields.get("stretch", "") or stretch_hint or meta_attrs.get("stretch", "")),
                     production_cost,
                     site_exclusive,
                 ]
@@ -1013,6 +1226,8 @@ class PaigeScraper:
             time.sleep(0.2)
 
         self.apply_style_name_rules(rows)
+        self.apply_jean_style_inference(rows)
+        self.apply_rise_label_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
 
@@ -1032,17 +1247,18 @@ class PaigeScraper:
         for first_word, group_rows in groups.items():
             if len(group_rows) < 2:
                 continue
-            if any("maternity" in r[idx_product].lower() for r in group_rows):
-                continue
             by_leg: Dict[str, List[List[str]]] = {}
             for r in group_rows:
                 by_leg.setdefault(r[idx_leg], []).append(r)
             for leg_value, leg_rows in by_leg.items():
-                styles = [r[idx_style_name] for r in leg_rows if r[idx_style_name]]
+                non_maternity_rows = [r for r in leg_rows if "maternity" not in r[idx_product].lower()]
+                if not non_maternity_rows:
+                    continue
+                styles = [r[idx_style_name] for r in non_maternity_rows if r[idx_style_name]]
                 if len(set(styles)) <= 1:
                     continue
                 most_common = max(set(styles), key=styles.count)
-                for r in leg_rows:
+                for r in non_maternity_rows:
                     r[idx_style_name] = most_common
 
         # Rule 2: one-word style names
@@ -1064,6 +1280,60 @@ class PaigeScraper:
             jean_first = (row[idx_jean_style].split(" ", 1)[0] if row[idx_jean_style] else "").strip()
             if jean_first:
                 row[idx_style_name] = f"{style_name} {jean_first}".strip()
+
+    def apply_jean_style_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+        idx_product = CSV_HEADERS.index("Product")
+        idx_desc = CSV_HEADERS.index("Description")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_inseam_label = CSV_HEADERS.index("Inseam Label")
+        idx_inseam_style = CSV_HEADERS.index("Inseam Style")
+
+        # Step: infer blank Jean Style from matching style name + leg opening.
+        for row in rows:
+            if row[idx_jean_style]:
+                continue
+            style = row[idx_style_name]
+            leg = row[idx_leg]
+            if not style:
+                continue
+            matches = [
+                r[idx_jean_style]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_leg] == leg and r[idx_jean_style]
+            ]
+            if matches:
+                row[idx_jean_style] = max(set(matches), key=matches.count)
+
+        # Recompute inseam label/style when jean style got updated.
+        for row in rows:
+            jean_style = row[idx_jean_style]
+            row[idx_inseam_label] = derive_inseam_label(row[idx_product], row[idx_desc], jean_style, row[idx_inseam])
+            row[idx_inseam_style] = derive_inseam_style(jean_style, row[idx_inseam_label], row[idx_inseam], "")
+
+    def apply_rise_label_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_rise_label = CSV_HEADERS.index("Rise Label")
+
+        for row in rows:
+            if row[idx_rise_label]:
+                continue
+            style = row[idx_style_name]
+            rise = row[idx_rise]
+            if not style or not rise:
+                continue
+            matches = [
+                r[idx_rise_label]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_rise] == rise and r[idx_rise_label]
+            ]
+            if not matches:
+                continue
+            frequencies = {label: matches.count(label) for label in set(matches)}
+            row[idx_rise_label] = max(frequencies, key=frequencies.get)
 
     def apply_petite_inseam_rule(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
@@ -1096,11 +1366,14 @@ class PaigeScraper:
 
     def run(self) -> Path:
         log("Starting Paige scrape")
-        rows = self.build_rows()
-        output_path = self.write_csv(rows)
-        log("Scrape complete")
-        print("Done.")
-        return output_path
+        try:
+            rows = self.build_rows()
+            output_path = self.write_csv(rows)
+            log("Scrape complete")
+            print("Done.")
+            return output_path
+        finally:
+            self.browser_extractor.close()
 
 
 def main() -> None:
