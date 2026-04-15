@@ -680,7 +680,7 @@ class PDPBrowserExtractor:
 
     def __init__(self) -> None:
         self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
         self._playwright = None
         self._browser = None
         self._context = None
@@ -702,7 +702,12 @@ class PDPBrowserExtractor:
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.launch(
                 headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                ],
             )
             self._context = self._browser.new_context(
                 ignore_https_errors=True,

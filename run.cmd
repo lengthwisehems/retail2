@@ -30,6 +30,18 @@ if errorlevel 1 (
 ) else (
     echo Packages verified.
 )
+echo Installing Playwright for browser-based scrapers...
+"%PY%" -m pip install --disable-pip-version-check -q playwright
+if errorlevel 1 (
+    echo([WARN] Playwright package install failed; browser-based scraping will be skipped.
+) else (
+    "%PY%" -m playwright install chromium
+    if errorlevel 1 (
+        echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
+    ) else (
+        echo Playwright Chromium ready.
+    )
+)
 "%PY%" -V
 
 REM ---------- Run each scraper ----------
