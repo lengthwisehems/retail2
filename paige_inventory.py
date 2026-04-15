@@ -613,12 +613,16 @@ def extract_stretch_from_html(html_text: str) -> str:
         if "dot" in " ".join(d.get("class", [])).lower()
     ]
 
+    # dot_siblings contains only the 5 actual dot elements (connectors/spacers filtered
+    # out). The active dot's 1-based position within this filtered list maps directly:
+    #   1 → High Stretch, 2 → Medium to High Stretch, 3 → Medium Stretch,
+    #   4 → Low Stretch,  5 → Rigid
     mapping = {
         1: "High Stretch",
-        3: "Medium to High Stretch",
-        5: "Medium Stretch",
-        7: "Low Stretch",
-        9: "Rigid",
+        2: "Medium to High Stretch",
+        3: "Medium Stretch",
+        4: "Low Stretch",
+        5: "Rigid",
     }
     for idx, child in enumerate(dot_siblings, start=1):
         if child is active_dot:
@@ -652,16 +656,18 @@ def derive_stretch_from_algolia_attrs(denim_fabric: str, stretch_attr: str) -> s
       denimFabric=Heritage         + stretch=Comfort Stretch → Medium Stretch
       denimFabric=Rigid            + stretch=Rigid           → Rigid
       denimFabric=Heritage         + stretch=Semi Rigid      → Low Stretch
+
+    Comparison is case-insensitive to handle Algolia returning values in any casing.
     """
-    fabric = (denim_fabric or "").strip()
-    stretch = (stretch_attr or "").strip()
+    fabric = (denim_fabric or "").strip().lower()
+    stretch = (stretch_attr or "").strip().lower()
     rules = [
-        ("Transcend Vintage", "High Stretch",    "High Stretch"),
-        ("Transcend Vintage", "Medium Stretch",  "Medium to High Stretch"),
-        ("Transcend",         "High Stretch",    "High Stretch"),
-        ("Heritage",          "Comfort Stretch", "Medium Stretch"),
-        ("Rigid",             "Rigid",           "Rigid"),
-        ("Heritage",          "Semi Rigid",      "Low Stretch"),
+        ("transcend vintage", "high stretch",    "High Stretch"),
+        ("transcend vintage", "medium stretch",  "Medium to High Stretch"),
+        ("transcend",         "high stretch",    "High Stretch"),
+        ("heritage",          "comfort stretch", "Medium Stretch"),
+        ("rigid",             "rigid",           "Rigid"),
+        ("heritage",          "semi rigid",      "Low Stretch"),
     ]
     for fab, str_val, output in rules:
         if fabric == fab and stretch == str_val:
@@ -825,12 +831,13 @@ class PDPBrowserExtractor:
                 """
             )
             if idx is not None:
+                # JS dotSiblings is filtered to dot-only (5 elements), so position is 1-5.
                 stretch = {
                     1: "High Stretch",
-                    3: "Medium to High Stretch",
-                    5: "Medium Stretch",
-                    7: "Low Stretch",
-                    9: "Rigid",
+                    2: "Medium to High Stretch",
+                    3: "Medium Stretch",
+                    4: "Low Stretch",
+                    5: "Rigid",
                 }.get(int(idx), "")
         except Exception:
             stretch = ""
