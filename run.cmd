@@ -42,10 +42,28 @@ call :UpdateFinalExit %ERRORLEVEL%
 call :RunScraper "AMO"         "%ROOT%AMO\amo_inventory.py"                         "%OUT%\AMO\Output"              "%LOGS%\AMO\amo_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
+call :RunScraper "AnineBing"         "%ROOT%AnineBing\aninebing_inventory.py"                         "%OUT%\AnineBing\Output"              "%LOGS%\AnineBing\aninebing_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "AYR"         "%ROOT%AYR\ayr_inventory.py"                         "%OUT%\AYR\Output"              "%LOGS%\AMO\ayr_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "BetroSimone"      "%ROOT%BetroSimone\betrosimone_inventory.py"                   "%OUT%\BetroSimone\Output"           "%LOGS%\BetroSimone\betrosimone_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "CitizensofHumanity"      "%ROOT%CitizensofHumanity\citizensofhumanity_inventory.py"                   "%OUT%\CitizensofHumanity\Output"           "%LOGS%\CitizensofHumanity\citizensofhumanity_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
 call :RunScraper "DL1961"      "%ROOT%DL1961\dl1961_inventory.py"                   "%OUT%\DL1961\Output"           "%LOGS%\DL1961\dl1961_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
+call :RunScraper "EBdenim" "%ROOT%EBdenim\EBdenim_inventory.py" "%OUT%\EBdenim\Output" "%LOGS%\EBdenim\ebdenim_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
 call :RunScraper "Edyson" "%ROOT%Edyson\edyson_inventory.py" "%OUT%\Edyson\Output" "%LOGS%\Edyson\edyson_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "FavoriteDaughter" "%ROOT%FavoriteDaughter\favoritedaughter_inventory.py" "%OUT%\FavoriteDaughter\Output" "%LOGS%\FavoriteDaughter\favoritedaughter_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
 call :RunScraper "Fidelity"    "%ROOT%Fidelity\fidelity_inventory.py"               "%OUT%\Fidelity\Output"         "%LOGS%\Fidelity\fidelity_run.log"
@@ -60,7 +78,13 @@ call :UpdateFinalExit %ERRORLEVEL%
 call :RunScraper "Haikure"     "%ROOT%Haikure\haikure_inventory.py"                 "%OUT%\Haikure\Output"          "%LOGS%\Haikure\haikure_inventory.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
+call :RunScraper "Hudson"     "%ROOT%Hudson\hudson_inventory.py"                 "%OUT%\Hudson\Output"          "%LOGS%\Hudson\hudson_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
 call :RunScraper "IconDenim"   "%ROOT%Icon\icon_inventory.py"                       "%OUT%\IconDenim\Output"        "%LOGS%\IconDenim\icon_run.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "Ksubi"   "%ROOT%Ksubi\ksubi_inventory.py"                       "%OUT%\Ksubi\Output"        "%LOGS%\Ksubi\ksubi_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
 call :RunScraper "LAgence"     "%ROOT%LAgence\lagence_inventory.py"                 "%OUT%\LAgence\Output"          "%LOGS%\LAgence\lagence_run.log"
@@ -176,6 +200,13 @@ for %%B in (%BRANDS%) do (
   )
 )
 
+rem --- Final summary and exit code visibility ---
+if "%FINAL_EXIT%"=="0" (
+    echo [INFO] Overall status: SUCCESS (soft per-brand issues, if any, do not fail job)
+) else (
+    echo [INFO] Overall status: HARD FAILURE code %FINAL_EXIT%
+)
+
 call :ReturnFinalExit
 
 REM ---------------------------------------------------------------------------
@@ -186,6 +217,10 @@ REM    %3 - destination output directory under %OUT%
 REM    %4 - log file path under %LOGS%
 REM ---------------------------------------------------------------------------
 :RunScraper
+if "%~1"=="" (
+    echo [WARN] RunScraper called with no arguments. Skipping.
+    exit /b 0
+)
 setlocal EnableExtensions EnableDelayedExpansion
 set "SCRAPER_NAME=%~1"
 set "SCRIPT=%~2"
