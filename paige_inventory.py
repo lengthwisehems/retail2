@@ -719,6 +719,16 @@ class PDPBrowserExtractor:
                 locale="en-US",
                 viewport={"width": 1366, "height": 1800},
             )
+            # Block images, fonts, and media so page navigation finishes faster on
+            # server environments (Azure App Service) where CPU/bandwidth are limited.
+            # We only need the DOM and JS; images/fonts add nothing to measurement
+            # or stretch extraction.
+            self._context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font"}
+                else route.continue_(),
+            )
             self._page = self._context.new_page()
             self._page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
