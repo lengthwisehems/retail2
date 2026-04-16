@@ -718,11 +718,14 @@ def derive_stretch_from_algolia_attrs(denim_fabric: str, stretch_attr: str) -> s
 
 
 class PDPBrowserExtractor:
-    """Browser-driven PDP extractor for Headless UI DETAILS panels.
+    """Browser-driven PDP extractor for HeadlessUI DETAILS panels.
 
-    Uses thread-local Playwright instances so multiple worker threads can run
-    concurrent page fetches without sharing browser state.  Each thread that
-    calls fetch() initialises its own Chromium process on first use.
+    Uses a single shared Chromium process with a fresh browser context created
+    for every fetch() call.  This prevents a dead/blocked context from cascading
+    into silent failures for all subsequent handles — the previous design reused
+    one thread-local page, so a TargetClosedError on handle N caused handles
+    N+1…end to fail silently because _thread_ensure() saw page is not None and
+    returned True without noticing the page was already dead.
     """
 
     _LAUNCH_ARGS = [
@@ -736,16 +739,14 @@ class PDPBrowserExtractor:
     def __init__(self) -> None:
         self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
         self.headless = os.getenv("PAIGE_PDP_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-        # Number of concurrent browser worker threads.
-        self._workers: int = max(1, int(os.getenv("PAIGE_PDP_BROWSER_WORKERS", "3")))
-        # Thread-local storage: each worker thread owns its own Playwright instance.
-        self._local = threading.local()
-        # Global playwright-importability flag checked once.
+        self._workers: int = max(1, int(os.getenv("PAIGE_PDP_BROWSER_WORKERS", "2")))
         self._playwright_importable: Optional[bool] = None
         self._import_lock = threading.Lock()
-        # All (pw, browser, ctx) tuples created, collected for cleanup.
-        self._resources: List[tuple] = []
-        self._resources_lock = threading.Lock()
+        # Single shared browser (thread-safe: Playwright allows concurrent contexts).
+        self._pw = None
+        self._browser = None
+        self._browser_lock = threading.Lock()
+        self._init_failed = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -765,56 +766,32 @@ class PDPBrowserExtractor:
                 self._playwright_importable = False
         return self._playwright_importable
 
-    def _thread_ensure(self) -> bool:
-        """Initialise a Chromium page for the calling thread if not already done."""
+    def _ensure_browser(self) -> bool:
+        """Launch the shared Chromium browser if not already running."""
         if not self.enabled or not self._playwright_available():
             return False
-        if getattr(self._local, "init_failed", False):
+        if self._init_failed:
             return False
-        if getattr(self._local, "page", None) is not None:
+        if self._browser is not None:
             return True
-        try:
-            from playwright.sync_api import sync_playwright
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=self.headless, args=self._LAUNCH_ARGS)
-            ctx = browser.new_context(
-                ignore_https_errors=True,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                locale="en-US",
-                # Smaller viewport → less content to render → faster load.
-                viewport={"width": 1366, "height": 768},
-            )
-            # Block images, fonts, media, and stylesheets.  We only need the
-            # DOM and JavaScript; none of these assets affect measurement or
-            # stretch extraction.
-            ctx.route(
-                "**/*",
-                lambda route: route.abort()
-                if route.request.resource_type in self._BLOCKED_TYPES
-                else route.continue_(),
-            )
-            page = ctx.new_page()
-            page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            # Warm-up: visit the site homepage so CDN connections are open.
+        with self._browser_lock:
+            if self._browser is not None:
+                return True
+            if self._init_failed:
+                return False
             try:
-                page.goto(PDP_HOST, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(250)
-            except Exception:
-                pass
-            self._local.page = page
-            with self._resources_lock:
-                self._resources.append((pw, browser, ctx))
-            return True
-        except Exception as exc:
-            log(f"Playwright launch failed (thread {threading.get_ident()}): {exc}")
-            self._local.init_failed = True
-            return False
+                from playwright.sync_api import sync_playwright
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(
+                    headless=self.headless,
+                    args=self._LAUNCH_ARGS,
+                )
+                log(f"Playwright Chromium launched (headless={self.headless})")
+                return True
+            except Exception as exc:
+                log(f"Playwright launch failed: {exc}")
+                self._init_failed = True
+                return False
 
     @staticmethod
     def _dismiss_overlays(page: object) -> None:
@@ -836,204 +813,228 @@ class PDPBrowserExtractor:
 
     def fetch(self, handle: str) -> Dict[str, str]:
         _empty: Dict[str, str] = {"details": "", "stretch": "", "description": ""}
-        if not self._thread_ensure():
+        if not self._ensure_browser():
+            log(f"PDP browser {handle} | SKIP: browser unavailable")
             return _empty
-        page = self._local.page
+
         url = f"{PDP_HOST}/products/{handle}"
         start = time.time()
-
-        # Optional hard cap per page (useful on Azure where network is slow).
-        # Set PAIGE_PDP_FETCH_TIMEOUT_S=15 in Azure App Settings to bail fast.
         _page_timeout_s = float(os.getenv("PAIGE_PDP_FETCH_TIMEOUT_S", "0") or "0")
 
+        # Fresh context per fetch: clears cookies/state so a blocked prior page
+        # cannot cascade into failures here.
+        ctx = None
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        except Exception:
+            ctx = self._browser.new_context(  # type: ignore[union-attr]
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1366, "height": 768},
+            )
+            ctx.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in self._BLOCKED_TYPES
+                else route.continue_(),
+            )
+            page = ctx.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        except Exception as exc:
+            log(f"PDP browser {handle} | context error: {type(exc).__name__}: {str(exc)[:80]}")
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
             return _empty
 
-        if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
-            return _empty
+        try:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception as exc:
+                log(f"PDP browser {handle} | goto FAIL ({type(exc).__name__}): {str(exc)[:100]}")
+                return _empty
 
-        # Checkpoint detection — wrap page.title() in try/except because the
-        # execution context is destroyed if the page navigates mid-call.
-        checkpoint_seen = False
-        for _ in range(5):
+            if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
+                log(f"PDP browser {handle} | timeout after goto ({time.time()-start:.1f}s)")
+                return _empty
+
+            # Detect bot-check / access-denied pages early.
             try:
                 page_title = (page.title() or "").lower()
-            except Exception:
-                break
-            if "checkpoint" not in page_title:
-                break
-            checkpoint_seen = True
-            page.wait_for_timeout(400)
-
-        if checkpoint_seen:
-            still_cp = False
-            try:
-                still_cp = "checkpoint" in (page.title() or "").lower()
+                if "checkpoint" in page_title or "access denied" in page_title or "blocked" in page_title:
+                    log(f"PDP browser {handle} | blocked page detected: {page_title!r}")
+                    return _empty
             except Exception:
                 pass
-            if still_cp:
+
+            self._dismiss_overlays(page)
+
+            # Wait for React to hydrate before interacting with HeadlessUI.
+            # HeadlessUI sets data-headlessui-state on its buttons only after hydration.
+            try:
+                page.wait_for_selector(
+                    "[data-headlessui-state]", timeout=7000, state="attached"
+                )
+            except Exception:
+                pass  # Continue anyway — page may not use HeadlessUI
+
+            if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
+                log(f"PDP browser {handle} | timeout after hydration wait")
+                return _empty
+
+            details_text = ""
+            try:
+                btn = page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
+                if btn.count() == 0:
+                    btn = page.locator("button:has-text('DETAILS')")
+                if btn.count():
+                    try:
+                        expanded = btn.first.get_attribute("aria-expanded", timeout=500)
+                    except Exception:
+                        expanded = None
+                    if expanded != "true":
+                        try:
+                            btn.first.click(timeout=1500)
+                        except Exception:
+                            try:
+                                btn.first.click(timeout=1500, force=True)
+                            except Exception:
+                                pass
+                    # Wait for the HeadlessUI panel to become visible after the click.
+                    try:
+                        page.locator(
+                            "[id^='headlessui-disclosure-panel-']"
+                        ).first.wait_for(state="visible", timeout=3000)
+                    except Exception:
+                        page.wait_for_timeout(300)
+
+                # Primary extraction: JavaScript search across the full DOM.
+                # Works for HeadlessUI v1 (panel in DOM after click) and v2 (always in DOM).
                 try:
-                    page.reload(wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(500)
+                    js_result = page.evaluate(
+                        """() => {
+                            var keys = ['front rise', 'inseam', 'leg opening', 'stretch'];
+                            var found = [];
+                            document.querySelectorAll('li, dd, td').forEach(function(el) {
+                                var t = (el.textContent || '').trim();
+                                var tl = t.toLowerCase();
+                                if (t.length > 3 && t.length < 200
+                                        && keys.some(function(k) { return tl.indexOf(k) !== -1; })) {
+                                    found.push(t.replace(/\\s+/g, ' '));
+                                }
+                            });
+                            var seen = {};
+                            return found.filter(function(x) {
+                                if (seen[x]) return false;
+                                seen[x] = true;
+                                return true;
+                            }).join(', ');
+                        }"""
+                    ) or ""
+                    if js_result:
+                        details_text = js_result
                 except Exception:
                     pass
 
-        self._dismiss_overlays(page)
+                # Fallback: strict CSS selector on HeadlessUI panel children.
+                if not details_text:
+                    detail_nodes = page.locator(PDP_SELECTOR)
+                    count = detail_nodes.count()
+                    if count:
+                        items = []
+                        for i in range(count):
+                            try:
+                                text = detail_nodes.nth(i).inner_text(timeout=600).strip()
+                            except Exception:
+                                continue
+                            if text:
+                                items.append(re.sub(r"\s+", " ", text))
+                        details_text = ", ".join(items)
 
-        # Wait for React to hydrate before interacting with HeadlessUI.
-        # HeadlessUI sets data-headlessui-state on its buttons only after hydration —
-        # clicking before this point fires the DOM click but the event handler is
-        # not yet attached, so the panel never opens.
-        try:
-            page.wait_for_selector(
-                "[data-headlessui-state]", timeout=6000, state="attached"
-            )
-        except Exception:
-            pass  # Continue anyway — page may not use HeadlessUI
-
-        if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
-            return _empty
-
-        details_text = ""
-        try:
-            btn = page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
-            if btn.count() == 0:
-                btn = page.locator("button:has-text('DETAILS')")
-            if btn.count():
-                try:
-                    expanded = btn.first.get_attribute("aria-expanded", timeout=500)
-                except Exception:
-                    expanded = None
-                if expanded != "true":
-                    try:
-                        btn.first.click(timeout=1500)
-                    except Exception:
+                # Second fallback: read the entire panel element.
+                if not details_text:
+                    panel = page.locator("[id^='headlessui-disclosure-panel-']").first
+                    if panel.count():
                         try:
-                            btn.first.click(timeout=1500, force=True)
+                            raw = panel.inner_text(timeout=1500).strip()
+                            if raw:
+                                details_text = re.sub(r"\s+", " ", raw)
                         except Exception:
                             pass
-                # Wait for the HeadlessUI panel to become visible after the click.
-                try:
-                    page.locator(
-                        "[id^='headlessui-disclosure-panel-']"
-                    ).first.wait_for(state="visible", timeout=3000)
-                except Exception:
-                    page.wait_for_timeout(300)
+            except Exception:
+                details_text = ""
 
-            # Primary extraction: JavaScript search across the full DOM.
-            # Works for HeadlessUI v1 (panel in DOM after click) and v2 (always in DOM).
+            stretch = ""
             try:
-                js_result = page.evaluate(
+                idx = page.evaluate(
                     """() => {
-                        var keys = ['front rise', 'inseam', 'leg opening', 'stretch'];
-                        var found = [];
-                        document.querySelectorAll('li, dd, td').forEach(function(el) {
-                            var t = (el.textContent || '').trim();
-                            var tl = t.toLowerCase();
-                            if (t.length > 3 && t.length < 200
-                                    && keys.some(function(k) { return tl.indexOf(k) !== -1; })) {
-                                found.push(t.replace(/\\s+/g, ' '));
-                            }
-                        });
-                        var seen = {};
-                        return found.filter(function(x) {
-                            if (seen[x]) return false;
-                            seen[x] = true;
-                            return true;
-                        }).join(', ');
+                      const allDivs = Array.from(document.querySelectorAll('div'));
+                      const activeDot = allDivs.find(el => {
+                        const cls = (el.className || '').toString().toLowerCase();
+                        return cls.includes('dot') && cls.includes('active');
+                      });
+                      if (!activeDot) return null;
+                      const parent = activeDot.parentElement;
+                      if (!parent) return null;
+                      const dotSiblings = Array.from(parent.children).filter(node => {
+                        const cls = (node.className || '').toString().toLowerCase();
+                        return cls.includes('dot');
+                      });
+                      const pos = dotSiblings.indexOf(activeDot) + 1;
+                      return pos > 0 ? pos : null;
                     }"""
-                ) or ""
-                if js_result:
-                    details_text = js_result
+                )
+                if idx is not None:
+                    stretch = {
+                        1: "High Stretch",
+                        2: "Medium to High Stretch",
+                        3: "Medium Stretch",
+                        4: "Low Stretch",
+                        5: "Rigid",
+                    }.get(int(idx), "")
+            except Exception:
+                stretch = ""
+
+            description_text = ""
+            try:
+                desc_node = page.locator(
+                    "div[class*='productDescription'], div[class*='description'] p"
+                ).first
+                if desc_node.count():
+                    description_text = re.sub(
+                        r"\s+", " ", desc_node.inner_text(timeout=600)
+                    ).strip()
+            except Exception:
+                description_text = ""
+
+            elapsed = time.time() - start
+            log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
+            return {"details": details_text, "stretch": stretch, "description": description_text}
+
+        finally:
+            try:
+                ctx.close()
             except Exception:
                 pass
 
-            # Fallback: strict CSS selector on HeadlessUI panel children.
-            if not details_text:
-                detail_nodes = page.locator(PDP_SELECTOR)
-                count = detail_nodes.count()
-                if count:
-                    items = []
-                    for i in range(count):
-                        try:
-                            text = detail_nodes.nth(i).inner_text(timeout=600).strip()
-                        except Exception:
-                            continue
-                        if text:
-                            items.append(re.sub(r"\s+", " ", text))
-                    details_text = ", ".join(items)
-
-            # Second fallback: read the entire panel element.
-            if not details_text:
-                panel = page.locator("[id^='headlessui-disclosure-panel-']").first
-                if panel.count():
-                    try:
-                        raw = panel.inner_text(timeout=1500).strip()
-                        if raw:
-                            details_text = re.sub(r"\s+", " ", raw)
-                    except Exception:
-                        pass
-        except Exception:
-            details_text = ""
-
-        stretch = ""
-        try:
-            idx = page.evaluate(
-                """() => {
-                  const allDivs = Array.from(document.querySelectorAll('div'));
-                  const activeDot = allDivs.find(el => {
-                    const cls = (el.className || '').toString().toLowerCase();
-                    return cls.includes('dot') && cls.includes('active');
-                  });
-                  if (!activeDot) return null;
-                  const parent = activeDot.parentElement;
-                  if (!parent) return null;
-                  const dotSiblings = Array.from(parent.children).filter(node => {
-                    const cls = (node.className || '').toString().toLowerCase();
-                    return cls.includes('dot');
-                  });
-                  const pos = dotSiblings.indexOf(activeDot) + 1;
-                  return pos > 0 ? pos : null;
-                }"""
-            )
-            if idx is not None:
-                stretch = {
-                    1: "High Stretch",
-                    2: "Medium to High Stretch",
-                    3: "Medium Stretch",
-                    4: "Low Stretch",
-                    5: "Rigid",
-                }.get(int(idx), "")
-        except Exception:
-            stretch = ""
-
-        description_text = ""
-        try:
-            desc_node = page.locator(
-                "div[class*='productDescription'], div[class*='description'] p"
-            ).first
-            if desc_node.count():
-                description_text = re.sub(
-                    r"\s+", " ", desc_node.inner_text(timeout=600)
-                ).strip()
-        except Exception:
-            description_text = ""
-
-        elapsed = time.time() - start
-        log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
-        return {"details": details_text, "stretch": stretch, "description": description_text}
-
     def close(self) -> None:
-        with self._resources_lock:
-            for pw, browser, ctx in self._resources:
-                for obj, method in ((ctx, "close"), (browser, "close"), (pw, "stop")):
-                    try:
-                        getattr(obj, method)()
-                    except Exception:
-                        pass
-            self._resources.clear()
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
 
 
 class PaigeScraper:
@@ -1057,23 +1058,19 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
-        self._browser_precache: Dict[str, Dict[str, str]] = {}
         self.browser_extractor = PDPBrowserExtractor()
 
     def _prefetch_http_concurrent(self, handles: List[str], seed_by_handle: Dict[str, str]) -> None:
-        """Pre-fetch tier 1+2 (HTTP only, no browser) for all handles concurrently.
-
-        Uses a pool of lightweight requests threads so 335 handles finish in ~90 seconds
-        instead of being processed serially in the main loop.
-        """
+        """Pre-fetch tier 1+2 (HTTP only, no browser) for all handles concurrently."""
         todo = [h for h in handles if h and h not in self._pdp_cache]
         if not todo:
             return
-        workers = max(1, int(os.getenv("PAIGE_PDP_HTTP_WORKERS", "8")))
+        # 4 workers: aggressive enough to be fast, conservative enough to avoid
+        # triggering Cloudflare rate-limiting that would then block the browser phase.
+        workers = max(1, int(os.getenv("PAIGE_PDP_HTTP_WORKERS", "4")))
         log(f"Pre-fetching {len(todo)} PDP handles via HTTP ({workers} workers)…")
         start = time.time()
 
-        # Temporarily suppress browser so fetch_pdp_fields only runs tiers 1+2.
         _was_enabled = self.browser_extractor.enabled
         self.browser_extractor.enabled = False
 
@@ -1093,17 +1090,38 @@ class PaigeScraper:
         cached = sum(1 for h in todo if h in self._pdp_cache)
         log(f"HTTP pre-fetch complete: {cached}/{len(todo)} handles cached in {elapsed:.1f}s")
 
-    def _apply_browser_precache(self) -> None:
-        """Merge browser pre-fetch results into pdp_cache.
+    def _prefetch_browser_concurrent(self, handles: List[str]) -> None:
+        """Pre-fetch browser data for handles missing measurements, then merge into pdp_cache.
 
-        _prefetch_http_concurrent populates _pdp_cache with HTTP-only data that
-        typically has no rise or leg_opening.  _prefetch_browser_concurrent then
-        fills _browser_precache with the DETAILS panel text.  This method merges
-        the two so the main loop sees complete measurements without re-running
-        fetch_pdp_fields (which would short-circuit at the cache check).
+        Results are merged immediately after all fetches complete so the main loop
+        reads complete (HTTP + browser) data from _pdp_cache without re-fetching.
         """
+        if not self.browser_extractor.enabled:
+            return
+        todo = [h for h in handles if h]
+        if not todo:
+            return
+        workers = self.browser_extractor._workers
+        log(f"Pre-fetching {len(todo)} PDP handles via browser ({workers} workers)…")
+        start = time.time()
+
+        def _fetch_one(handle: str) -> Tuple[str, Dict[str, str]]:
+            try:
+                return handle, self.browser_extractor.fetch(handle)
+            except Exception as exc:
+                log(f"Pre-fetch browser error for {handle}: {exc}")
+                return handle, {}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results: List[Tuple[str, Dict[str, str]]] = list(pool.map(_fetch_one, todo))
+
+        elapsed = time.time() - start
+        per_page = elapsed / len(todo) if todo else 0.0
+        log(f"Browser pre-fetch complete: {len(todo)} handles in {elapsed:.1f}s ({per_page:.2f}s/page)")
+
+        # Merge browser results into pdp_cache (single-threaded, no race conditions).
         merged = 0
-        for handle, browser_data in self._browser_precache.items():
+        for handle, browser_data in results:
             cached = self._pdp_cache.get(handle)
             if cached is None:
                 continue
@@ -1112,7 +1130,6 @@ class PaigeScraper:
             browser_stretch = browser_data.get("stretch", "")
             if not (browser_details or browser_desc or browser_stretch):
                 continue
-            # Mirrors fetch_pdp_fields browser-tier logic exactly.
             parts: List[str] = []
             if browser_desc:
                 parts.append(browser_desc)
@@ -1141,32 +1158,6 @@ class PaigeScraper:
                 merged += 1
         if merged:
             log(f"Applied browser measurements to {merged} handles in pdp_cache")
-
-    def _prefetch_browser_concurrent(self, handles: List[str]) -> None:
-        """Pre-fetch browser data for all handles concurrently before the main loop."""
-        if not self.browser_extractor.enabled:
-            return
-        todo = [h for h in handles if h and h not in self._browser_precache]
-        if not todo:
-            return
-        workers = self.browser_extractor._workers
-        log(f"Pre-fetching {len(todo)} PDP handles via browser ({workers} workers)…")
-        start = time.time()
-
-        def _fetch_one(handle: str) -> Tuple[str, Dict[str, str]]:
-            try:
-                return handle, self.browser_extractor.fetch(handle)
-            except Exception as exc:
-                log(f"Pre-fetch browser error for {handle}: {exc}")
-                return handle, {}
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for handle, result in pool.map(_fetch_one, todo):
-                self._browser_precache[handle] = result
-
-        elapsed = time.time() - start
-        per_page = elapsed / len(todo) if todo else 0.0
-        log(f"Browser pre-fetch complete: {len(todo)} handles in {elapsed:.1f}s ({per_page:.2f}s/page)")
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
         response = self.session.post(
@@ -1398,7 +1389,7 @@ class PaigeScraper:
 
         # Browser-driven fallback for Headless UI DETAILS disclosure.
         if not (rise and inseam and leg_opening):
-            browser_data = self._browser_precache.get(handle) or self.browser_extractor.fetch(handle)
+            browser_data = self.browser_extractor.fetch(handle)
             browser_desc = browser_data.get("description", "")
             browser_details = browser_data.get("details", "")
             if browser_desc:
@@ -1478,16 +1469,15 @@ class PaigeScraper:
                 _sd = ", ".join(dedupe_description_parts([_sd, _at]))
             _seed_by_handle[_h] = _sd
 
-        # Phase 1: fast HTTP pre-fetch (tier 1 + tier 2) — ~90s for 335 handles.
+        # Phase 1: HTTP pre-fetch (tiers 1+2) — fills inseam for ~30% of handles.
         self._prefetch_http_concurrent(_prefetch_handles, _seed_by_handle)
 
-        # Phase 2: browser pre-fetch only for handles still missing measurements.
+        # Phase 2: browser pre-fetch for handles still missing rise or leg_opening.
         _browser_todo = [
             h for h in _prefetch_handles
             if not all(self._pdp_cache.get(h, {}).get(k) for k in ("rise", "inseam", "leg_opening"))
         ]
         self._prefetch_browser_concurrent(_browser_todo)
-        self._apply_browser_precache()
         # ─────────────────────────────────────────────────────────────────────
 
         for idx, style in enumerate(styles, start=1):
