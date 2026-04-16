@@ -24,17 +24,17 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "paige"
+BRAND = "Pistola"
 COLLECTION_URL = [
-    "https://paige.com/collection/women-denim",
+    "https://www.pistoladenim.com/collections/all-denim",
 ]
-MYSHOPIFY = "paige-7873.myshopify.com"
-GRAPHQL = "https://paige-7873.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["383d494a76122b5e6cadffc2c7667ef2"]
+MYSHOPIFY = "pistola-denim.myshopify.com"
+GRAPHQL = "https://pistola-denim.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["234bc5fb0739b70c70baf489a06352ba"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["women-denim"]
-ALGOLIA_APP_ID = "DK4YY42827"
-ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["all-denim"]
+ALGOLIA_APP_ID = ""
+ALGOLIA_API_KEY = ""
 ALGOLIA_INDEX = "production_products"
 ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
 ALGOLIA_EXTRA_PARAMS: Dict[str, Any] = {}
@@ -43,33 +43,29 @@ ALGOLIA_HITS_PER_PAGE = 1000
 ALGOLIA_DISTINCT = "true"
 ALGOLIA_DISTINCT_PASSES: List[str] = ["true", "false"]
 METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = [
-    ("custom", "colorVariants"),
-    ("custom", "inseamVariants"),
-    ("custom", "fitVariants"),
-    ("custom", "fabricationVariants"),
-    ("custom", "shopTheLook"),
-    ("custom", "specs"),
+    ("custom", "connected_products"),
+    ("seed", "color_image"),
+    ("seed", "color_image"),
+    ("shopify", "age-group"),
     ("custom", "fit"),
-    ("custom", "rise"),
-    ("custom", "denimFabric"),
-    ("custom", "gender"),
-    ("custom", "categoryPrimary"),
-    ("custom", "sizeType"),
-    ("custom", "sku"),
-    ("custom", "stretch"),
-    ("custom", "styleContent"),
-    ("custom", "color"),
-    ("custom", "colorCategory"),
-    ("custom", "colorCategory2"),
-    ("custom", "dressLength"),
-    ("custom", "wash"),
-    ("custom", "closure"),
-    ("custom", "sleeveLength"),
-    ("custom", "length"),
-    ("custom", "clothingType"),
-    ("custom", "clothingFamily"),
-    ("custom", "category"),
+    ("shopify", "waist-rise"),
+    ("shopify", "target-gender"),
+    ("shopify", "size"),
+    ("shopify", "color-pattern"),
+    ("shopify", "fabric"),
     ("custom", "productType"),
+    ("mm-google-shopping","age_group"),
+    ("product","launch_date"),
+    ("product","season_code"),
+    ("reviews","rating"),
+    ("reviews","rating_count"),
+    ("yotop","reviews_count"),
+    ("yotop","reviews_average"),
+    ("global","style"),
+    ("info","tab1"),
+    ("info","tab2"),
+    ("mc-facebook","google_product_category"),
+    ("swym_wishlist","wishlist_social_count"),
 ]
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
 VIEW_JSON_ENRICHMENT_ENABLED = False
