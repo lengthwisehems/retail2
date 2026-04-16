@@ -508,6 +508,46 @@ def extract_pdp_description(html_text: str) -> str:
     return ""
 
 
+def extract_next_data_description(html_text: str) -> str:
+    """Extract product description from Next.js __NEXT_DATA__ JSON embedded in the page.
+
+    Paige's headless Shopify + Next.js site embeds server-rendered product data in a
+    <script id="__NEXT_DATA__"> tag.  This data often includes the full product
+    description (body_html / descriptionHtml) with measurement details that are not
+    available in the Shopify JSON endpoint or in the rendered static HTML elements.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    script = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script or not script.string:
+        return ""
+    try:
+        data = json.loads(script.string)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+
+    measurement_keywords = ("front rise", "inseam", "leg opening", "stretch")
+    candidates: List[str] = []
+
+    def _search(obj: object, depth: int = 0) -> None:
+        if depth > 20:
+            return
+        if isinstance(obj, str) and len(obj) < 8000:
+            text = strip_html_text(obj) if "<" in obj else obj
+            if any(k in text.lower() for k in measurement_keywords):
+                candidates.append(text)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _search(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _search(item, depth + 1)
+
+    _search(data)
+    if candidates:
+        return ", ".join(dict.fromkeys(c for c in candidates if c))
+    return ""
+
+
 def parse_mixed_fraction(raw_value: str) -> Optional[float]:
     value = raw_value.strip().replace("″", "").replace('"', "")
     if not value:
@@ -805,7 +845,15 @@ class PDPBrowserExtractor:
                         btn.first.click(timeout=1200)
                     except Exception:
                         btn.first.click(timeout=1200, force=True)
-                self._page.wait_for_timeout(120)
+                # Wait for the HeadlessUI panel to be attached to the DOM rather than a
+                # fixed delay; on Azure's slower CPU the 120 ms was often not enough for
+                # React to finish rendering the panel after the click.
+                try:
+                    self._page.locator(
+                        "[id^='headlessui-disclosure-panel-']"
+                    ).first.wait_for(state="attached", timeout=1800)
+                except Exception:
+                    self._page.wait_for_timeout(300)
 
             detail_nodes = self._page.locator(PDP_SELECTOR)
             count = detail_nodes.count()
@@ -816,6 +864,17 @@ class PDPBrowserExtractor:
                     if text:
                         items.append(re.sub(r"\s+", " ", text))
                 details_text = ", ".join(items)
+            else:
+                # Fallback: read the entire panel's text when the strict child selector
+                # does not match (e.g. the markup has a different nesting depth).
+                panel = self._page.locator("[id^='headlessui-disclosure-panel-']").first
+                if panel.count():
+                    try:
+                        raw = panel.inner_text(timeout=1200).strip()
+                        if raw:
+                            details_text = re.sub(r"\s+", " ", raw)
+                    except Exception:
+                        pass
         except Exception:
             details_text = ""
 
@@ -1125,11 +1184,18 @@ class PaigeScraper:
                 response = self.session.get(url, timeout=20, allow_redirects=True)
                 response.raise_for_status()
                 details_description = extract_pdp_description(response.text)
+                next_data_desc = extract_next_data_description(response.text)
                 stretch_from_html = extract_stretch_from_html(response.text)
                 if stretch_from_html:
                     stretch = normalize_stretch_value(stretch_from_html)
+                added = False
                 if details_description:
                     description_parts.append(details_description)
+                    added = True
+                if next_data_desc:
+                    description_parts.append(next_data_desc)
+                    added = True
+                if added:
                     description = ", ".join(dedupe_description_parts(description_parts))
                     rise = extract_measurement(description, ["Front Rise", "Rise"])
                     inseam = extract_measurement(description, ["Inseam", "Inleg"])
