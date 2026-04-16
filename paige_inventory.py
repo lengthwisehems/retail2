@@ -842,9 +842,16 @@ class PDPBrowserExtractor:
         url = f"{PDP_HOST}/products/{handle}"
         start = time.time()
 
+        # Optional hard cap per page (useful on Azure where network is slow).
+        # Set PAIGE_PDP_FETCH_TIMEOUT_S=15 in Azure App Settings to bail fast.
+        _page_timeout_s = float(os.getenv("PAIGE_PDP_FETCH_TIMEOUT_S", "0") or "0")
+
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
         except Exception:
+            return _empty
+
+        if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
             return _empty
 
         # Checkpoint detection — wrap page.title() in try/except because the
@@ -875,6 +882,20 @@ class PDPBrowserExtractor:
 
         self._dismiss_overlays(page)
 
+        # Wait for React to hydrate before interacting with HeadlessUI.
+        # HeadlessUI sets data-headlessui-state on its buttons only after hydration —
+        # clicking before this point fires the DOM click but the event handler is
+        # not yet attached, so the panel never opens.
+        try:
+            page.wait_for_selector(
+                "[data-headlessui-state]", timeout=6000, state="attached"
+            )
+        except Exception:
+            pass  # Continue anyway — page may not use HeadlessUI
+
+        if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
+            return _empty
+
         details_text = ""
         try:
             btn = page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
@@ -887,35 +908,65 @@ class PDPBrowserExtractor:
                     expanded = None
                 if expanded != "true":
                     try:
-                        btn.first.click(timeout=1200)
+                        btn.first.click(timeout=1500)
                     except Exception:
                         try:
-                            btn.first.click(timeout=1200, force=True)
+                            btn.first.click(timeout=1500, force=True)
                         except Exception:
                             pass
                 # Wait for the HeadlessUI panel to become visible after the click.
                 try:
                     page.locator(
                         "[id^='headlessui-disclosure-panel-']"
-                    ).first.wait_for(state="visible", timeout=2000)
+                    ).first.wait_for(state="visible", timeout=3000)
                 except Exception:
                     page.wait_for_timeout(300)
 
-            detail_nodes = page.locator(PDP_SELECTOR)
-            count = detail_nodes.count()
-            if count:
-                items = []
-                for i in range(count):
-                    try:
-                        text = detail_nodes.nth(i).inner_text(timeout=600).strip()
-                    except Exception:
-                        continue
-                    if text:
-                        items.append(re.sub(r"\s+", " ", text))
-                details_text = ", ".join(items)
-            else:
-                # Fallback: read the entire panel text when the strict child
-                # selector does not match (e.g. different nesting depth).
+            # Primary extraction: JavaScript search across the full DOM.
+            # Works for HeadlessUI v1 (panel in DOM after click) and v2 (always in DOM).
+            try:
+                js_result = page.evaluate(
+                    """() => {
+                        var keys = ['front rise', 'inseam', 'leg opening', 'stretch'];
+                        var found = [];
+                        document.querySelectorAll('li, dd, td').forEach(function(el) {
+                            var t = (el.textContent || '').trim();
+                            var tl = t.toLowerCase();
+                            if (t.length > 3 && t.length < 200
+                                    && keys.some(function(k) { return tl.indexOf(k) !== -1; })) {
+                                found.push(t.replace(/\\s+/g, ' '));
+                            }
+                        });
+                        var seen = {};
+                        return found.filter(function(x) {
+                            if (seen[x]) return false;
+                            seen[x] = true;
+                            return true;
+                        }).join(', ');
+                    }"""
+                ) or ""
+                if js_result:
+                    details_text = js_result
+            except Exception:
+                pass
+
+            # Fallback: strict CSS selector on HeadlessUI panel children.
+            if not details_text:
+                detail_nodes = page.locator(PDP_SELECTOR)
+                count = detail_nodes.count()
+                if count:
+                    items = []
+                    for i in range(count):
+                        try:
+                            text = detail_nodes.nth(i).inner_text(timeout=600).strip()
+                        except Exception:
+                            continue
+                        if text:
+                            items.append(re.sub(r"\s+", " ", text))
+                    details_text = ", ".join(items)
+
+            # Second fallback: read the entire panel element.
+            if not details_text:
                 panel = page.locator("[id^='headlessui-disclosure-panel-']").first
                 if panel.count():
                     try:
@@ -1008,6 +1059,39 @@ class PaigeScraper:
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
         self._browser_precache: Dict[str, Dict[str, str]] = {}
         self.browser_extractor = PDPBrowserExtractor()
+
+    def _prefetch_http_concurrent(self, handles: List[str], seed_by_handle: Dict[str, str]) -> None:
+        """Pre-fetch tier 1+2 (HTTP only, no browser) for all handles concurrently.
+
+        Uses a pool of lightweight requests threads so 335 handles finish in ~90 seconds
+        instead of being processed serially in the main loop.
+        """
+        todo = [h for h in handles if h and h not in self._pdp_cache]
+        if not todo:
+            return
+        workers = max(1, int(os.getenv("PAIGE_PDP_HTTP_WORKERS", "8")))
+        log(f"Pre-fetching {len(todo)} PDP handles via HTTP ({workers} workers)…")
+        start = time.time()
+
+        # Temporarily suppress browser so fetch_pdp_fields only runs tiers 1+2.
+        _was_enabled = self.browser_extractor.enabled
+        self.browser_extractor.enabled = False
+
+        def _fetch_one(handle: str) -> None:
+            try:
+                self.fetch_pdp_fields(handle, seed_by_handle.get(handle, ""))
+            except Exception as exc:
+                log(f"HTTP pre-fetch error for {handle}: {exc}")
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_fetch_one, todo))
+        finally:
+            self.browser_extractor.enabled = _was_enabled
+
+        elapsed = time.time() - start
+        cached = sum(1 for h in todo if h in self._pdp_cache)
+        log(f"HTTP pre-fetch complete: {cached}/{len(todo)} handles cached in {elapsed:.1f}s")
 
     def _prefetch_browser_concurrent(self, handles: List[str]) -> None:
         """Pre-fetch browser data for all handles concurrently before the main loop."""
@@ -1322,7 +1406,7 @@ class PaigeScraper:
             styles = self.fetch_styles()
             use_graphql = False
 
-        # ── Concurrent browser pre-fetch before the serial main loop ─────────
+        # ── Concurrent pre-fetch: HTTP tier 1+2, then browser for gaps ──────
         _seen_pf: set = set()
         _prefetch_handles: List[str] = []
         for _s in styles:
@@ -1330,7 +1414,30 @@ class PaigeScraper:
             if _h and _h in collection_handles and _h not in _seen_pf:
                 _seen_pf.add(_h)
                 _prefetch_handles.append(_h)
-        self._prefetch_browser_concurrent(_prefetch_handles)
+
+        # Build per-handle seed descriptions (mirrors logic in the main loop).
+        _seed_by_handle: Dict[str, str] = {}
+        for _s in styles:
+            _h = _s.get("handle", "")
+            if not _h:
+                continue
+            _sd = safe_string(_s.get("description", "")) if use_graphql else ""
+            _as = algolia_style_map.get(_h, {})
+            _ab = safe_string(_as.get("body_html_safe", ""))
+            if _ab:
+                _at = strip_html_text(_ab)
+                _sd = ", ".join(dedupe_description_parts([_sd, _at]))
+            _seed_by_handle[_h] = _sd
+
+        # Phase 1: fast HTTP pre-fetch (tier 1 + tier 2) — ~90s for 335 handles.
+        self._prefetch_http_concurrent(_prefetch_handles, _seed_by_handle)
+
+        # Phase 2: browser pre-fetch only for handles still missing measurements.
+        _browser_todo = [
+            h for h in _prefetch_handles
+            if not all(self._pdp_cache.get(h, {}).get(k) for k in ("rise", "inseam", "leg_opening"))
+        ]
+        self._prefetch_browser_concurrent(_browser_todo)
         # ─────────────────────────────────────────────────────────────────────
 
         for idx, style in enumerate(styles, start=1):
