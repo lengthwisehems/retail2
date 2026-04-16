@@ -1093,6 +1093,55 @@ class PaigeScraper:
         cached = sum(1 for h in todo if h in self._pdp_cache)
         log(f"HTTP pre-fetch complete: {cached}/{len(todo)} handles cached in {elapsed:.1f}s")
 
+    def _apply_browser_precache(self) -> None:
+        """Merge browser pre-fetch results into pdp_cache.
+
+        _prefetch_http_concurrent populates _pdp_cache with HTTP-only data that
+        typically has no rise or leg_opening.  _prefetch_browser_concurrent then
+        fills _browser_precache with the DETAILS panel text.  This method merges
+        the two so the main loop sees complete measurements without re-running
+        fetch_pdp_fields (which would short-circuit at the cache check).
+        """
+        merged = 0
+        for handle, browser_data in self._browser_precache.items():
+            cached = self._pdp_cache.get(handle)
+            if cached is None:
+                continue
+            browser_details = browser_data.get("details", "")
+            browser_desc = browser_data.get("description", "")
+            browser_stretch = browser_data.get("stretch", "")
+            if not (browser_details or browser_desc or browser_stretch):
+                continue
+            # Mirrors fetch_pdp_fields browser-tier logic exactly.
+            parts: List[str] = []
+            if browser_desc:
+                parts.append(browser_desc)
+            existing_desc = cached.get("description", "")
+            if existing_desc:
+                parts.append(existing_desc)
+            if browser_details:
+                parts.append(browser_details)
+            description = ", ".join(dedupe_description_parts(parts))
+            rise = extract_measurement(description, ["Front Rise", "Rise"]) or cached.get("rise", "")
+            inseam = extract_measurement(description, ["Inseam", "Inleg"]) or cached.get("inseam", "")
+            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"]) or cached.get("leg_opening", "")
+            stretch = (
+                (normalize_stretch_value(browser_stretch) if browser_stretch else "")
+                or cached.get("stretch", "")
+                or normalize_stretch_value(extract_label_text(description, ["Stretch"]))
+            )
+            cached.update({
+                "description": description,
+                "rise": rise,
+                "inseam": inseam,
+                "leg_opening": leg_opening,
+                "stretch": stretch,
+            })
+            if rise or leg_opening:
+                merged += 1
+        if merged:
+            log(f"Applied browser measurements to {merged} handles in pdp_cache")
+
     def _prefetch_browser_concurrent(self, handles: List[str]) -> None:
         """Pre-fetch browser data for all handles concurrently before the main loop."""
         if not self.browser_extractor.enabled:
@@ -1438,6 +1487,7 @@ class PaigeScraper:
             if not all(self._pdp_cache.get(h, {}).get(k) for k in ("rise", "inseam", "leg_opening"))
         ]
         self._prefetch_browser_concurrent(_browser_todo)
+        self._apply_browser_precache()
         # ─────────────────────────────────────────────────────────────────────
 
         for idx, style in enumerate(styles, start=1):
