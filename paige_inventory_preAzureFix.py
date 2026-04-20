@@ -978,23 +978,41 @@ class PaigeScraper:
                 cursor = block["pageInfo"]["endCursor"]
         return list(merged.values())
 
-    def fetch_collection_handles_json(self) -> set[str]:
-        handles: set[str] = set()
-        for collection in ("women-denim", "women-sale"):
-            page = 1
-            while True:
-                url = f"https://shop.paige.com/collections/{collection}/products.json?limit=250&page={page}"
-                response = self.session.get(url, timeout=30)
-                response.raise_for_status()
-                products = (response.json() or {}).get("products") or []
-                if not products:
-                    break
-                for product in products:
-                    handle = (product.get("handle") or "").strip()
-                    if handle:
-                        handles.add(handle)
-                page += 1
-        return handles
+    def fetch_collection_handles_json(self) -> Optional[set[str]]:
+        for host in HOST_ROTATION:
+            plain = requests.Session()
+            plain.headers.update(self.session.headers)
+            try:
+                handles: set[str] = set()
+                for collection in ("women-denim", "women-sale"):
+                    page = 1
+                    while True:
+                        url = f"{host}/collections/{collection}/products.json?limit=250&page={page}"
+                        response = plain.get(url, timeout=30)
+                        if response.status_code == 429:
+                            raise requests.exceptions.HTTPError("429", response=response)
+                        response.raise_for_status()
+                        products = (response.json() or {}).get("products") or []
+                        if not products:
+                            break
+                        for product in products:
+                            handle = (product.get("handle") or "").strip()
+                            if handle:
+                                handles.add(handle)
+                        page += 1
+                return handles
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    log(f"fetch_collection_handles_json: 429 from {host}, trying next host")
+                else:
+                    log(f"fetch_collection_handles_json: HTTP {status} from {host}, trying next host")
+            except Exception as exc:
+                log(f"fetch_collection_handles_json: {host} failed ({exc}), trying next host")
+            finally:
+                plain.close()
+        log("fetch_collection_handles_json: all hosts exhausted, skipping handle filter")
+        return None
 
     def algolia_request(self, params: Dict[str, str]) -> Dict:
         query_string = "&".join(
@@ -1188,7 +1206,7 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
+                if collection_handles is not None and handle not in collection_handles:
                     continue
                 if not should_keep_product(tags, title, style.get("_source_collection", "")):
                     continue
@@ -1199,7 +1217,7 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
+                if collection_handles is not None and handle not in collection_handles:
                     continue
                 meta_attrs = ((style.get("meta") or {}).get("attributes") or {})
                 variants = self.fetch_variants(style_id)
