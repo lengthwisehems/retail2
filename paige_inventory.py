@@ -1097,11 +1097,18 @@ class PaigeScraper:
         reads complete (HTTP + browser) data from _pdp_cache without re-fetching.
         """
         if not self.browser_extractor.enabled:
+            log("Browser pre-fetch skipped: PAIGE_PDP_BROWSER_ENABLED is off")
             return
         todo = [h for h in handles if h]
         if not todo:
+            log("Browser pre-fetch skipped: all handles already have measurements")
             return
         workers = self.browser_extractor._workers
+        playwright_ok = self.browser_extractor._playwright_available()
+        log(f"Browser pre-fetch starting: {len(todo)} handles, {workers} workers, playwright_available={playwright_ok}")
+        if not playwright_ok:
+            log("Browser pre-fetch aborted: Playwright not importable — run: pip install playwright && playwright install chromium")
+            return
         log(f"Pre-fetching {len(todo)} PDP handles via browser ({workers} workers)…")
         start = time.time()
 
@@ -1388,7 +1395,10 @@ class PaigeScraper:
                 pass
 
         # Browser-driven fallback for Headless UI DETAILS disclosure.
-        if not (rise and inseam and leg_opening):
+        # Guard: skip when browser is intentionally disabled (e.g. HTTP pre-fetch
+        # phase) to avoid generating hundreds of "SKIP: browser unavailable" log
+        # entries that look like real failures.
+        if not (rise and inseam and leg_opening) and self.browser_extractor.enabled:
             browser_data = self.browser_extractor.fetch(handle)
             browser_desc = browser_data.get("description", "")
             browser_details = browser_data.get("details", "")
