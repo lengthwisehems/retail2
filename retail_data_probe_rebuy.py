@@ -1422,6 +1422,9 @@ def fetch_collection_json(
             products = data.get("products") or []
             if not products:
                 logger.info("No products found on page %s; stopping pagination", page)
+                # If page 1 returns nothing, treat as if unavailable so fallback runs
+                if page == 1:
+                    saw_collection_json_404 = True
                 break
 
             all_products.extend(products)
@@ -1429,6 +1432,10 @@ def fetch_collection_json(
                 break
             page += 1
             time.sleep(0.5)
+
+    # Also trigger fallback if we got nothing at all (non-404 empty response)
+    if not all_products:
+        saw_collection_json_404 = True
 
     if saw_collection_json_404 and fallback_online_store_urls:
         def canonicalize_online_store_url(raw_url: str) -> str:
@@ -3755,21 +3762,58 @@ def main() -> None:
     COLLECTION_TITLE_MAP = fetch_collection_titles(session, logger)
     html_blobs = fetch_collection_html(session, logger)
     storefront_rows, access_rows = gather_storefront_data(session, html_blobs, logger)
-    fallback_urls = [
-        str(row.get("product.onlineStoreUrl") or "").strip()
-        for row in storefront_rows
-        if isinstance(row, dict)
-    ]
-    json_rows, tag_group_columns = fetch_collection_json(
-        session,
-        logger,
-        fallback_online_store_urls=fallback_urls,
-    )
+
+    # Fetch Rebuy data first so its product handles can serve as JSON fallback URLs
     if REBUY_API_KEY and REBUY_CUSTOM_ID:
         rebuy_rows, rebuy_tag_columns = fetch_rebuy_data(session, logger)
     else:
         logger.info("Rebuy configuration missing; skipping Rebuy extraction")
         rebuy_rows, rebuy_tag_columns = [], []
+
+    # Build fallback URL list from Storefront rows + Rebuy handles
+    fallback_urls: List[str] = []
+    seen_fallback_keys: Set[str] = set()
+
+    def _add_fallback(url: str) -> None:
+        clean = str(url or "").strip()
+        if not clean:
+            return
+        key = clean.lower().rstrip("/")
+        if key not in seen_fallback_keys:
+            seen_fallback_keys.add(key)
+            fallback_urls.append(clean)
+
+    for row in storefront_rows:
+        if isinstance(row, dict):
+            _add_fallback(str(row.get("product.onlineStoreUrl") or ""))
+
+    # Derive store base URL from the first COLLECTION_URL entry
+    _primary = _primary_collection_url() or ""
+    _parts = urlsplit(_primary)
+    _store_base = f"{_parts.scheme}://{_parts.netloc}" if _parts.netloc else ""
+
+    seen_rebuy_handles: Set[str] = set()
+    for row in rebuy_rows:
+        if not isinstance(row, dict):
+            continue
+        handle = str(row.get("product.handle") or "").strip()
+        if handle and handle not in seen_rebuy_handles:
+            seen_rebuy_handles.add(handle)
+            url = row.get("product.onlineStoreUrl") or row.get("product.link") or ""
+            url = str(url).strip()
+            if url and not url.startswith("http"):
+                url = f"{_store_base}{url}" if url.startswith("/") else f"{_store_base}/products/{handle}"
+            if not url:
+                url = f"{_store_base}/products/{handle}"
+            _add_fallback(url)
+
+    logger.info("JSON fallback pool: %s unique product URLs", len(fallback_urls))
+
+    json_rows, tag_group_columns = fetch_collection_json(
+        session,
+        logger,
+        fallback_online_store_urls=fallback_urls,
+    )
     output_path = export_workbook(
         json_rows,
         storefront_rows,
