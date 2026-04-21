@@ -1432,12 +1432,14 @@ class PaigeScraper:
         def _stem(title: str) -> str:
             return (title.split(" - ")[0] if " - " in title else title).strip().lower()
 
-        # Pre-build a set of (style_name, color) for every non-petite row so
-        # we can efficiently enforce the petite inseam exception below.
-        non_petite_style_color: set = {
-            (r[idx_style_name], r[idx_color])
+        # Pre-build a set of (style_name, color, inseam) for every non-petite
+        # row that already has an inseam value, so we can enforce the petite
+        # inseam exception: only blank the petite row's inseam when a
+        # non-petite row has the exact same Style Name, Color, AND Inseam.
+        non_petite_key: set = {
+            (r[idx_style_name], r[idx_color], r[idx_inseam])
             for r in rows
-            if "petite" not in r[idx_product].lower()
+            if "petite" not in r[idx_product].lower() and r[idx_inseam]
         }
 
         groups: Dict[str, List[List[str]]] = {}
@@ -1461,11 +1463,11 @@ class PaigeScraper:
                     row[idx_leg] = most_leg
                 if not row[idx_inseam] and most_inseam:
                     # Petite exception: leave inseam blank when a non-petite
-                    # row shares the same Style Name and Color so the two
-                    # entries are still distinguishable by inseam.
+                    # row shares the same Style Name, Color, AND Inseam value
+                    # so the two entries remain distinguishable.
                     if "petite" in row[idx_product].lower() and (
-                        row[idx_style_name], row[idx_color]
-                    ) in non_petite_style_color:
+                        row[idx_style_name], row[idx_color], most_inseam
+                    ) in non_petite_key:
                         continue
                     row[idx_inseam] = most_inseam
 
