@@ -9,6 +9,7 @@ if not exist "%PY%" (
 )
 for %%D in ("%PY%") do set "PY_DIR=%%~dpD"
 set "PATH=%PY_DIR%;%PY_DIR%Scripts;%PATH%"
+set "PYTHONUNBUFFERED=1"
 
 REM ---------- Persistent folders ----------
 set "ROOT=%~dp0"
@@ -16,6 +17,10 @@ set "OUT=%HOME%\data\outputs"
 set "LOGS=%HOME%\data\logs"
 if not exist "%OUT%"  mkdir "%OUT%"
 if not exist "%LOGS%" mkdir "%LOGS%"
+
+REM ---------- Playwright browser cache (persistent across runs) ----------
+set "PLAYWRIGHT_BROWSERS_PATH=%HOME%\playwright-browsers"
+if not exist "%PLAYWRIGHT_BROWSERS_PATH%" mkdir "%PLAYWRIGHT_BROWSERS_PATH%"
 
 set "FINAL_EXIT=0"
 set "BRANDS=ABrand AGJeans AMO DL1961 Edyson Fidelity Frame GoodAmerican Haikure IconDenim LAgence MotherDenim Neuw Paige Pistola RamyBrook ReDone Rollas Rudes Selfcontrast Staud Triarchy Warpweft"
@@ -31,15 +36,25 @@ if errorlevel 1 (
     echo Packages verified.
 )
 echo Installing Playwright for browser-based scrapers...
-"%PY%" -m pip install --disable-pip-version-check -q playwright
+REM Pin to the same version you have locally (run "python -m playwright --version" on your machine).
+REM Pinning prevents pip from silently upgrading to a new version, which would require
+REM downloading a different Chromium build and re-trigger the 30-minute download every run.
+"%PY%" -m pip install --disable-pip-version-check -q "playwright==REPLACE_WITH_YOUR_VERSION"
 if errorlevel 1 (
     echo([WARN] Playwright package install failed; browser-based scraping will be skipped.
 ) else (
-    "%PY%" -m playwright install chromium
-    if errorlevel 1 (
-        echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
+    REM Check for an existing chromium-* folder using dir (wildcard works here, unlike if-not-exist).
+    set "CHROMIUM_FOUND="
+    for /f "delims=" %%D in ('dir /b /ad "%PLAYWRIGHT_BROWSERS_PATH%\chromium-*" 2^>nul') do set "CHROMIUM_FOUND=1"
+    if defined CHROMIUM_FOUND (
+        echo Playwright Chromium already present, skipping install.
     ) else (
-        echo Playwright Chromium ready.
+        "%PY%" -m playwright install chromium
+        if errorlevel 1 (
+            echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
+        ) else (
+            echo Playwright Chromium installed.
+        )
     )
 )
 "%PY%" -V
