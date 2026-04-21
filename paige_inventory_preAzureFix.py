@@ -1206,8 +1206,9 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if collection_handles is not None and handle not in collection_handles:
-                    continue
+                # No collection_handles check here: the GraphQL query is already scoped to the
+                # target collections, and the REST cache can lag behind for recently-published
+                # products, which would incorrectly drop them from the output.
                 if not should_keep_product(tags, title, style.get("_source_collection", "")):
                     continue
                 variants = (style.get("variants") or {}).get("nodes") or []
