@@ -758,7 +758,22 @@ class PDPBrowserExtractor:
         try:
             self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
         except Exception:
-            return {"details": "", "stretch": "", "description": ""}
+            # Navigation failed (e.g. 503, timeout).  The page may now be in a
+            # broken state that would cause every subsequent handle to fail too.
+            # Open a fresh page within the same context and retry once.
+            try:
+                old_page = self._page
+                self._page = self._context.new_page()
+                self._page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+                try:
+                    old_page.close()
+                except Exception:
+                    pass
+                self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                return {"details": "", "stretch": "", "description": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
         checkpoint_seen = False
@@ -1383,6 +1398,7 @@ class PaigeScraper:
                 )
             time.sleep(0.2)
 
+        self.apply_measurement_inference(rows)
         self.apply_style_name_rules(rows)
         self.apply_jean_style_inference(rows)
         self.apply_jean_style_fit_fallback(rows, fit_hint_by_sku, tags_by_sku)
@@ -1390,6 +1406,41 @@ class PaigeScraper:
         self.apply_color_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
+
+    def apply_measurement_inference(self, rows: List[List[str]]) -> None:
+        """Fill blank Rise and Leg Opening from style-family siblings.
+
+        Groups rows by the stem of the product title (everything before the
+        colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
+        Jean' colourways share their measurements.  When Playwright extraction
+        fails for a subset of handles in a family (due to transient 503s or
+        browser-session issues), this propagates the most-common non-blank
+        values from the successfully-extracted siblings.
+        """
+        idx_product = CSV_HEADERS.index("Product")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+
+        def _stem(title: str) -> str:
+            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            key = _stem(row[idx_product])
+            groups.setdefault(key, []).append(row)
+
+        for group_rows in groups.values():
+            rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
+            legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
+            if not rises and not legs:
+                continue
+            most_rise = max(set(rises), key=rises.count) if rises else ""
+            most_leg = max(set(legs), key=legs.count) if legs else ""
+            for row in group_rows:
+                if not row[idx_rise] and most_rise:
+                    row[idx_rise] = most_rise
+                if not row[idx_leg] and most_leg:
+                    row[idx_leg] = most_leg
 
     def apply_style_name_rules(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
