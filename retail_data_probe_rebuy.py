@@ -316,6 +316,8 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
           id
           handle
           title
+          description
+          descriptionHtml
           productType
           tags
           vendor
@@ -334,8 +336,14 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
                 id
                 title
                 sku
+                barcode
                 availableForSale
+                quantityAvailable
                 price {
+                  amount
+                  currencyCode
+                }
+                compareAtPrice {
                   amount
                   currencyCode
                 }
@@ -410,8 +418,14 @@ query ProductsFallback($cursor: String, $pageSize: Int!, $query: String) {{
               id
               title
               sku
+              barcode
               availableForSale
+              quantityAvailable
               price {{
+                amount
+                currencyCode
+              }}
+              compareAtPrice {{
                 amount
                 currencyCode
               }}
@@ -1391,9 +1405,10 @@ def fetch_collection_json(
         return [], []
 
     all_products: List[Dict[str, Any]] = []
-    saw_collection_json_404 = False
+    needs_fallback = False
     for products_json_url in products_json_urls:
         page = 1
+        url_got_products = False
         while True:
             params = {"limit": 250, "page": page}
             logger.info("Fetching collection JSON page %s from %s", page, products_json_url)
@@ -1403,41 +1418,53 @@ def fetch_collection_json(
                 )
             except requests.RequestException as exc:
                 logger.warning("Collection JSON request failed: %s", exc)
+                needs_fallback = True
                 break
 
             if not response.ok:
                 logger.warning(
-                    "Collection JSON request returned status %s", response.status_code
+                    "Collection JSON returned HTTP %s for %s — will use per-product fallback",
+                    response.status_code, products_json_url,
                 )
-                if response.status_code == 404:
-                    saw_collection_json_404 = True
+                needs_fallback = True
                 break
 
             try:
                 data = response.json()
             except ValueError:
-                logger.warning("Collection JSON response was not valid JSON")
+                logger.warning(
+                    "Collection JSON response was not valid JSON (got %s bytes, starts: %s) — will use fallback",
+                    len(response.content),
+                    response.text[:120].replace("\n", " "),
+                )
+                needs_fallback = True
                 break
 
             products = data.get("products") or []
             if not products:
-                logger.info("No products found on page %s; stopping pagination", page)
-                # If page 1 returns nothing, treat as if unavailable so fallback runs
                 if page == 1:
-                    saw_collection_json_404 = True
+                    logger.info(
+                        "Collection JSON page 1 returned 0 products for %s — will use per-product fallback",
+                        products_json_url,
+                    )
+                    needs_fallback = True
+                else:
+                    logger.info("Collection JSON page %s returned 0 products; pagination complete", page)
                 break
 
             all_products.extend(products)
+            url_got_products = True
+            logger.info("Collection JSON page %s: %s products (total so far: %s)", page, len(products), len(all_products))
             if len(products) < 250:
                 break
             page += 1
             time.sleep(0.5)
 
-    # Also trigger fallback if we got nothing at all (non-404 empty response)
+    # If every URL returned nothing, activate fallback
     if not all_products:
-        saw_collection_json_404 = True
+        needs_fallback = True
 
-    if saw_collection_json_404 and fallback_online_store_urls:
+    if needs_fallback and fallback_online_store_urls:
         def canonicalize_online_store_url(raw_url: str) -> str:
             candidate = str(raw_url or "").strip()
             if not candidate:
