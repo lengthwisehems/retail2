@@ -726,8 +726,11 @@ class PDPBrowserExtractor:
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
+                        "--disable-setuid-sandbox",
                         "--disable-gpu",
                         "--disable-dev-shm-usage",
+                        "--single-process",
+                        "--no-zygote",
                     ],
                 )
             self._context = self._browser.new_context(
@@ -943,6 +946,11 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
+        # Keyed by style family stem (title before " - ").  Once the browser
+        # successfully reads a DETAILS panel for one colourway, all subsequent
+        # colourways in the same family reuse those measurements — reducing
+        # browser calls from ~299 down to ~30-40 on Azure.
+        self._family_browser_cache: Dict[str, Dict[str, str]] = {}
         self.browser_extractor = PDPBrowserExtractor()
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
@@ -1137,7 +1145,7 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(self, handle: str, description_seed: str = "") -> Dict[str, str]:
+    def fetch_pdp_fields(self, handle: str, description_seed: str = "", title: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
         source = "seed"
@@ -1186,7 +1194,18 @@ class PaigeScraper:
 
         # Browser-driven fallback for Headless UI DETAILS disclosure.
         if not (rise and inseam and leg_opening):
-            browser_data = self.browser_extractor.fetch(handle)
+            # Check the family cache first.  All colourways of the same style
+            # (same title stem before " - ") share identical measurements, so
+            # if we already ran the browser for a sibling, reuse that result
+            # rather than loading another 45-second page on Azure.
+            family_key = (title.split(" - ")[0] if " - " in title else title).strip().lower() if title else ""
+            if family_key and family_key in self._family_browser_cache:
+                browser_data = self._family_browser_cache[family_key]
+                log(f"PDP browser {handle} | family cache hit")
+            else:
+                browser_data = self.browser_extractor.fetch(handle)
+                if family_key and (browser_data.get("details") or browser_data.get("description")):
+                    self._family_browser_cache[family_key] = browser_data
             browser_desc = browser_data.get("description", "")
             browser_details = browser_data.get("details", "")
             if browser_desc:
@@ -1280,7 +1299,7 @@ class PaigeScraper:
                 algolia_text = strip_html_text(algolia_body_html)
                 seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
             pdp_start = time.time()
-            pdp_fields = self.fetch_pdp_fields(handle, seed_description)
+            pdp_fields = self.fetch_pdp_fields(handle, seed_description, title=title)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
             if pdp_fields["rise"]:
