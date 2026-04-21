@@ -758,7 +758,22 @@ class PDPBrowserExtractor:
         try:
             self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
         except Exception:
-            return {"details": "", "stretch": "", "description": ""}
+            # Navigation failed (e.g. 503, timeout).  The page may now be in a
+            # broken state that would cause every subsequent handle to fail too.
+            # Open a fresh page within the same context and retry once.
+            try:
+                old_page = self._page
+                self._page = self._context.new_page()
+                self._page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+                try:
+                    old_page.close()
+                except Exception:
+                    pass
+                self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                return {"details": "", "stretch": "", "description": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
         checkpoint_seen = False
@@ -978,23 +993,41 @@ class PaigeScraper:
                 cursor = block["pageInfo"]["endCursor"]
         return list(merged.values())
 
-    def fetch_collection_handles_json(self) -> set[str]:
-        handles: set[str] = set()
-        for collection in ("women-denim", "women-sale"):
-            page = 1
-            while True:
-                url = f"https://shop.paige.com/collections/{collection}/products.json?limit=250&page={page}"
-                response = self.session.get(url, timeout=30)
-                response.raise_for_status()
-                products = (response.json() or {}).get("products") or []
-                if not products:
-                    break
-                for product in products:
-                    handle = (product.get("handle") or "").strip()
-                    if handle:
-                        handles.add(handle)
-                page += 1
-        return handles
+    def fetch_collection_handles_json(self) -> Optional[set[str]]:
+        for host in HOST_ROTATION:
+            plain = requests.Session()
+            plain.headers.update(self.session.headers)
+            try:
+                handles: set[str] = set()
+                for collection in ("women-denim", "women-sale"):
+                    page = 1
+                    while True:
+                        url = f"{host}/collections/{collection}/products.json?limit=250&page={page}"
+                        response = plain.get(url, timeout=30)
+                        if response.status_code == 429:
+                            raise requests.exceptions.HTTPError("429", response=response)
+                        response.raise_for_status()
+                        products = (response.json() or {}).get("products") or []
+                        if not products:
+                            break
+                        for product in products:
+                            handle = (product.get("handle") or "").strip()
+                            if handle:
+                                handles.add(handle)
+                        page += 1
+                return handles
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    log(f"fetch_collection_handles_json: 429 from {host}, trying next host")
+                else:
+                    log(f"fetch_collection_handles_json: HTTP {status} from {host}, trying next host")
+            except Exception as exc:
+                log(f"fetch_collection_handles_json: {host} failed ({exc}), trying next host")
+            finally:
+                plain.close()
+        log("fetch_collection_handles_json: all hosts exhausted, skipping handle filter")
+        return None
 
     def algolia_request(self, params: Dict[str, str]) -> Dict:
         query_string = "&".join(
@@ -1188,8 +1221,9 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
-                    continue
+                # No collection_handles check here: the GraphQL query is already scoped to the
+                # target collections, and the REST cache can lag behind for recently-published
+                # products, which would incorrectly drop them from the output.
                 if not should_keep_product(tags, title, style.get("_source_collection", "")):
                     continue
                 variants = (style.get("variants") or {}).get("nodes") or []
@@ -1199,7 +1233,7 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
+                if collection_handles is not None and handle not in collection_handles:
                     continue
                 meta_attrs = ((style.get("meta") or {}).get("attributes") or {})
                 variants = self.fetch_variants(style_id)
@@ -1364,6 +1398,7 @@ class PaigeScraper:
                 )
             time.sleep(0.2)
 
+        self.apply_measurement_inference(rows)
         self.apply_style_name_rules(rows)
         self.apply_jean_style_inference(rows)
         self.apply_jean_style_fit_fallback(rows, fit_hint_by_sku, tags_by_sku)
@@ -1371,6 +1406,70 @@ class PaigeScraper:
         self.apply_color_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
+
+    def apply_measurement_inference(self, rows: List[List[str]]) -> None:
+        """Fill blank Rise, Inseam, and Leg Opening from style-family siblings.
+
+        Groups rows by the stem of the product title (everything before the
+        colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
+        Jean' colourways share their measurements.  When Playwright extraction
+        fails for a subset of handles in a family (due to transient 503s or
+        browser-session issues), this propagates the most-common non-blank
+        values from the successfully-extracted siblings.
+
+        Petite inseam exception: if a petite row shares the same Style Name
+        and Color as any non-petite row, its Inseam is left blank so that
+        apply_petite_inseam_rule (which enforces this constraint after all
+        other post-processing) does not have to undo a value we set here.
+        """
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_color = CSV_HEADERS.index("Color")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+
+        def _stem(title: str) -> str:
+            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+
+        # Pre-build a set of (style_name, color, inseam) for every non-petite
+        # row that already has an inseam value, so we can enforce the petite
+        # inseam exception: only blank the petite row's inseam when a
+        # non-petite row has the exact same Style Name, Color, AND Inseam.
+        non_petite_key: set = {
+            (r[idx_style_name], r[idx_color], r[idx_inseam])
+            for r in rows
+            if "petite" not in r[idx_product].lower() and r[idx_inseam]
+        }
+
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            key = _stem(row[idx_product])
+            groups.setdefault(key, []).append(row)
+
+        for group_rows in groups.values():
+            rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
+            legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
+            inseams = [r[idx_inseam] for r in group_rows if r[idx_inseam]]
+            if not rises and not legs and not inseams:
+                continue
+            most_rise = max(set(rises), key=rises.count) if rises else ""
+            most_leg = max(set(legs), key=legs.count) if legs else ""
+            most_inseam = max(set(inseams), key=inseams.count) if inseams else ""
+            for row in group_rows:
+                if not row[idx_rise] and most_rise:
+                    row[idx_rise] = most_rise
+                if not row[idx_leg] and most_leg:
+                    row[idx_leg] = most_leg
+                if not row[idx_inseam] and most_inseam:
+                    # Petite exception: leave inseam blank when a non-petite
+                    # row shares the same Style Name, Color, AND Inseam value
+                    # so the two entries remain distinguishable.
+                    if "petite" in row[idx_product].lower() and (
+                        row[idx_style_name], row[idx_color], most_inseam
+                    ) in non_petite_key:
+                        continue
+                    row[idx_inseam] = most_inseam
 
     def apply_style_name_rules(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
