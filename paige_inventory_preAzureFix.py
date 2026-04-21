@@ -1408,7 +1408,7 @@ class PaigeScraper:
         return rows
 
     def apply_measurement_inference(self, rows: List[List[str]]) -> None:
-        """Fill blank Rise and Leg Opening from style-family siblings.
+        """Fill blank Rise, Inseam, and Leg Opening from style-family siblings.
 
         Groups rows by the stem of the product title (everything before the
         colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
@@ -1416,13 +1416,29 @@ class PaigeScraper:
         fails for a subset of handles in a family (due to transient 503s or
         browser-session issues), this propagates the most-common non-blank
         values from the successfully-extracted siblings.
+
+        Petite inseam exception: if a petite row shares the same Style Name
+        and Color as any non-petite row, its Inseam is left blank so that
+        apply_petite_inseam_rule (which enforces this constraint after all
+        other post-processing) does not have to undo a value we set here.
         """
         idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_color = CSV_HEADERS.index("Color")
+        idx_inseam = CSV_HEADERS.index("Inseam")
         idx_rise = CSV_HEADERS.index("Rise")
         idx_leg = CSV_HEADERS.index("Leg Opening")
 
         def _stem(title: str) -> str:
             return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+
+        # Pre-build a set of (style_name, color) for every non-petite row so
+        # we can efficiently enforce the petite inseam exception below.
+        non_petite_style_color: set = {
+            (r[idx_style_name], r[idx_color])
+            for r in rows
+            if "petite" not in r[idx_product].lower()
+        }
 
         groups: Dict[str, List[List[str]]] = {}
         for row in rows:
@@ -1432,15 +1448,26 @@ class PaigeScraper:
         for group_rows in groups.values():
             rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
             legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
-            if not rises and not legs:
+            inseams = [r[idx_inseam] for r in group_rows if r[idx_inseam]]
+            if not rises and not legs and not inseams:
                 continue
             most_rise = max(set(rises), key=rises.count) if rises else ""
             most_leg = max(set(legs), key=legs.count) if legs else ""
+            most_inseam = max(set(inseams), key=inseams.count) if inseams else ""
             for row in group_rows:
                 if not row[idx_rise] and most_rise:
                     row[idx_rise] = most_rise
                 if not row[idx_leg] and most_leg:
                     row[idx_leg] = most_leg
+                if not row[idx_inseam] and most_inseam:
+                    # Petite exception: leave inseam blank when a non-petite
+                    # row shares the same Style Name and Color so the two
+                    # entries are still distinguishable by inseam.
+                    if "petite" in row[idx_product].lower() and (
+                        row[idx_style_name], row[idx_color]
+                    ) in non_petite_style_color:
+                        continue
+                    row[idx_inseam] = most_inseam
 
     def apply_style_name_rules(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
