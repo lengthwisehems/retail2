@@ -40,7 +40,7 @@ echo Installing Playwright for browser-based scrapers...
 REM Pin to the same version you have locally (run "python -m playwright --version" on your machine).
 REM Pinning prevents pip from silently upgrading to a new version, which would require
 REM downloading a different Chromium build and force a re-download on every run.
-"%PY%" -m pip install --disable-pip-version-check -q "playwright==REPLACE_WITH_YOUR_VERSION"
+"%PY%" -m pip install --disable-pip-version-check -q "playwright==1.56.0"
 if errorlevel 1 (
     echo([WARN] Playwright package install failed; browser-based scraping will be skipped.
 ) else (
