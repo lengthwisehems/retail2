@@ -726,11 +726,8 @@ class PDPBrowserExtractor:
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
-                        "--disable-setuid-sandbox",
                         "--disable-gpu",
                         "--disable-dev-shm-usage",
-                        "--single-process",
-                        "--no-zygote",
                     ],
                 )
             self._context = self._browser.new_context(
@@ -825,25 +822,31 @@ class PDPBrowserExtractor:
         details_text = ""
         try:
             btn = self._page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
-            if btn.count() == 0:
+            try:
+                # Wait for React to hydrate and the button to appear.
+                # On local this resolves in <100 ms; on Azure it can take 5-10 s.
+                btn.first.wait_for(state="visible", timeout=12000)
+            except Exception:
                 btn = self._page.locator("button:has-text('DETAILS')")
-            if btn.count():
-                expanded = btn.first.get_attribute("aria-expanded", timeout=500)
-                if expanded != "true":
-                    try:
-                        btn.first.click(timeout=1200)
-                    except Exception:
-                        btn.first.click(timeout=1200, force=True)
-                # Wait for the panel to render.  Azure's throttled CPU means React
-                # hydration takes longer than on a local machine; 800ms is safe.
-                self._page.wait_for_timeout(800)
+                btn.first.wait_for(state="visible", timeout=3000)
+            expanded = btn.first.get_attribute("aria-expanded", timeout=1000)
+            if expanded != "true":
+                try:
+                    btn.first.click(timeout=2000)
+                except Exception:
+                    btn.first.click(timeout=2000, force=True)
+            # Wait for the disclosure panel to render.
+            try:
+                self._page.wait_for_selector(PDP_SELECTOR, timeout=4000)
+            except Exception:
+                self._page.wait_for_timeout(1500)
 
             detail_nodes = self._page.locator(PDP_SELECTOR)
             count = detail_nodes.count()
             if count:
                 items = []
                 for i in range(count):
-                    text = detail_nodes.nth(i).inner_text(timeout=600).strip()
+                    text = detail_nodes.nth(i).inner_text(timeout=1500).strip()
                     if text:
                         items.append(re.sub(r"\s+", " ", text))
                 details_text = ", ".join(items)
