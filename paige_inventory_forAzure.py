@@ -946,11 +946,6 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
-        # Keyed by style family stem (title before " - ").  Once the browser
-        # successfully reads a DETAILS panel for one colourway, all subsequent
-        # colourways in the same family reuse those measurements — reducing
-        # browser calls from ~299 down to ~30-40 on Azure.
-        self._family_browser_cache: Dict[str, Dict[str, str]] = {}
         self.browser_extractor = PDPBrowserExtractor()
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
@@ -1194,18 +1189,7 @@ class PaigeScraper:
 
         # Browser-driven fallback for Headless UI DETAILS disclosure.
         if not (rise and inseam and leg_opening):
-            # Check the family cache first.  All colourways of the same style
-            # (same title stem before " - ") share identical measurements, so
-            # if we already ran the browser for a sibling, reuse that result
-            # rather than loading another 45-second page on Azure.
-            family_key = (title.split(" - ")[0] if " - " in title else title).strip().lower() if title else ""
-            if family_key and family_key in self._family_browser_cache:
-                browser_data = self._family_browser_cache[family_key]
-                log(f"PDP browser {handle} | family cache hit")
-            else:
-                browser_data = self.browser_extractor.fetch(handle)
-                if family_key and (browser_data.get("details") or browser_data.get("description")):
-                    self._family_browser_cache[family_key] = browser_data
+            browser_data = self.browser_extractor.fetch(handle)
             browser_desc = browser_data.get("description", "")
             browser_details = browser_data.get("details", "")
             if browser_desc:
