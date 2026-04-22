@@ -31,6 +31,11 @@ HOST_ROTATION = [
     "https://paige.com",
 ]
 PDP_HOST = "https://shop.paige.com"
+BROWSER_HOST_ORDER = [
+    "https://paige.com",
+    "https://shop.paige.com",
+    "https://www.paige.com",
+]
 STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Accent Hardware", "Ankle", "Belted", "Coated", "Corduroy", "Crop", "Crushed", "Crystal",
     "Cuff", "Cuffed", "Cutoff", "Darted", "Destroyed", "Fit", "Flag", "Flap Pocket", "Flap",
@@ -779,27 +784,36 @@ class PDPBrowserExtractor:
         if not self._ensure():
             return {"details": "", "stretch": "", "description": ""}
         assert self._page is not None
-        url = f"{PDP_HOST}/products/{handle}"
         start = time.time()
-        try:
-            self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
-        except Exception:
-            # Navigation failed (e.g. 503, timeout).  The page may now be in a
-            # broken state that would cause every subsequent handle to fail too.
-            # Open a fresh page within the same context and retry once.
+        nav_ok = False
+        for _host in BROWSER_HOST_ORDER:
+            url = f"{_host}/products/{handle}"
             try:
-                old_page = self._page
-                self._page = self._context.new_page()
-                self._page.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-                try:
-                    old_page.close()
-                except Exception:
-                    pass
                 self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
             except Exception:
-                return {"details": "", "stretch": "", "description": ""}
+                # Navigation failed; open a fresh page and retry this host once.
+                try:
+                    old_page = self._page
+                    self._page = self._context.new_page()
+                    self._page.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
+                    try:
+                        old_page.close()
+                    except Exception:
+                        pass
+                    self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
+                except Exception:
+                    continue  # try next host
+            # Reject chrome-error pages before accepting this host.
+            current_url = self._page.url or ""
+            if "chrome-error" in current_url or current_url.startswith("chrome-error"):
+                continue
+            nav_ok = True
+            break
+
+        if not nav_ok:
+            return {"details": "", "stretch": "", "description": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
         checkpoint_seen = False
@@ -819,21 +833,6 @@ class PDPBrowserExtractor:
 
         self._dismiss_overlays()
 
-        # Diagnostic: log exactly what page Playwright received.
-        # This tells us whether Cloudflare served a challenge page, the real
-        # product page loaded, and whether the DETAILS button is in the DOM at all.
-        try:
-            _diag_title = self._page.title()
-            _diag_url   = self._page.url
-            _diag_btn   = self._page.evaluate(
-                "() => { const b = Array.from(document.querySelectorAll('button'))"
-                ".find(el => /details/i.test(el.textContent.trim()));"
-                " return b ? b.textContent.trim().slice(0, 40) : null; }"
-            )
-            log(f"PDP diag {handle} | title={_diag_title!r} | url={_diag_url!r} | btn_in_dom={_diag_btn!r}")
-        except Exception:
-            pass
-
         details_text = ""
         try:
             btn = self._page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
@@ -852,7 +851,7 @@ class PDPBrowserExtractor:
                     btn.first.click(timeout=2000, force=True)
             # Wait for the disclosure panel to render.
             try:
-                self._page.wait_for_selector(PDP_SELECTOR, timeout=4000)
+                self._page.wait_for_selector(PDP_SELECTOR, timeout=8000)
             except Exception:
                 self._page.wait_for_timeout(1500)
 
@@ -1161,31 +1160,45 @@ class PaigeScraper:
     def fetch_pdp_fields(self, handle: str, description_seed: str = "", title: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
-        source = "seed"
-        description_parts: List[str] = [description_seed] if description_seed else []
-        description = ", ".join(dedupe_description_parts(description_parts))
-        stretch = normalize_stretch_value(extract_label_text(description, ["Stretch"]))
+        description_parts: List[str] = []
+        stretch = ""
 
-        try:
-            product_json = self.session.get(
-                urljoin(PDP_HOST, f"/products/{handle}.json"),
-                timeout=20,
-                allow_redirects=True,
-            )
-            if product_json.status_code == 200:
-                body_html = (product_json.json().get("product") or {}).get("body_html") or ""
-                body_text = strip_html_text(body_html)
-                if body_text:
-                    description_parts.append(body_text)
-                    source = "product-json"
-        except Exception:
-            pass
-
+        # Stage 1: Browser (source of truth — PDP DETAILS panel).
+        browser_data = self.browser_extractor.fetch(handle)
+        browser_desc = browser_data.get("description", "")
+        browser_details = browser_data.get("details", "")
+        if browser_desc:
+            description_parts.append(browser_desc)
+        if browser_details:
+            description_parts.append(browser_details)
+        if browser_data.get("stretch"):
+            stretch = normalize_stretch_value(browser_data["stretch"])
         description = ", ".join(dedupe_description_parts(description_parts))
         rise = extract_measurement(description, ["Front Rise", "Rise"])
         inseam = extract_measurement(description, ["Inseam", "Inleg"])
         leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
 
+        # Stage 2: product.json REST — fill any gaps the browser missed.
+        if not (rise and inseam and leg_opening):
+            try:
+                product_json = self.session.get(
+                    urljoin(PDP_HOST, f"/products/{handle}.json"),
+                    timeout=20,
+                    allow_redirects=True,
+                )
+                if product_json.status_code == 200:
+                    body_html = (product_json.json().get("product") or {}).get("body_html") or ""
+                    body_text = strip_html_text(body_html)
+                    if body_text:
+                        description_parts.append(body_text)
+                        description = ", ".join(dedupe_description_parts(description_parts))
+                        rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
+                        inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
+                        leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
+            except Exception:
+                pass
+
+        # Stage 3: HTML scrape — fill any remaining gaps.
         if not (rise and inseam and leg_opening):
             url = urljoin(PDP_HOST, f"/products/{handle}")
             try:
@@ -1193,35 +1206,22 @@ class PaigeScraper:
                 response.raise_for_status()
                 details_description = extract_pdp_description(response.text)
                 stretch_from_html = extract_stretch_from_html(response.text)
-                if stretch_from_html:
+                if stretch_from_html and not stretch:
                     stretch = normalize_stretch_value(stretch_from_html)
                 if details_description:
                     description_parts.append(details_description)
                     description = ", ".join(dedupe_description_parts(description_parts))
-                    rise = extract_measurement(description, ["Front Rise", "Rise"])
-                    inseam = extract_measurement(description, ["Inseam", "Inleg"])
-                    leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
-                    source = "pdp-html"
+                    rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
+                    inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
+                    leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
             except Exception:
                 pass
 
-        # Browser-driven fallback for Headless UI DETAILS disclosure.
-        if not (rise and inseam and leg_opening):
-            browser_data = self.browser_extractor.fetch(handle)
-            browser_desc = browser_data.get("description", "")
-            browser_details = browser_data.get("details", "")
-            if browser_desc:
-                description_parts.insert(0, browser_desc)
-            if browser_details:
-                description_parts.append(browser_details)
-            if browser_data.get("stretch"):
-                stretch = normalize_stretch_value(browser_data["stretch"])
-            description = ", ".join(dedupe_description_parts(description_parts))
-            rise = extract_measurement(description, ["Front Rise", "Rise"])
-            inseam = extract_measurement(description, ["Inseam", "Inleg"])
-            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
-            if browser_details:
-                source = "pdp-browser"
+        # Stage 4: Algolia/GraphQL description seed — enrich text only, never override measurements.
+        if description_seed:
+            description_parts.append(description_seed)
+        if not stretch:
+            stretch = normalize_stretch_value(extract_label_text(description_seed, ["Stretch"]))
 
         description = ", ".join(dedupe_description_parts(description_parts))
 
@@ -1304,6 +1304,10 @@ class PaigeScraper:
             pdp_fields = self.fetch_pdp_fields(handle, seed_description, title=title)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
+            if processed_handles % 75 == 0:
+                log(f"Browser restart after {processed_handles} handles (periodic session reset)")
+                self.browser_extractor.close()
+                self.browser_extractor = PDPBrowserExtractor()
             if pdp_fields["rise"]:
                 rise_filled += 1
             if pdp_fields["inseam"]:
@@ -1478,8 +1482,15 @@ class PaigeScraper:
         idx_rise = CSV_HEADERS.index("Rise")
         idx_leg = CSV_HEADERS.index("Leg Opening")
 
-        def _stem(title: str) -> str:
-            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+        def _family_key(title: str) -> str:
+            base = (title.split(" - ")[0] if " - " in title else title).strip().lower()
+            lower = title.lower()
+            markers = []
+            if "petite" in lower:
+                markers.append("petite")
+            if "ankle" in lower:
+                markers.append("ankle")
+            return (base + "|" + ",".join(sorted(markers))) if markers else base
 
         # Pre-build a set of (style_name, color, inseam) for every non-petite
         # row that already has an inseam value, so we can enforce the petite
@@ -1493,7 +1504,7 @@ class PaigeScraper:
 
         groups: Dict[str, List[List[str]]] = {}
         for row in rows:
-            key = _stem(row[idx_product])
+            key = _family_key(row[idx_product])
             groups.setdefault(key, []).append(row)
 
         for group_rows in groups.values():
