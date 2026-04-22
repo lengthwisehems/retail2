@@ -819,6 +819,21 @@ class PDPBrowserExtractor:
 
         self._dismiss_overlays()
 
+        # Diagnostic: log exactly what page Playwright received.
+        # This tells us whether Cloudflare served a challenge page, the real
+        # product page loaded, and whether the DETAILS button is in the DOM at all.
+        try:
+            _diag_title = self._page.title()
+            _diag_url   = self._page.url
+            _diag_btn   = self._page.evaluate(
+                "() => { const b = Array.from(document.querySelectorAll('button'))"
+                ".find(el => /details/i.test(el.textContent.trim()));"
+                " return b ? b.textContent.trim().slice(0, 40) : null; }"
+            )
+            log(f"PDP diag {handle} | title={_diag_title!r} | url={_diag_url!r} | btn_in_dom={_diag_btn!r}")
+        except Exception:
+            pass
+
         details_text = ""
         try:
             btn = self._page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
