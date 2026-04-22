@@ -10,6 +10,7 @@ if not exist "%PY%" (
 for %%D in ("%PY%") do set "PY_DIR=%%~dpD"
 set "PATH=%PY_DIR%;%PY_DIR%Scripts;%PATH%"
 set "PYTHONUNBUFFERED=1"
+set "PYTHONIOENCODING=utf-8"
 
 REM ---------- Persistent folders ----------
 set "ROOT=%~dp0"
@@ -38,23 +39,20 @@ if errorlevel 1 (
 echo Installing Playwright for browser-based scrapers...
 REM Pin to the same version you have locally (run "python -m playwright --version" on your machine).
 REM Pinning prevents pip from silently upgrading to a new version, which would require
-REM downloading a different Chromium build and re-trigger the 30-minute download every run.
+REM downloading a different Chromium build and force a re-download on every run.
 "%PY%" -m pip install --disable-pip-version-check -q "playwright==REPLACE_WITH_YOUR_VERSION"
 if errorlevel 1 (
     echo([WARN] Playwright package install failed; browser-based scraping will be skipped.
 ) else (
-    REM Check for an existing chromium-* folder using dir (wildcard works here, unlike if-not-exist).
-    set "CHROMIUM_FOUND="
-    for /f "delims=" %%D in ('dir /b /ad "%PLAYWRIGHT_BROWSERS_PATH%\chromium-*" 2^>nul') do set "CHROMIUM_FOUND=1"
-    if defined CHROMIUM_FOUND (
-        echo Playwright Chromium already present, skipping install.
+    REM Always call playwright install — it exits in ~2 s when the right browser is already
+    REM present, and downloads only when something is missing.  A folder-name check is
+    REM unreliable because Playwright has used both "chromium-XXXX" and
+    REM "chromium_headless_shell-XXXX" naming schemes across versions.
+    "%PY%" -m playwright install chromium
+    if errorlevel 1 (
+        echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
     ) else (
-        "%PY%" -m playwright install chromium
-        if errorlevel 1 (
-            echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
-        ) else (
-            echo Playwright Chromium installed.
-        )
+        echo Playwright Chromium ready.
     )
 )
 "%PY%" -V
