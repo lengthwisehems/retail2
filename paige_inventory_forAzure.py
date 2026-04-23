@@ -1224,9 +1224,14 @@ class PaigeScraper:
             except Exception:
                 pass
 
-        # Stage 4: Algolia/GraphQL description seed — enrich text only, never override measurements.
+        # Stage 4: Algolia/GraphQL description seed — last-resort fallback for any still-missing
+        # measurements. Browser values (Stage 1) are never overridden because of the `or` guards.
         if description_seed:
             description_parts.append(description_seed)
+            description = ", ".join(dedupe_description_parts(description_parts))
+            rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
+            inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
+            leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
         if not stretch:
             stretch = normalize_stretch_value(extract_label_text(description_seed, ["Stretch"]))
 
@@ -1315,6 +1320,13 @@ class PaigeScraper:
                 log(f"Browser restart after {processed_handles} handles (periodic session reset)")
                 self.browser_extractor.close()
                 self.browser_extractor = PDPBrowserExtractor()
+                # Warm up the new session with a throw-away page so that the next real
+                # handle does not pay the Cloudflare cold-start penalty.
+                try:
+                    self.browser_extractor.fetch("women-anessa-black-shadow")
+                    log("Browser warm-up complete")
+                except Exception:
+                    pass
             if pdp_fields["rise"]:
                 rise_filled += 1
             if pdp_fields["inseam"]:
