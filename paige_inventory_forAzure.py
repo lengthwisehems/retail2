@@ -1320,10 +1320,10 @@ class PaigeScraper:
                 log(f"Browser restart after {processed_handles} handles (periodic session reset)")
                 self.browser_extractor.close()
                 self.browser_extractor = PDPBrowserExtractor()
-                # Warm up the new session with a throw-away page so that the next real
-                # handle does not pay the Cloudflare cold-start penalty.
+                # Warm up the new session by re-fetching the last handle so the
+                # next real handle does not pay the Cloudflare cold-start penalty.
                 try:
-                    self.browser_extractor.fetch("women-anessa-black-shadow")
+                    self.browser_extractor.fetch(handle)
                     log("Browser warm-up complete")
                 except Exception:
                     pass
