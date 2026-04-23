@@ -32,8 +32,8 @@ HOST_ROTATION = [
 ]
 PDP_HOST = "https://shop.paige.com"
 BROWSER_HOST_ORDER = [
-    "https://paige.com",
     "https://shop.paige.com",
+    "https://paige.com",
     "https://www.paige.com",
 ]
 STYLE_NAME_REMOVE_PHRASES: List[str] = [
