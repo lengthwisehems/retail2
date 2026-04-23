@@ -805,11 +805,27 @@ class PDPBrowserExtractor:
                     self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
                 except Exception:
                     continue  # try next host
-            # Reject chrome-error pages before accepting this host.
+            # Reject chrome-error, Cloudflare challenge, and rate-limit pages.
             current_url = self._page.url or ""
-            if "chrome-error" in current_url or current_url.startswith("chrome-error"):
-                continue
+            try:
+                current_title = (self._page.title() or "").lower()
+            except Exception:
+                current_title = ""
+            bad_page = (
+                "chrome-error" in current_url
+                or current_url.startswith("chrome-error")
+                or "/cdn-cgi/challenge-platform" in current_url
+                or "just a moment" in current_title
+                or "attention required" in current_title
+                or "429" in current_title
+                or "too many requests" in current_title
+                or "403 forbidden" in current_title
+                or ("error" in current_url.lower() and "products" not in current_url)
+            )
+            if bad_page:
+                continue  # try next host
             nav_ok = True
+            self._page.wait_for_timeout(1500)  # throttle to stay below Cloudflare rate-limit
             break
 
         if not nav_ok:
@@ -1316,7 +1332,7 @@ class PaigeScraper:
             pdp_fields = self.fetch_pdp_fields(handle, seed_description, title=title)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
-            if processed_handles % 75 == 0:
+            if processed_handles % 50 == 0:
                 log(f"Browser restart after {processed_handles} handles (periodic session reset)")
                 self.browser_extractor.close()
                 self.browser_extractor = PDPBrowserExtractor()
