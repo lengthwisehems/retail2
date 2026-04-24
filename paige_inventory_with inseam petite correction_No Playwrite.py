@@ -756,7 +756,7 @@ class PDPBrowserExtractor:
 
     def fetch(self, handle: str) -> Dict[str, str]:
         if not self._ensure():
-            return {"details": "", "stretch": "", "description": ""}
+            return {"stretch": ""}
         assert self._page is not None
         url = f"{PDP_HOST}/products/{handle}"
         start = time.time()
@@ -778,18 +778,25 @@ class PDPBrowserExtractor:
                     pass
                 self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
             except Exception:
-                return {"details": "", "stretch": "", "description": ""}
+                return {"stretch": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
         checkpoint_seen = False
         for _ in range(5):
-            page_title = (self._page.title() or "").lower()
+            try:
+                page_title = (self._page.title() or "").lower()
+            except Exception:
+                page_title = ""
             if "checkpoint" not in page_title:
                 break
             checkpoint_seen = True
             self._page.wait_for_timeout(400)
 
-        if checkpoint_seen and "checkpoint" in (self._page.title() or "").lower():
+        try:
+            _cur_title = (self._page.title() or "").lower()
+        except Exception:
+            _cur_title = ""
+        if checkpoint_seen and "checkpoint" in _cur_title:
             try:
                 self._page.reload(wait_until="domcontentloaded", timeout=20000)
                 self._page.wait_for_timeout(500)
