@@ -786,11 +786,13 @@ class PDPBrowserExtractor:
         assert self._page is not None
         start = time.time()
         nav_ok = False
+        _accepted_host = ""
         for _host in BROWSER_HOST_ORDER:
             url = f"{_host}/products/{handle}"
             try:
                 self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
-            except Exception:
+            except Exception as _nav_exc:
+                log(f"PDP browser {handle} | {_host} | nav error ({type(_nav_exc).__name__}: {_nav_exc}), retrying with fresh page")
                 # Navigation failed; open a fresh page and retry this host once.
                 try:
                     old_page = self._page
@@ -803,7 +805,8 @@ class PDPBrowserExtractor:
                     except Exception:
                         pass
                     self._page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
-                except Exception:
+                except Exception as _retry_exc:
+                    log(f"PDP browser {handle} | {_host} | retry failed ({type(_retry_exc).__name__}), skipping host")
                     continue  # try next host
             # Reject chrome-error, Cloudflare challenge, and rate-limit pages.
             current_url = self._page.url or ""
@@ -823,12 +826,15 @@ class PDPBrowserExtractor:
                 or ("error" in current_url.lower() and "products" not in current_url)
             )
             if bad_page:
+                log(f"PDP browser {handle} | {_host} | blocked page: title={current_title!r} url={current_url!r}")
                 continue  # try next host
+            _accepted_host = _host
             nav_ok = True
             self._page.wait_for_timeout(1500)  # throttle to stay below Cloudflare rate-limit
             break
 
         if not nav_ok:
+            log(f"PDP browser {handle} | all {len(BROWSER_HOST_ORDER)} hosts failed, returning empty")
             return {"details": "", "stretch": "", "description": ""}
 
         # lightweight checkpoint wait; keep bounded for speed.
@@ -940,7 +946,15 @@ class PDPBrowserExtractor:
             description_text = ""
 
         elapsed = time.time() - start
-        log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
+        try:
+            _final_title = self._page.title() or ""
+        except Exception:
+            _final_title = ""
+        log(
+            f"PDP browser {handle} | {_accepted_host} | {elapsed:.2f}s"
+            f" | details={'yes' if details_text else 'no'}"
+            f" | title={_final_title!r}"
+        )
         return {"details": details_text, "stretch": stretch, "description": description_text}
 
     def close(self) -> None:
@@ -1200,6 +1214,9 @@ class PaigeScraper:
         rise = extract_measurement(description, ["Front Rise", "Rise"])
         inseam = extract_measurement(description, ["Inseam", "Inleg"])
         leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+        rise_src = "browser" if rise else ""
+        inseam_src = "browser" if inseam else ""
+        leg_src = "browser" if leg_opening else ""
 
         # Stage 2: product.json REST — fill any gaps the browser missed.
         if not (rise and inseam and leg_opening):
@@ -1215,11 +1232,22 @@ class PaigeScraper:
                     if body_text:
                         description_parts.append(body_text)
                         description = ", ".join(dedupe_description_parts(description_parts))
-                        rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
-                        inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
-                        leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
-            except Exception:
-                pass
+                        if not rise:
+                            rise = extract_measurement(description, ["Front Rise", "Rise"])
+                            if rise:
+                                rise_src = "REST"
+                        if not inseam:
+                            inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                            if inseam:
+                                inseam_src = "REST"
+                        if not leg_opening:
+                            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                            if leg_opening:
+                                leg_src = "REST"
+                elif product_json.status_code == 429:
+                    log(f"PDP fields {handle} | REST product.json returned 429")
+            except Exception as _exc:
+                log(f"PDP fields {handle} | REST product.json error: {type(_exc).__name__}: {_exc}")
 
         # Stage 3: HTML scrape — fill any remaining gaps.
         if not (rise and inseam and leg_opening):
@@ -1234,24 +1262,51 @@ class PaigeScraper:
                 if details_description:
                     description_parts.append(details_description)
                     description = ", ".join(dedupe_description_parts(description_parts))
-                    rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
-                    inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
-                    leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
-            except Exception:
-                pass
+                    if not rise:
+                        rise = extract_measurement(description, ["Front Rise", "Rise"])
+                        if rise:
+                            rise_src = "html-scrape"
+                    if not inseam:
+                        inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                        if inseam:
+                            inseam_src = "html-scrape"
+                    if not leg_opening:
+                        leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                        if leg_opening:
+                            leg_src = "html-scrape"
+                else:
+                    log(f"PDP fields {handle} | html-scrape: no details description found")
+            except Exception as _exc:
+                log(f"PDP fields {handle} | html-scrape error: {type(_exc).__name__}: {_exc}")
 
         # Stage 4: Algolia/GraphQL description seed — last-resort fallback for any still-missing
         # measurements. Browser values (Stage 1) are never overridden because of the `or` guards.
         if description_seed:
             description_parts.append(description_seed)
             description = ", ".join(dedupe_description_parts(description_parts))
-            rise = rise or extract_measurement(description, ["Front Rise", "Rise"])
-            inseam = inseam or extract_measurement(description, ["Inseam", "Inleg"])
-            leg_opening = leg_opening or extract_measurement(description, ["Leg Opening", "Opening"])
+            if not rise:
+                rise = extract_measurement(description, ["Front Rise", "Rise"])
+                if rise:
+                    rise_src = "algolia-seed"
+            if not inseam:
+                inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                if inseam:
+                    inseam_src = "algolia-seed"
+            if not leg_opening:
+                leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                if leg_opening:
+                    leg_src = "algolia-seed"
         if not stretch:
             stretch = normalize_stretch_value(extract_label_text(description_seed, ["Stretch"]))
 
         description = ", ".join(dedupe_description_parts(description_parts))
+
+        log(
+            f"PDP fields {handle}"
+            f" | rise={rise!r}({rise_src or 'missing'})"
+            f" | inseam={inseam!r}({inseam_src or 'missing'})"
+            f" | leg={leg_opening!r}({leg_src or 'missing'})"
+        )
 
         result = {
             "description": description,
@@ -1328,6 +1383,7 @@ class PaigeScraper:
             if algolia_body_html:
                 algolia_text = strip_html_text(algolia_body_html)
                 seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
+            log(f"START handle {processed_handles + 1} | {handle} | {title}")
             pdp_start = time.time()
             pdp_fields = self.fetch_pdp_fields(handle, seed_description, title=title)
             pdp_total_seconds += (time.time() - pdp_start)
