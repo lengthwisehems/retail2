@@ -685,7 +685,7 @@ class PDPBrowserExtractor:
 
     def __init__(self) -> None:
         self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
         self._playwright = None
         self._browser = None
         self._context = None
@@ -1133,13 +1133,6 @@ class PaigeScraper:
             description = (seed_clean + "; " + meta_str) if meta_str else seed_clean
         else:
             description = meta_str
-
-        log(
-            f"PDP fields {handle}"
-            f" | rise={rise!r}({'specs' if rise else 'missing'})"
-            f" | inseam={inseam!r}({'specs' if inseam else 'missing'})"
-            f" | leg={leg_opening!r}({'specs' if leg_opening else 'missing'})"
-        )
 
         result = {
             "description": description,
