@@ -36,11 +36,6 @@ BROWSER_HOST_ORDER = [
     "https://paige.com",
     "https://www.paige.com",
 ]
-ATTRIBUTE_KEYS_ORDER = (
-    "closure", "clothingtype", "colorcategory", "colorvariants",
-    "denimfabric", "fit", "fitvariants", "gender", "inseamvariants",
-    "length", "producttype", "rise", "specs", "stretch", "stylecontent",
-)
 STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Accent Hardware", "Ankle", "Belted", "Coated", "Corduroy", "Crop", "Crushed", "Crystal",
     "Cuff", "Cuffed", "Cutoff", "Darted", "Destroyed", "Fit", "Flag", "Flap Pocket", "Flap",
@@ -1042,26 +1037,6 @@ class PaigeScraper:
                 onlineStoreUrl
                 totalInventory
                 featuredImage { url }
-                metafields(identifiers: [
-                  {namespace: "attributes", key: "closure"},
-                  {namespace: "attributes", key: "clothingtype"},
-                  {namespace: "attributes", key: "colorcategory"},
-                  {namespace: "attributes", key: "colorvariants"},
-                  {namespace: "attributes", key: "denimfabric"},
-                  {namespace: "attributes", key: "fit"},
-                  {namespace: "attributes", key: "fitvariants"},
-                  {namespace: "attributes", key: "gender"},
-                  {namespace: "attributes", key: "inseamvariants"},
-                  {namespace: "attributes", key: "length"},
-                  {namespace: "attributes", key: "producttype"},
-                  {namespace: "attributes", key: "rise"},
-                  {namespace: "attributes", key: "specs"},
-                  {namespace: "attributes", key: "stretch"},
-                  {namespace: "attributes", key: "stylecontent"},
-                ]) {
-                  key
-                  value
-                }
                 variants(first: 250) {
                   nodes {
                     id
@@ -1219,47 +1194,118 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(
-        self,
-        handle: str,
-        metafields: Dict[str, str],
-        description_seed: str = "",
-        title: str = "",
-    ) -> Dict[str, str]:
+    def fetch_pdp_fields(self, handle: str, description_seed: str = "", title: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
+        description_parts: List[str] = []
+        stretch = ""
 
-        # Rise, Inseam, Leg Opening come from the "specs" metafield, e.g.:
-        #   Rise: 10"\nInseam: 28"\nLeg Opening: 10 1/4"
-        specs = metafields.get("specs", "")
-        rise = extract_measurement(specs, ["Front Rise", "Rise"])
-        inseam = extract_measurement(specs, ["Inseam", "Inleg"])
-        leg_opening = extract_measurement(specs, ["Leg Opening", "Opening"])
-
-        # Stretch from browser dot-position indicator. Metafield is fallback.
+        # Stage 1: Browser (source of truth — PDP DETAILS panel).
         browser_data = self.browser_extractor.fetch(handle)
-        stretch = normalize_stretch_value(browser_data.get("stretch", ""))
-        if not stretch:
-            stretch = normalize_stretch_value(metafields.get("stretch", ""))
+        browser_desc = browser_data.get("description", "")
+        browser_details = browser_data.get("details", "")
+        if browser_desc:
+            description_parts.append(browser_desc)
+        if browser_details:
+            description_parts.append(browser_details)
+        if browser_data.get("stretch"):
+            stretch = normalize_stretch_value(browser_data["stretch"])
+        description = ", ".join(dedupe_description_parts(description_parts))
+        rise = extract_measurement(description, ["Front Rise", "Rise"])
+        inseam = extract_measurement(description, ["Inseam", "Inleg"])
+        leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+        rise_src = "browser" if rise else ""
+        inseam_src = "browser" if inseam else ""
+        leg_src = "browser" if leg_opening else ""
 
-        # Build description: product description seed followed by each
-        # attribute metafield as "key : value;".
-        meta_str = " ".join(
-            f"{key} : {metafields[key]};"
-            for key in ATTRIBUTE_KEYS_ORDER
-            if metafields.get(key)
-        )
+        # Stage 2: product.json REST — fill any gaps the browser missed.
+        if not (rise and inseam and leg_opening):
+            try:
+                product_json = self.session.get(
+                    urljoin(PDP_HOST, f"/products/{handle}.json"),
+                    timeout=20,
+                    allow_redirects=True,
+                )
+                if product_json.status_code == 200:
+                    body_html = (product_json.json().get("product") or {}).get("body_html") or ""
+                    body_text = strip_html_text(body_html)
+                    if body_text:
+                        description_parts.append(body_text)
+                        description = ", ".join(dedupe_description_parts(description_parts))
+                        if not rise:
+                            rise = extract_measurement(description, ["Front Rise", "Rise"])
+                            if rise:
+                                rise_src = "REST"
+                        if not inseam:
+                            inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                            if inseam:
+                                inseam_src = "REST"
+                        if not leg_opening:
+                            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                            if leg_opening:
+                                leg_src = "REST"
+                elif product_json.status_code == 429:
+                    log(f"PDP fields {handle} | REST product.json returned 429")
+            except Exception as _exc:
+                log(f"PDP fields {handle} | REST product.json error: {type(_exc).__name__}: {_exc}")
+
+        # Stage 3: HTML scrape — fill any remaining gaps.
+        if not (rise and inseam and leg_opening):
+            url = urljoin(PDP_HOST, f"/products/{handle}")
+            try:
+                response = self.session.get(url, timeout=20, allow_redirects=True)
+                response.raise_for_status()
+                details_description = extract_pdp_description(response.text)
+                stretch_from_html = extract_stretch_from_html(response.text)
+                if stretch_from_html and not stretch:
+                    stretch = normalize_stretch_value(stretch_from_html)
+                if details_description:
+                    description_parts.append(details_description)
+                    description = ", ".join(dedupe_description_parts(description_parts))
+                    if not rise:
+                        rise = extract_measurement(description, ["Front Rise", "Rise"])
+                        if rise:
+                            rise_src = "html-scrape"
+                    if not inseam:
+                        inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                        if inseam:
+                            inseam_src = "html-scrape"
+                    if not leg_opening:
+                        leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                        if leg_opening:
+                            leg_src = "html-scrape"
+                else:
+                    log(f"PDP fields {handle} | html-scrape: no details description found")
+            except Exception as _exc:
+                log(f"PDP fields {handle} | html-scrape error: {type(_exc).__name__}: {_exc}")
+
+        # Stage 4: Algolia/GraphQL description seed — last-resort fallback for any still-missing
+        # measurements. Browser values (Stage 1) are never overridden because of the `or` guards.
         if description_seed:
-            seed_clean = description_seed.rstrip().rstrip(";").rstrip()
-            description = (seed_clean + "; " + meta_str) if meta_str else seed_clean
-        else:
-            description = meta_str
+            description_parts.append(description_seed)
+            description = ", ".join(dedupe_description_parts(description_parts))
+            if not rise:
+                rise = extract_measurement(description, ["Front Rise", "Rise"])
+                if rise:
+                    rise_src = "algolia-seed"
+            if not inseam:
+                inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                if inseam:
+                    inseam_src = "algolia-seed"
+            if not leg_opening:
+                leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                if leg_opening:
+                    leg_src = "algolia-seed"
+        if not stretch:
+            stretch = normalize_stretch_value(extract_label_text(description_seed, ["Stretch"]))
+
+        description = ", ".join(dedupe_description_parts(description_parts))
 
         log(
             f"PDP fields {handle}"
-            f" | rise={rise!r}({'specs' if rise else 'missing'})"
-            f" | inseam={inseam!r}({'specs' if inseam else 'missing'})"
-            f" | leg={leg_opening!r}({'specs' if leg_opening else 'missing'})"
+            f" | rise={rise!r}({rise_src or 'missing'})"
+            f" | inseam={inseam!r}({inseam_src or 'missing'})"
+            f" | leg={leg_opening!r}({leg_src or 'missing'})"
         )
 
         result = {
@@ -1267,7 +1313,7 @@ class PaigeScraper:
             "rise": rise,
             "inseam": inseam,
             "leg_opening": leg_opening,
-            "stretch": stretch,
+            "stretch": stretch or normalize_stretch_value(extract_label_text(description, ["Stretch"])),
             "elapsed": "",
         }
         self._pdp_cache[handle] = result
@@ -1337,16 +1383,9 @@ class PaigeScraper:
             if algolia_body_html:
                 algolia_text = strip_html_text(algolia_body_html)
                 seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
-            # Build metafields dict from the GraphQL product node.
-            metafields_list = style.get("metafields") or []
-            metafields: Dict[str, str] = {
-                mf["key"]: mf["value"]
-                for mf in metafields_list
-                if mf and mf.get("key") and mf.get("value")
-            }
             log(f"START handle {processed_handles + 1} | {handle} | {title}")
             pdp_start = time.time()
-            pdp_fields = self.fetch_pdp_fields(handle, metafields, seed_description, title=title)
+            pdp_fields = self.fetch_pdp_fields(handle, seed_description, title=title)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
             if processed_handles % 50 == 0:
@@ -1372,15 +1411,14 @@ class PaigeScraper:
             production_cost = extract_tag_value(tags, "productionCost:")
             site_exclusive = extract_tag_value(tags, "productType:")
             product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
-            algolia_attrs = ((style_algolia.get("meta") or {}).get("attributes") or {})
-            fit_hint = metafields.get("fit") or algolia_attrs.get("fit", "")
-            length_hint = metafields.get("length") or algolia_attrs.get("length", "")
-            rise_hint = metafields.get("rise") or algolia_attrs.get("rise", "")
-            wash_hint = algolia_attrs.get("wash", "")
-            color_hint = metafields.get("colorcategory") or algolia_attrs.get("colorCategory", "")
-            algolia_denim_fabric = metafields.get("denimfabric") or algolia_attrs.get("denimFabric", "")
-            algolia_stretch_attr = metafields.get("stretch") or algolia_attrs.get("stretch", "")
-            inseam_hint = safe_string(algolia_attrs.get("inseam", ""))
+            fit_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("fit", "")
+            length_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("length", "")
+            rise_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("rise", "")
+            wash_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("wash", "")
+            color_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("colorCategory", "")
+            algolia_denim_fabric = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("denimFabric", "")
+            algolia_stretch_attr = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("stretch", "")
+            inseam_hint = safe_string(((style_algolia.get("meta") or {}).get("attributes") or {}).get("inseam", ""))
 
             for variant in variants:
                 raw_size = safe_string(

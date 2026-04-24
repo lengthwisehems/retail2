@@ -1,0 +1,1658 @@
+import csv
+import html
+import json
+import os
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+LOG_FILE = BASE_DIR / "paige_inventory.log"
+
+ALGOLIA_APP_ID = "DK4YY42827"
+ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
+ALGOLIA_INDEX = "production_products"
+ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
+GRAPHQL_URL = "https://paige-7873.myshopify.com/api/unstable/graphql.json"
+GRAPHQL_TOKEN = "383d494a76122b5e6cadffc2c7667ef2"
+HOST_ROTATION = [
+    "https://shop.paige.com",
+    "https://paige-7873.myshopify.com",
+    "https://paige.com",
+]
+PDP_HOST = "https://shop.paige.com"
+STYLE_NAME_REMOVE_PHRASES: List[str] = [
+    "Accent Hardware", "Ankle", "Belted", "Coated", "Corduroy", "Crop", "Crushed", "Crystal",
+    "Cuff", "Cuffed", "Cutoff", "Darted", "Destroyed", "Fit", "Flag", "Flap Pocket", "Flap",
+    "Flip", "Frayed Seam", "Front Yoke", "Frontier", "High Rise", "Inch", "Inset", "Jean",
+    "Krystal", "Leather", "Lightweight", "Lo", "low and loose", "Low Rise", "Mid Rise", "Panel",
+    "Pant", "Patch", "Petite", "Pintucked", "Plaid", "Plus", "Raw Hem", "Renaissance", "Repair",
+    "Rinse", "Ripped", "Saddle", "Seam", "Seamed Front Yoke", "Seamed", "Selvedge", "Sequin",
+    "Side Seam Snaps", "Skimmer", "Slice", "Snake Print", "Sott", "Spark", "Spliced", "Split",
+    "Studded", "Super", "Track Pant", "Trashed", "Trouser", "Vegan Leather", "vent", "slit",
+    "W/ Contrast Front Panel", "w/ Cuff", "w/ Flap Jean", "w/ Slit Hem", "W/ Stud Detailing",
+    "W/ Wide Cuff", "W/Flap", "Wax", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper",
+]
+
+PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
+PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
+ATTRIBUTE_KEYS_ORDER = (
+    "closure", "clothingtype", "colorcategory", "colorvariants",
+    "denimfabric", "fit", "fitvariants", "gender", "inseamvariants",
+    "length", "producttype", "rise", "specs", "stretch", "stylecontent",
+)
+
+CSV_HEADERS = [
+    "Style Id",
+    "Handle",
+    "Published At",
+    "Created At",
+    "Product",
+    "Style Name",
+    "Product Type",
+    "Tags",
+    "Vendor",
+    "Description",
+    "Variant Title",
+    "Color",
+    "Size",
+    "Rise",
+    "Inseam",
+    "Leg Opening",
+    "Price",
+    "Compare at Price",
+    "Available for Sale",
+    "Quantity Available",
+    "Returns",
+    "Quantity Available (Instore Inventory)",
+    "Quantity Available (Online Inventory)",
+    "Google Analytics Purchases",
+    "Quantity of style",
+    "SKU - Shopify",
+    "SKU - Brand",
+    "Barcode",
+    "Product Line",
+    "Image URL",
+    "SKU URL",
+    "Jean Style",
+    "Inseam Label",
+    "Inseam Style",
+    "Rise Label",
+    "Hem Style",
+    "Color - Simplified",
+    "Color - Standardized",
+    "Country Produced",
+    "Stretch",
+    "Production Cost",
+    "Site Exclusive",
+]
+
+
+def ensure_directories() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        LOG_FILE.touch(exist_ok=True)
+    except PermissionError:
+        pass
+
+
+def log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{timestamp}] {message}\n")
+    except PermissionError:
+        pass
+
+
+def format_price(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"${numeric:.2f}"
+
+
+def format_date(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    iso_value = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso_value)
+    except ValueError:
+        try:
+            dt = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return value
+    return dt.strftime("%m/%d/%Y")
+    
+def join_tags(tags: Iterable[str]) -> str:
+    cleaned: List[str] = []
+    for tag in tags:
+        
+        if not tag:
+            continue
+        text = html.unescape(str(tag)).strip()
+        if text:
+            cleaned.append(text)
+    return ", ".join(cleaned)
+
+
+def safe_string(value: Optional[object]) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def extract_tag_value(tags: Iterable[str], prefix: str) -> str:
+    prefix_lower = prefix.lower()
+    for tag in tags:
+        if not tag:
+            continue
+        tag_text = str(tag)
+        if tag_text.lower().startswith(prefix_lower):
+            return html.unescape(tag_text[len(prefix):]).strip()
+    return ""
+
+
+def should_keep_product(tags: Iterable[str], title: str, source_collection: str) -> bool:
+    tag_set = {str(tag).strip() for tag in tags}
+    has_required_tag = any(
+        key in tag_set
+        for key in (
+            "clothingType:Jeans",
+            "clothingTypeCode:JEAN",
+            "category:Denim Bottoms",
+            "clothingType:Pant",
+        )
+    )
+    title_has_keyword = ("jean" in title.lower()) or ("pant" in title.lower())
+    if source_collection == "women-denim":
+        return True
+    return has_required_tag and title_has_keyword
+
+
+def derive_product_type(tags: Iterable[str], title: str) -> str:
+    title_lower = title.lower()
+    tag_set = {str(tag).strip() for tag in tags}
+    if "jean" in title_lower:
+        return "Jeans"
+    if any(tag in tag_set for tag in ("clothingType:Jeans", "clothingTypeCode:JEAN", "category:Denim Bottoms")):
+        return "Jeans"
+    if "pant" in title_lower:
+        return "Pants"
+    if any(tag in tag_set for tag in ("clothingType:Pant", "clothingTypeCode:PAN")):
+        return "Pants"
+    return ""
+
+
+def derive_style_name_base(product_title: str) -> str:
+    text = (product_title or "").split("-", 1)[0].strip()
+    text = text.replace('"', " ")
+    text = re.sub(r"\b\d+\b", " ", text)
+    for phrase in sorted(STYLE_NAME_REMOVE_PHRASES, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def to_float(value: str) -> Optional[float]:
+    try:
+        return float(value) if value != "" else None
+    except ValueError:
+        return None
+
+
+def contains_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    pattern = re.escape(phrase.strip()).replace(r"\ ", r"\s+")
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text.lower()) is not None
+
+
+def text_has_any(text: str, phrases: Sequence[str]) -> bool:
+    return any(contains_phrase(text, phrase) for phrase in phrases)
+
+
+def _straight_bucket(leg_opening: str) -> str:
+    lo = to_float(leg_opening)
+    if lo is None:
+        return ""
+    if lo < 15.5:
+        return "Straight from Knee"
+    if lo <= 17:
+        return "Straight from Knee/Thigh"
+    return "Straight from Thigh"
+
+
+def _map_jean_keywords(text: str, leg_opening: str, include_mom: bool) -> str:
+    text = (text or "").lower()
+    if not text:
+        return ""
+    straight_bucket = _straight_bucket(leg_opening)
+    taper_words = ("taper", "tapering", "tapered")
+    if include_mom:
+        taper_words = (*taper_words, "mom")
+    rules = [
+        (("barrel", "bowed", "bow leg", "stovepipe", "stove-pipe", "horseshoe"), "Barrel"),
+        (taper_words, "Tapered"),
+        (("baggy",), "Baggy"),
+        (("flare",), "Flare"),
+        (("bootcut", "boot"), "Bootcut"),
+        (("skinny",), "Skinny"),
+        (("wide leg", "wide-leg", "palazzo"), "Wide Leg"),
+        (("cigarette", "slim"), "Straight from Knee"),
+    ]
+    for phrases, output in rules:
+        if text_has_any(text, phrases):
+            return output
+    if contains_phrase(text, "straight"):
+        return straight_bucket
+    return ""
+
+
+def derive_jean_style(style_name: str, title: str, description: str, leg_opening: str) -> str:
+    # Step 1: Style Name
+    mapped = _map_jean_keywords(style_name, leg_opening, include_mom=True)
+    if mapped:
+        return mapped
+    # Step 3: Description
+    mapped = _map_jean_keywords(description, leg_opening, include_mom=False)
+    if mapped:
+        return mapped
+    return ""
+
+
+def derive_jean_style_from_fit(fit_hint: str, tags: str, leg_opening: str) -> str:
+    # Step 5 fallback only
+    mapped = _map_jean_keywords(fit_hint, leg_opening, include_mom=False)
+    if mapped:
+        return mapped
+    if text_has_any((tags or "").lower(), ("baggy",)):
+        return "Baggy"
+    return ""
+
+
+def derive_inseam_label(title: str, description: str, jean_style: str, inseam: str) -> str:
+    title_l = title.lower()
+    if "petite" in title_l:
+        return "Petite"
+    if "longer" in description.lower():
+        return "Long"
+    inseam_value = to_float(inseam)
+    if inseam_value is None:
+        return "Regular"
+    if jean_style in {"Barrel", "Bootcut", "Flare", "Wide Leg", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"} and inseam_value >= 33:
+        return "Long"
+    if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and inseam_value >= 30:
+        return "Long"
+    return "Regular"
+
+
+def derive_inseam_style(jean_style: str, inseam_label: str, inseam: str, length_hint: str = "") -> str:
+    val = to_float(inseam)
+    label = inseam_label or "Regular"
+    wide_group = {"Barrel", "Bootcut", "Flare", "Wide Leg", "Straight from Thigh", "Baggy", "Straight from Knee/Thigh"}
+    skinny_group = {"Skinny", "Tapered", "Straight from Knee"}
+    if val is not None:
+        if jean_style in wide_group:
+            if label == "Petite":
+                return "Cropped" if val <= 25 else ("Ankle" if val <= 28 else "Full Length")
+            if label == "Regular":
+                return "Cropped" if val <= 28 else ("Ankle" if val < 31 else "Full Length")
+            if label == "Long" and val >= 33:
+                return "Full Length"
+        if jean_style in skinny_group:
+            if label == "Petite":
+                return "Cropped" if val < 25 else "Full Length"
+            if label == "Regular":
+                return "Cropped" if val < 27 else ("Full Length" if val < 30 else "Full Length")
+            if label == "Long" and val >= 30:
+                return "Full Length"
+    hint = (length_hint or "").strip()
+    if hint:
+        hint_lower = hint.lower()
+        if jean_style in skinny_group and hint_lower == "ankle":
+            return "Full Length"
+        if jean_style in wide_group and hint_lower == "extra long":
+            return "Full Length"
+        if jean_style in wide_group:
+            return hint
+    return ""
+
+
+def derive_rise_label(title: str, handle: str, description: str, rise_hint: str = "") -> str:
+    t = f"{title} {handle} {description} {rise_hint}".lower()
+    if any(k in t for k in ("super low rise", "ultra low rise", "super low waist", "ultra low waist")):
+        return "Ultra Low"
+    if any(k in t for k in ("super high rise", "ultra high rise", "super high waist", "ultra high waist")):
+        return "Ultra High"
+    if any(k in t for k in ("mid-rise", "mid rise")):
+        return "Mid"
+    if any(k in t for k in ("low-rise", "low rise", " low waist")):
+        return "Low"
+    if any(k in t for k in ("high-rise", "high rise", " high waist")):
+        return "High"
+    # Handle bare Algolia rise_hint values like "Low" or "High"
+    hint_stripped = (rise_hint or "").strip().lower()
+    if hint_stripped == "low":
+        return "Low"
+    if hint_stripped == "high":
+        return "High"
+    if hint_stripped == "mid":
+        return "Mid"
+    if hint_stripped in ("ultra low", "super low"):
+        return "Ultra Low"
+    if hint_stripped in ("ultra high", "super high"):
+        return "Ultra High"
+    return ""
+
+
+def derive_hem_style(description: str) -> str:
+    d = description.lower()
+    if any(k in d for k in ("split hem", "side slits", "side-slits", "slit inseams at the hem", "slit at the hem", "slit hem")):
+        return "Split Hem"
+    if any(k in d for k in ("released hem", "undone finished hem", "undone hem", "released-hem")):
+        return "Released Hem"
+    if any(k in d for k in ("raw hem", "raw-edge hem", "raw edge hem", "raw-hem")):
+        return "Raw Hem"
+    if any(k in d for k in ("wide hem", "wide-hem", "trouser hem")):
+        return "Wide Hem"
+    if any(k in d for k in ("distressed hem", "distressed-hem", "destroyed hem", "destructed hem")):
+        return "Distressed Hem"
+    if "zippers at the hem" in d:
+        return "Zipper Hem"
+    if any(k in d for k in ("clean hem", "finished hem", "clean-edge hem", "clean finished hem", "clean-finished hem")):
+        return "Clean Hem"
+    return ""
+
+
+def derive_color_standardized(color: str, description: str, color_hint: str = "") -> str:
+    c = color.lower()
+    d = description.lower()
+    hint = color_hint.lower()
+    mapping = [
+        (("animal print", "leopard", "snake", "camo"), "Animal Print"),
+        (("blue", "navy", "indigo"), "Blue"),
+        (("green", "moss", "olive", "sage"), "Green"),
+        (("grey", "gray", "smoke"), "Grey"),
+        (("orange",), "Orange"),
+        (("pink",), "Pink"),
+        (("purple", "violet", "maroon"), "Purple"),
+        (("red", "wine", "burgundy", "oxblood"), "Red"),
+        (("tan", "beige", "khaki", "light taupe"), "Tan"),
+        (("white", "ecru", "egret", "cream", "bleach"), "White"),
+        (("yellow",), "Yellow"),
+        (("black", "onyx", "noir", "raven"), "Black"),
+        (("brown", "cinnamon", "coffee", "espresso"), "Brown"),
+    ]
+    for keys, out in mapping:
+        if text_has_any(c, keys):
+            return out
+    for keys, out in mapping:
+        if text_has_any(d, keys):
+            return out
+    if text_has_any(
+        d,
+        (
+            "dark base",
+            "acid wash",
+            "dark rinse",
+            "dark stretch denim",
+            "dark washed",
+            "medium-dark",
+            "medium-light",
+            "dark vintage wash",
+            "dark wash",
+            "deep wash",
+            "light vintage wash",
+            "light vintage-inspired wash",
+            "light wash",
+            "light/medium wash",
+            "light-to-medium wash",
+            "medium wash",
+            "medium/dark soft vintage wash",
+            "medium/dark wash",
+        ),
+    ):
+        return "Blue"
+    for keys, out in mapping:
+        if text_has_any(hint, keys):
+            return out
+    return ""
+
+
+def derive_color_simplified(color: str, description: str, standardized: str, wash_hint: str = "") -> str:
+    s = standardized.lower()
+    c = color.lower()
+    d = description.lower()
+    if "black" in s or "brown" in s:
+        return "Dark"
+    if "white" in s or "tan" in s:
+        return "Light"
+    if text_has_any(c, ("wine", "burgundy", "navy", "dark", "deep")):
+        return "Dark"
+    if text_has_any(c, ("pastel", "cream", "light")):
+        return "Light"
+    if text_has_any(c, ("medium", "mid")):
+        return "Medium"
+    if text_has_any(d, ("medium light", "light medium", "light to medium", "medium to light", "light-to-medium", "medium-to-light", "medium-light", "light-medium", "light/medium", "medium/light")):
+        return "Light to Medium"
+    if text_has_any(d, ("medium dark", "dark medium", "dark to medium", "medium to dark", "dark-to-medium", "medium-to-dark", "medium-dark", "dark-medium", "dark/medium", "medium/dark")):
+        return "Medium to Dark"
+    if text_has_any(d, ("dark", "deep", "black", "wine", "burgundy", "midnight blue", "forest green", "navy")):
+        return "Dark"
+    if text_has_any(d, ("light blue", "pale blue", "powdery blue", "powder blue", "light vintage", "soft blue", "soft pink", "ecru", "white", "acid wash", "acid-wash", "light", "khaki", "tan", "ivory")):
+        return "Light"
+    if text_has_any(d, ("mid blue", "mid-blue", "medium stone wash", "classic stone washed blue", "vintage washed blue", "classic vintage blue", "medium blue", "medium wash", "classic blue")):
+        return "Medium"
+    return wash_hint
+
+
+def normalize_text(tag: Tag) -> str:
+    text = " ".join(part.strip() for part in tag.stripped_strings if part.strip())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_html_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    return normalize_text(BeautifulSoup(raw_html, "html.parser"))
+
+
+def dedupe_description_parts(parts: Sequence[str]) -> List[str]:
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        cleaned = re.sub(r"\s+", " ", (part or "")).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower().replace("’", "'").replace("“", '"').replace("”", '"')
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+    return deduped
+
+
+def extract_pdp_description(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    matches = [node for node in soup.select(PDP_SELECTOR) if isinstance(node, Tag)]
+    values = [normalize_text(node) for node in matches if normalize_text(node)]
+    if values:
+        return ", ".join(values)
+
+    parent = soup.select_one(PDP_PARENT_SELECTOR)
+    if parent is not None:
+        values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
+        if values:
+            return ", ".join(values)
+
+    keyword_hits: List[str] = []
+    for node in soup.find_all(["li", "p", "span"]):
+        node_text = normalize_text(node)
+        node_lower = node_text.lower()
+        if any(token in node_lower for token in ("front rise", "rise", "inseam", "leg opening", "stretch")):
+            keyword_hits.append(node_text)
+    if keyword_hits:
+        return ", ".join(dict.fromkeys(keyword_hits))
+
+    return ""
+
+
+def parse_mixed_fraction(raw_value: str) -> Optional[float]:
+    value = raw_value.strip().replace("″", "").replace('"', "")
+    if not value:
+        return None
+    mixed = re.fullmatch(r"(\d+)\s+(\d+)/(\d+)", value)
+    if mixed:
+        whole = float(mixed.group(1))
+        numerator = float(mixed.group(2))
+        denominator = float(mixed.group(3))
+        if denominator == 0:
+            return None
+        return whole + (numerator / denominator)
+    fraction = re.fullmatch(r"(\d+)/(\d+)", value)
+    if fraction:
+        numerator = float(fraction.group(1))
+        denominator = float(fraction.group(2))
+        if denominator == 0:
+            return None
+        return numerator / denominator
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def extract_measurement(text: str, labels: Sequence[str]) -> str:
+    fraction_map = {
+        "¼": " 1/4",
+        "½": " 1/2",
+        "¾": " 3/4",
+        "⅛": " 1/8",
+        "⅜": " 3/8",
+        "⅝": " 5/8",
+        "⅞": " 7/8",
+    }
+    norm_text = text
+    for symbol, replacement in fraction_map.items():
+        norm_text = norm_text.replace(symbol, replacement)
+    number_pattern = r"([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)"
+    for label in labels:
+        patterns = [
+            rf"{label}\s*:\s*{number_pattern}",
+            rf"{label}\s*[-]?\s*{number_pattern}\s*(?:in|inch|inches|\"|”)?",
+            rf"{number_pattern}\s*(?:in|inch|inches|\"|”)?\s*{label}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, norm_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = parse_mixed_fraction(match.group(1))
+            if value is None:
+                continue
+            return format_decimal(value)
+    return ""
+
+
+def format_decimal(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text
+
+
+def extract_label_text(text: str, labels: Sequence[str]) -> str:
+    for label in labels:
+        match = re.search(rf"{label}\s*:\s*([^,]+)", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def extract_stretch_from_html(html_text: str) -> str:
+    """Parse the stretch-scale widget from static HTML.
+
+    The widget renders as a parent container holding an odd number of child divs
+    where every other child (positions 1, 3, 5, 7, 9) is a visible "dot" and the
+    active dot carries a class that includes the word "active".  We locate the
+    active dot by scanning all divs that contain both "dot" and "active" in their
+    combined class string, then count its 1-based position among all dot siblings.
+    """
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    # Find the active dot: any div whose class string contains both 'dot' and 'active'.
+    active_dot = None
+    for div in soup.find_all("div"):
+        cls = " ".join(div.get("class", [])).lower()
+        if "dot" in cls and "active" in cls:
+            active_dot = div
+            break
+
+    if active_dot is None:
+        return ""
+
+    dot_parent = active_dot.parent
+    if dot_parent is None:
+        return ""
+
+    # Collect all direct-child divs whose class includes "dot".
+    dot_siblings = [
+        d for d in dot_parent.find_all("div", recursive=False)
+        if "dot" in " ".join(d.get("class", [])).lower()
+    ]
+
+    # dot_siblings contains only the 5 actual dot elements (connectors/spacers filtered
+    # out). The active dot's 1-based position within this filtered list maps directly:
+    #   1 → High Stretch, 2 → Medium to High Stretch, 3 → Medium Stretch,
+    #   4 → Low Stretch,  5 → Rigid
+    mapping = {
+        1: "High Stretch",
+        2: "Medium to High Stretch",
+        3: "Medium Stretch",
+        4: "Low Stretch",
+        5: "Rigid",
+    }
+    for idx, child in enumerate(dot_siblings, start=1):
+        if child is active_dot:
+            return mapping.get(idx, "")
+    return ""
+
+
+def normalize_stretch_value(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    # Keep mapping strict to explicit stretch labels only (no free-text inference).
+    normalized = re.sub(r"\s+", " ", raw).strip().lower()
+    exact_map = {
+        "high stretch": "High Stretch",
+        "medium to high stretch": "Medium to High Stretch",
+        "medium stretch": "Medium Stretch",
+        "low stretch": "Low Stretch",
+        "rigid": "Rigid",
+    }
+    return exact_map.get(normalized, raw)
+
+
+def derive_stretch_from_algolia_attrs(denim_fabric: str, stretch_attr: str) -> str:
+    """Fallback: infer Stretch from Algolia product.meta.attributes fields.
+
+    Rules (in priority order):
+      denimFabric=Transcend Vintage + stretch=High Stretch   → High Stretch
+      denimFabric=Transcend Vintage + stretch=Medium Stretch → Medium to High Stretch
+      denimFabric=Transcend        + stretch=High Stretch    → High Stretch
+      denimFabric=Heritage         + stretch=Comfort Stretch → Medium Stretch
+      denimFabric=Rigid            + stretch=Rigid           → Rigid
+      denimFabric=Heritage         + stretch=Semi Rigid      → Low Stretch
+
+    Comparison is case-insensitive to handle Algolia returning values in any casing.
+    """
+    fabric = (denim_fabric or "").strip().lower()
+    stretch = (stretch_attr or "").strip().lower()
+    rules = [
+        ("transcend vintage", "high stretch",    "High Stretch"),
+        ("transcend vintage", "medium stretch",  "Medium to High Stretch"),
+        ("transcend",         "high stretch",    "High Stretch"),
+        ("heritage",          "comfort stretch", "Medium Stretch"),
+        ("rigid",             "rigid",           "Rigid"),
+        ("heritage",          "semi rigid",      "Low Stretch"),
+    ]
+    for fab, str_val, output in rules:
+        if fabric == fab and stretch == str_val:
+            return output
+    return ""
+
+
+class PDPBrowserExtractor:
+    """Browser-driven PDP extractor for Headless UI DETAILS panels."""
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._init_failed = False
+
+    def _ensure(self) -> bool:
+        if not self.enabled or self._init_failed:
+            return False
+        if self._page is not None:
+            return True
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            log(f"Playwright import failed: {exc}")
+            self._init_failed = True
+            return False
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self._context = self._browser.new_context(
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1366, "height": 1800},
+            )
+            self._page = self._context.new_page()
+            self._page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            try:
+                # warm up first navigation so first PDP is less likely to be blocked/empty
+                self._page.goto(PDP_HOST, wait_until="domcontentloaded", timeout=15000)
+                self._page.wait_for_timeout(250)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            log(f"Playwright launch failed: {exc}")
+            self._init_failed = True
+            self.close()
+            return False
+
+    def _dismiss_overlays(self) -> None:
+        if self._page is None:
+            return
+        try:
+            self._page.evaluate(
+                """
+                () => {
+                  document.querySelectorAll(
+                    '#attentive_overlay, iframe#attentive_creative, [id*="attentive_overlay"], [data-testid*="attentive"]'
+                  ).forEach((el) => {
+                    try { el.remove(); } catch (e) {}
+                  });
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def fetch(self, handle: str) -> Dict[str, str]:
+        if not self._ensure():
+            return {"details": "", "stretch": "", "description": ""}
+        assert self._page is not None
+        url = f"{PDP_HOST}/products/{handle}"
+        start = time.time()
+        try:
+            self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception:
+            # Navigation failed (e.g. 503, timeout).  The page may now be in a
+            # broken state that would cause every subsequent handle to fail too.
+            # Open a fresh page within the same context and retry once.
+            try:
+                old_page = self._page
+                self._page = self._context.new_page()
+                self._page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+                try:
+                    old_page.close()
+                except Exception:
+                    pass
+                self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                return {"details": "", "stretch": "", "description": ""}
+
+        # lightweight checkpoint wait; keep bounded for speed.
+        checkpoint_seen = False
+        for _ in range(5):
+            page_title = (self._page.title() or "").lower()
+            if "checkpoint" not in page_title:
+                break
+            checkpoint_seen = True
+            self._page.wait_for_timeout(400)
+
+        if checkpoint_seen and "checkpoint" in (self._page.title() or "").lower():
+            try:
+                self._page.reload(wait_until="domcontentloaded", timeout=20000)
+                self._page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+        self._dismiss_overlays()
+
+        # Rise/Inseam/Leg Opening now come from the "specs" metafield — no
+        # DETAILS panel extraction needed. Browser is used for stretch only.
+        stretch = ""
+        try:
+            # Broad selector: any div whose class contains both 'dot' and 'active'.
+            # We evaluate in JS so we can scan all matching elements and pick the
+            # one that lives inside a stretch-scale-like parent.
+            idx = self._page.evaluate(
+                """
+                () => {
+                  // Find the active dot among all divs that have 'dot' and 'active' in class.
+                  const allDivs = Array.from(document.querySelectorAll('div'));
+                  const activeDot = allDivs.find(el => {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    return cls.includes('dot') && cls.includes('active');
+                  });
+                  if (!activeDot) return null;
+                  const parent = activeDot.parentElement;
+                  if (!parent) return null;
+                  const dotSiblings = Array.from(parent.children).filter(node => {
+                    const cls = (node.className || '').toString().toLowerCase();
+                    return cls.includes('dot');
+                  });
+                  const pos = dotSiblings.indexOf(activeDot) + 1;
+                  return pos > 0 ? pos : null;
+                }
+                """
+            )
+            if idx is not None:
+                # JS dotSiblings is filtered to dot-only (5 elements), so position is 1-5.
+                stretch = {
+                    1: "High Stretch",
+                    2: "Medium to High Stretch",
+                    3: "Medium Stretch",
+                    4: "Low Stretch",
+                    5: "Rigid",
+                }.get(int(idx), "")
+        except Exception:
+            stretch = ""
+
+        elapsed = time.time() - start
+        log(f"PDP browser {handle} | {elapsed:.2f}s | stretch={stretch!r}")
+        return {"stretch": stretch}
+
+    def close(self) -> None:
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+
+class PaigeScraper:
+    def __init__(self) -> None:
+        ensure_directories()
+        self.session = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                " AppleWebKit/537.36 (KHTML, like Gecko)"
+                " Chrome/124.0.0.0 Safari/537.36",
+            }
+        )
+        self._pdp_cache: Dict[str, Dict[str, str]] = {}
+        self.browser_extractor = PDPBrowserExtractor()
+
+    def graphql_request(self, query: str, variables: Dict) -> Dict:
+        response = self.session.post(
+            GRAPHQL_URL,
+            headers={
+                "X-Shopify-Storefront-Access-Token": GRAPHQL_TOKEN,
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "variables": variables},
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL errors: {payload['errors']}")
+        return payload["data"]
+
+    def fetch_graphql_products(self) -> List[Dict]:
+        query = """
+        query CollectionProducts($handle: String!, $cursor: String) {
+          collection(handle: $handle) {
+            products(first: 250, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                handle
+                title
+                description
+                createdAt
+                publishedAt
+                productType
+                tags
+                vendor
+                onlineStoreUrl
+                totalInventory
+                featuredImage { url }
+                metafields(identifiers: [
+                  {namespace: "attributes", key: "closure"},
+                  {namespace: "attributes", key: "clothingtype"},
+                  {namespace: "attributes", key: "colorcategory"},
+                  {namespace: "attributes", key: "colorvariants"},
+                  {namespace: "attributes", key: "denimfabric"},
+                  {namespace: "attributes", key: "fit"},
+                  {namespace: "attributes", key: "fitvariants"},
+                  {namespace: "attributes", key: "gender"},
+                  {namespace: "attributes", key: "inseamvariants"},
+                  {namespace: "attributes", key: "length"},
+                  {namespace: "attributes", key: "producttype"},
+                  {namespace: "attributes", key: "rise"},
+                  {namespace: "attributes", key: "specs"},
+                  {namespace: "attributes", key: "stretch"},
+                  {namespace: "attributes", key: "stylecontent"},
+                ]) {
+                  key
+                  value
+                }
+                variants(first: 250) {
+                  nodes {
+                    id
+                    title
+                    availableForSale
+                    quantityAvailable
+                    price { amount }
+                    compareAtPrice { amount }
+                    barcode
+                    sku
+                    selectedOptions { name value }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        merged: Dict[str, Dict] = {}
+        for collection_handle in ("women-denim", "women-sale"):
+            cursor = None
+            while True:
+                data = self.graphql_request(query, {"handle": collection_handle, "cursor": cursor})
+                collection = data.get("collection")
+                if not collection:
+                    break
+                block = collection["products"]
+                for product in block["nodes"]:
+                    product["_source_collection"] = collection_handle
+                    existing = merged.get(product["handle"])
+                    if existing is None:
+                        merged[product["handle"]] = product
+                    else:
+                        existing["_source_collection"] = "women-denim" if (
+                            "women-denim" in (existing.get("_source_collection"), collection_handle)
+                        ) else existing.get("_source_collection")
+                if not block["pageInfo"]["hasNextPage"]:
+                    break
+                cursor = block["pageInfo"]["endCursor"]
+        return list(merged.values())
+
+    def fetch_collection_handles_json(self) -> Optional[set[str]]:
+        for host in HOST_ROTATION:
+            plain = requests.Session()
+            plain.headers.update(self.session.headers)
+            try:
+                handles: set[str] = set()
+                for collection in ("women-denim", "women-sale"):
+                    page = 1
+                    while True:
+                        url = f"{host}/collections/{collection}/products.json?limit=250&page={page}"
+                        response = plain.get(url, timeout=30)
+                        if response.status_code == 429:
+                            raise requests.exceptions.HTTPError("429", response=response)
+                        response.raise_for_status()
+                        products = (response.json() or {}).get("products") or []
+                        if not products:
+                            break
+                        for product in products:
+                            handle = (product.get("handle") or "").strip()
+                            if handle:
+                                handles.add(handle)
+                        page += 1
+                return handles
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    log(f"fetch_collection_handles_json: 429 from {host}, trying next host")
+                else:
+                    log(f"fetch_collection_handles_json: HTTP {status} from {host}, trying next host")
+            except Exception as exc:
+                log(f"fetch_collection_handles_json: {host} failed ({exc}), trying next host")
+            finally:
+                plain.close()
+        log("fetch_collection_handles_json: all hosts exhausted, skipping handle filter")
+        return None
+
+    def algolia_request(self, params: Dict[str, str]) -> Dict:
+        query_string = "&".join(
+            f"{key}={requests.utils.quote(str(value))}" for key, value in params.items()
+        )
+        payload = {"params": query_string}
+        response = self.session.post(
+            ALGOLIA_SEARCH_URL,
+            headers={
+                "X-Algolia-Application-Id": ALGOLIA_APP_ID,
+                "X-Algolia-API-Key": ALGOLIA_API_KEY,
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def fetch_styles(self) -> List[Dict]:
+        styles: List[Dict] = []
+        page = 0
+        while True:
+            response = self.algolia_request(
+                {
+                    "filters": "(collections:women-denim OR collections:women-sale)",
+                    "distinct": "true",
+                    "hitsPerPage": 1000,
+                    "page": page,
+                }
+            )
+            hits = response.get("hits", [])
+            styles.extend(hits)
+            nb_pages = response.get("nbPages", 0)
+            page += 1
+            if page >= nb_pages:
+                break
+        return styles
+
+    def fetch_variants(self, style_id: str) -> List[Dict]:
+        variants: List[Dict] = []
+        page = 0
+        while True:
+            response = self.algolia_request(
+                {
+                    "filters": f"id={style_id} AND (collections:women-denim OR collections:women-sale)",
+                    "distinct": "false",
+                    "hitsPerPage": 1000,
+                    "page": page,
+                }
+            )
+            hits = response.get("hits", [])
+            if not hits:
+                break
+            variants.extend(hits)
+            nb_pages = response.get("nbPages", 0)
+            page += 1
+            if page >= nb_pages:
+                break
+        return variants
+
+    def fetch_algolia_variant_map(self) -> Dict[str, Dict]:
+        by_id: Dict[str, Dict] = {}
+        total_hits = 0
+        for style in self.fetch_styles():
+            style_id = str(style.get("id") or "")
+            if not style_id:
+                continue
+            for hit in self.fetch_variants(style_id):
+                total_hits += 1
+                keys = [
+                    str(hit.get("objectID") or ""),
+                    str(hit.get("id") or ""),
+                    str(hit.get("sku") or ""),
+                ]
+                for key in keys:
+                    if key:
+                        by_id[key] = hit
+        log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
+        return by_id
+
+    def fetch_pdp_fields(
+        self,
+        handle: str,
+        metafields: Dict[str, str],
+        description_seed: str = "",
+    ) -> Dict[str, str]:
+        if handle in self._pdp_cache:
+            return self._pdp_cache[handle]
+
+        # Rise, Inseam, Leg Opening from the "specs" metafield, e.g.:
+        #   Rise: 10 1/2"\nInseam: 32"\nLeg Opening: 19 1/2"
+        specs = metafields.get("specs", "")
+        rise = extract_measurement(specs, ["Front Rise", "Rise"])
+        inseam = extract_measurement(specs, ["Inseam", "Inleg"])
+        leg_opening = extract_measurement(specs, ["Leg Opening", "Opening"])
+
+        # Stretch from browser dot-position indicator. Metafield is fallback.
+        browser_data = self.browser_extractor.fetch(handle)
+        stretch = normalize_stretch_value(browser_data.get("stretch", ""))
+        if not stretch:
+            stretch = normalize_stretch_value(metafields.get("stretch", ""))
+
+        # Build description: product description seed followed by each
+        # attribute metafield formatted as "key : value;".
+        meta_str = " ".join(
+            f"{key} : {metafields[key]};"
+            for key in ATTRIBUTE_KEYS_ORDER
+            if metafields.get(key)
+        )
+        if description_seed:
+            seed_clean = description_seed.rstrip().rstrip(";").rstrip()
+            description = (seed_clean + "; " + meta_str) if meta_str else seed_clean
+        else:
+            description = meta_str
+
+        log(
+            f"PDP fields {handle}"
+            f" | rise={rise!r}({'specs' if rise else 'missing'})"
+            f" | inseam={inseam!r}({'specs' if inseam else 'missing'})"
+            f" | leg={leg_opening!r}({'specs' if leg_opening else 'missing'})"
+        )
+
+        result = {
+            "description": description,
+            "rise": rise,
+            "inseam": inseam,
+            "leg_opening": leg_opening,
+            "stretch": stretch,
+            "elapsed": "",
+        }
+        self._pdp_cache[handle] = result
+        return result
+
+    def build_rows(self) -> List[List[str]]:
+        rows: List[List[str]] = []
+        fit_hint_by_sku: Dict[str, str] = {}
+        tags_by_sku: Dict[str, str] = {}
+        processed_handles = 0
+        pdp_total_seconds = 0.0
+        rise_filled = 0
+        inseam_filled = 0
+        leg_filled = 0
+        algolia_style_map: Dict[str, Dict] = {}
+        collection_handles = self.fetch_collection_handles_json()
+        try:
+            for style_hit in self.fetch_styles():
+                handle = style_hit.get("handle")
+                if handle and handle not in algolia_style_map:
+                    algolia_style_map[handle] = style_hit
+        except Exception:
+            algolia_style_map = {}
+        algolia_variant_map = self.fetch_algolia_variant_map()
+        use_graphql = True
+        try:
+            styles = self.fetch_graphql_products()
+            log(f"Fetched {len(styles)} styles from GraphQL collections women-denim + women-sale")
+        except Exception as exc:
+            log(f"GraphQL style pull failed ({exc}), falling back to Algolia")
+            styles = self.fetch_styles()
+            use_graphql = False
+
+        for idx, style in enumerate(styles, start=1):
+            if use_graphql:
+                style_id = style.get("id", "").replace("gid://shopify/Product/", "")
+                handle = style.get("handle", "")
+                tags = style.get("tags", [])
+                title = style.get("title", "")
+                # No collection_handles check here: the GraphQL query is already scoped to the
+                # target collections, and the REST cache can lag behind for recently-published
+                # products, which would incorrectly drop them from the output.
+                if not should_keep_product(tags, title, style.get("_source_collection", "")):
+                    continue
+                variants = (style.get("variants") or {}).get("nodes") or []
+                meta_attrs: Dict[str, str] = {}
+            else:
+                style_id = str(style.get("id"))
+                handle = style.get("handle", "")
+                tags = style.get("tags", [])
+                title = style.get("title", "")
+                if collection_handles is not None and handle not in collection_handles:
+                    continue
+                meta_attrs = ((style.get("meta") or {}).get("attributes") or {})
+                variants = self.fetch_variants(style_id)
+                if not should_keep_product(tags, title, "women-sale"):
+                    continue
+            if not handle:
+                continue
+            if not variants:
+                log(f"No variants returned for style {style_id} ({handle})")
+                continue
+
+            style_algolia = algolia_style_map.get(handle, {})
+            seed_description = safe_string(style.get("description", "")) if use_graphql else ""
+            algolia_body_html = safe_string(style_algolia.get("body_html_safe", ""))
+            if algolia_body_html:
+                algolia_text = strip_html_text(algolia_body_html)
+                seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
+            # Build metafields dict from the GraphQL product node.
+            metafields_list = style.get("metafields") or []
+            metafields: Dict[str, str] = {
+                mf["key"]: mf["value"]
+                for mf in metafields_list
+                if mf and mf.get("key") and mf.get("value")
+            }
+            pdp_start = time.time()
+            pdp_fields = self.fetch_pdp_fields(handle, metafields, seed_description)
+            pdp_total_seconds += (time.time() - pdp_start)
+            processed_handles += 1
+            if pdp_fields["rise"]:
+                rise_filled += 1
+            if pdp_fields["inseam"]:
+                inseam_filled += 1
+            if pdp_fields["leg_opening"]:
+                leg_filled += 1
+            style_name = derive_style_name_base(title)
+            product_type = derive_product_type(tags, title)
+            country = extract_tag_value(tags, "country:")
+            production_cost = extract_tag_value(tags, "productionCost:")
+            site_exclusive = extract_tag_value(tags, "productType:")
+            product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
+            algolia_attrs = ((style_algolia.get("meta") or {}).get("attributes") or {})
+            fit_hint = metafields.get("fit") or algolia_attrs.get("fit", "")
+            length_hint = metafields.get("length") or algolia_attrs.get("length", "")
+            rise_hint = metafields.get("rise") or algolia_attrs.get("rise", "")
+            wash_hint = algolia_attrs.get("wash", "")
+            color_hint = metafields.get("colorcategory") or algolia_attrs.get("colorCategory", "")
+            algolia_denim_fabric = metafields.get("denimfabric") or algolia_attrs.get("denimFabric", "")
+            algolia_stretch_attr = metafields.get("stretch") or algolia_attrs.get("stretch", "")
+            inseam_hint = safe_string(algolia_attrs.get("inseam", ""))
+
+            for variant in variants:
+                raw_size = safe_string(
+                    variant.get("option1")
+                    or (variant.get("options") or {}).get("size", "")
+                )
+                if not raw_size and variant.get("selectedOptions"):
+                    for option in variant["selectedOptions"]:
+                        if (option.get("name") or "").lower() in {"size", "waist"}:
+                            raw_size = safe_string(option.get("value"))
+                size_value = raw_size.rstrip("Pp") if raw_size else ""
+
+                sku_brand = safe_string(variant.get("sku"))
+                sku_shopify = safe_string(variant.get("objectID") or variant.get("id"))
+                variant_title = f"{title} - {size_value}".strip(" -")
+                published_at = format_date(
+                    variant.get("published_at") or style.get("publishedAt") or style.get("published_at")
+                )
+                created_at = format_date(style.get("createdAt") or style.get("created_at"))
+                title_value = title
+                color_value = ""
+                if "-" in title_value:
+                    color_value = title_value.split("-")[-1].strip()
+
+                available_raw = variant.get("inventory_available")
+                if available_raw is None:
+                    available_raw = variant.get("availableForSale")
+                available_bool = bool(available_raw)
+                if isinstance(available_raw, str):
+                    available_bool = available_raw.lower() == "true"
+
+                inventory_quantity = int(
+                    variant.get("inventory_quantity")
+                    or variant.get("quantityAvailable")
+                    or 0
+                )
+                variant_ref = algolia_variant_map.get(sku_shopify) or algolia_variant_map.get(sku_brand) or {}
+                locations_inventory = variant_ref.get("locations_inventory") or variant.get("locations_inventory") or {}
+                returns_qty = int(locations_inventory.get("100464689435") or 0)
+                online_qty = int(locations_inventory.get("82416435483") or 0)
+                instore_qty = inventory_quantity - (online_qty + returns_qty)
+                ga_purchases = safe_string(variant_ref.get("recently_ordered_count") or variant.get("recently_ordered_count"))
+
+                sku_shopify_value = sku_shopify.replace("gid://shopify/ProductVariant/", "")
+                product_line_value = "Maternity" if "maternity" in title.lower() else ""
+                jean_style = derive_jean_style(style_name, title, pdp_fields["description"], pdp_fields["leg_opening"])
+                inseam_label = derive_inseam_label(title, pdp_fields["description"], jean_style, pdp_fields["inseam"])
+                inseam_style = derive_inseam_style(jean_style, inseam_label, pdp_fields["inseam"], length_hint)
+                rise_label = derive_rise_label(title, handle, pdp_fields["description"], rise_hint)
+                hem_style = derive_hem_style(pdp_fields["description"])
+                color_standardized = derive_color_standardized(color_value, pdp_fields["description"], color_hint)
+                color_simplified = derive_color_simplified(color_value, pdp_fields["description"], color_standardized, wash_hint)
+
+                row = [
+                    style_id,
+                    handle,
+                    published_at,
+                    created_at,
+                    title,
+                    style_name,
+                    product_type,
+                    join_tags(tags),
+                    style.get("vendor", ""),
+                    pdp_fields["description"],
+                    variant_title,
+                    color_value,
+                    size_value,
+                    pdp_fields["rise"],
+                    pdp_fields["inseam"] or inseam_hint,
+                    pdp_fields["leg_opening"],
+                    format_price(
+                        (variant.get("price") or {}).get("amount")
+                        if isinstance(variant.get("price"), dict)
+                        else style.get("price")
+                    ),
+                    format_price(
+                        (variant.get("compareAtPrice") or {}).get("amount")
+                        if isinstance(variant.get("compareAtPrice"), dict)
+                        else style.get("compare_at_price")
+                    ),
+                    "TRUE" if available_bool else "FALSE",
+                    safe_string(inventory_quantity),
+                    safe_string(returns_qty),
+                    safe_string(instore_qty),
+                    safe_string(online_qty),
+                    ga_purchases,
+                    safe_string(style.get("totalInventory") or style.get("variants_inventory_count")),
+                    sku_shopify_value,
+                    sku_brand,
+                    safe_string(variant.get("barcode")),
+                    product_line_value,
+                    (style.get("featuredImage") or {}).get("url") or style.get("product_image", ""),
+                    style.get("onlineStoreUrl") or f"https://shop.paige.com/products/{handle}",
+                    jean_style,
+                    inseam_label,
+                    inseam_style,
+                    rise_label,
+                    hem_style,
+                    color_simplified,
+                    color_standardized,
+                    country,
+                    normalize_stretch_value(
+                        pdp_fields.get("stretch", "")
+                        or derive_stretch_from_algolia_attrs(algolia_denim_fabric, algolia_stretch_attr)
+                        or meta_attrs.get("stretch", "")
+                    ),
+                    production_cost,
+                    site_exclusive,
+                ]
+                fit_hint_by_sku[sku_shopify_value] = fit_hint
+                tags_by_sku[sku_shopify_value] = join_tags(tags)
+                rows.append(row)
+
+            if processed_handles % 50 == 0 or idx == len(styles):
+                avg = (pdp_total_seconds / processed_handles) if processed_handles else 0.0
+                log(
+                    f"{processed_handles}/{len(styles)} handles processed | {avg:.2f}s/page | "
+                    f"rise filled = {rise_filled}/{processed_handles} | "
+                    f"inseam filled = {inseam_filled}/{processed_handles} | "
+                    f"leg opening filled = {leg_filled}/{processed_handles}"
+                )
+            time.sleep(0.2)
+
+        self.apply_measurement_inference(rows)
+        self.apply_style_name_rules(rows)
+        self.apply_jean_style_inference(rows)
+        self.apply_jean_style_fit_fallback(rows, fit_hint_by_sku, tags_by_sku)
+        self.apply_rise_label_inference(rows)
+        self.apply_color_inference(rows)
+        self.apply_petite_inseam_rule(rows)
+        return rows
+
+    def apply_measurement_inference(self, rows: List[List[str]]) -> None:
+        """Fill blank Rise, Inseam, and Leg Opening from style-family siblings.
+
+        Groups rows by the stem of the product title (everything before the
+        colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
+        Jean' colourways share their measurements.  When Playwright extraction
+        fails for a subset of handles in a family (due to transient 503s or
+        browser-session issues), this propagates the most-common non-blank
+        values from the successfully-extracted siblings.
+
+        Petite inseam exception: if a petite row shares the same Style Name
+        and Color as any non-petite row, its Inseam is left blank so that
+        apply_petite_inseam_rule (which enforces this constraint after all
+        other post-processing) does not have to undo a value we set here.
+        """
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_color = CSV_HEADERS.index("Color")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+
+        def _stem(title: str) -> str:
+            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+
+        # Pre-build a set of (style_name, color, inseam) for every non-petite
+        # row that already has an inseam value, so we can enforce the petite
+        # inseam exception: only blank the petite row's inseam when a
+        # non-petite row has the exact same Style Name, Color, AND Inseam.
+        non_petite_key: set = {
+            (r[idx_style_name], r[idx_color], r[idx_inseam])
+            for r in rows
+            if "petite" not in r[idx_product].lower() and r[idx_inseam]
+        }
+
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            key = _stem(row[idx_product])
+            groups.setdefault(key, []).append(row)
+
+        for group_rows in groups.values():
+            rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
+            legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
+            inseams = [r[idx_inseam] for r in group_rows if r[idx_inseam]]
+            if not rises and not legs and not inseams:
+                continue
+            most_rise = max(set(rises), key=rises.count) if rises else ""
+            most_leg = max(set(legs), key=legs.count) if legs else ""
+            most_inseam = max(set(inseams), key=inseams.count) if inseams else ""
+            for row in group_rows:
+                if not row[idx_rise] and most_rise:
+                    row[idx_rise] = most_rise
+                if not row[idx_leg] and most_leg:
+                    row[idx_leg] = most_leg
+                if not row[idx_inseam] and most_inseam:
+                    # Petite exception: leave inseam blank when a non-petite
+                    # row shares the same Style Name, Color, AND Inseam value
+                    # so the two entries remain distinguishable.
+                    if "petite" in row[idx_product].lower() and (
+                        row[idx_style_name], row[idx_color], most_inseam
+                    ) in non_petite_key:
+                        continue
+                    row[idx_inseam] = most_inseam
+
+    def apply_style_name_rules(self, rows: List[List[str]]) -> None:
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+
+        # Rule 1: unify by first word when leg opening matches and style is most frequent (skip maternity)
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            first_word = (row[idx_product].split(" ", 1)[0] if row[idx_product] else "").strip().lower()
+            if first_word:
+                groups.setdefault(first_word, []).append(row)
+
+        for first_word, group_rows in groups.items():
+            if len(group_rows) < 2:
+                continue
+            by_leg: Dict[str, List[List[str]]] = {}
+            for r in group_rows:
+                by_leg.setdefault(r[idx_leg], []).append(r)
+            for leg_value, leg_rows in by_leg.items():
+                non_maternity_rows = [r for r in leg_rows if "maternity" not in r[idx_product].lower()]
+                if not non_maternity_rows:
+                    continue
+                styles = [r[idx_style_name] for r in non_maternity_rows if r[idx_style_name]]
+                if len(set(styles)) <= 1:
+                    continue
+                most_common = max(set(styles), key=styles.count)
+                for r in non_maternity_rows:
+                    r[idx_style_name] = most_common
+
+        # Rule 2: one-word style names
+        for row in rows:
+            style_name = row[idx_style_name].strip()
+            if not style_name or len(style_name.split()) != 1:
+                continue
+            product_first_word = (row[idx_product].split(" ", 1)[0] if row[idx_product] else "").strip().lower()
+            same_family = [
+                r for r in rows
+                if (r[idx_product].split(" ", 1)[0] if r[idx_product] else "").strip().lower() == product_first_word
+                and r[idx_leg] == row[idx_leg]
+                and len(r[idx_style_name].split()) > 1
+            ]
+            if same_family:
+                candidates = [r[idx_style_name] for r in same_family]
+                row[idx_style_name] = max(set(candidates), key=candidates.count)
+                continue
+            jean_first = (row[idx_jean_style].split(" ", 1)[0] if row[idx_jean_style] else "").strip()
+            if jean_first:
+                row[idx_style_name] = f"{style_name} {jean_first}".strip()
+
+    def apply_jean_style_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+        idx_product = CSV_HEADERS.index("Product")
+        idx_desc = CSV_HEADERS.index("Description")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_inseam_label = CSV_HEADERS.index("Inseam Label")
+        idx_inseam_style = CSV_HEADERS.index("Inseam Style")
+
+        # Step 1: Re-derive jean_style from updated Style Name for every row.
+        # Style Name may have been updated by apply_style_name_rules; the value
+        # computed during build_rows() used the pre-rules name, so we redo it here.
+        for row in rows:
+            updated_style_name = row[idx_style_name]
+            # Re-run keyword mapping against the (possibly corrected) style name.
+            mapped = _map_jean_keywords(updated_style_name, row[idx_leg], include_mom=True)
+            if mapped:
+                row[idx_jean_style] = mapped
+            # If the style-name mapping didn't resolve it, keep whatever was already there.
+
+        # Step 2: For still-blank Jean Style rows, infer from sibling rows with same
+        # style name + leg opening.
+        for row in rows:
+            if row[idx_jean_style]:
+                continue
+            style = row[idx_style_name]
+            leg = row[idx_leg]
+            if not style:
+                continue
+            matches = [
+                r[idx_jean_style]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_leg] == leg and r[idx_jean_style]
+            ]
+            if matches:
+                row[idx_jean_style] = max(set(matches), key=matches.count)
+
+        # Recompute inseam label/style when jean style got updated.
+        for row in rows:
+            jean_style = row[idx_jean_style]
+            row[idx_inseam_label] = derive_inseam_label(row[idx_product], row[idx_desc], jean_style, row[idx_inseam])
+            row[idx_inseam_style] = derive_inseam_style(jean_style, row[idx_inseam_label], row[idx_inseam], "")
+
+    def apply_jean_style_fit_fallback(
+        self,
+        rows: List[List[str]],
+        fit_hint_by_sku: Dict[str, str],
+        tags_by_sku: Dict[str, str],
+    ) -> None:
+        idx_sku_shopify = CSV_HEADERS.index("SKU - Shopify")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+        idx_jean_style = CSV_HEADERS.index("Jean Style")
+        idx_product = CSV_HEADERS.index("Product")
+        idx_desc = CSV_HEADERS.index("Description")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_inseam_label = CSV_HEADERS.index("Inseam Label")
+        idx_inseam_style = CSV_HEADERS.index("Inseam Style")
+
+        for row in rows:
+            if row[idx_jean_style]:
+                continue
+            sku = row[idx_sku_shopify]
+            fit_hint = fit_hint_by_sku.get(sku, "")
+            tag_text = tags_by_sku.get(sku, "")
+            row[idx_jean_style] = derive_jean_style_from_fit(fit_hint, tag_text, row[idx_leg])
+            if row[idx_jean_style]:
+                row[idx_inseam_label] = derive_inseam_label(row[idx_product], row[idx_desc], row[idx_jean_style], row[idx_inseam])
+                row[idx_inseam_style] = derive_inseam_style(row[idx_jean_style], row[idx_inseam_label], row[idx_inseam], "")
+
+    def apply_rise_label_inference(self, rows: List[List[str]]) -> None:
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_rise_label = CSV_HEADERS.index("Rise Label")
+
+        for row in rows:
+            if row[idx_rise_label]:
+                continue
+            style = row[idx_style_name]
+            rise = row[idx_rise]
+            if not style or not rise:
+                continue
+            matches = [
+                r[idx_rise_label]
+                for r in rows
+                if r[idx_style_name] == style and r[idx_rise] == rise and r[idx_rise_label]
+            ]
+            if not matches:
+                continue
+            frequencies = {label: matches.count(label) for label in set(matches)}
+            row[idx_rise_label] = max(frequencies, key=frequencies.get)
+
+    def apply_color_inference(self, rows: List[List[str]]) -> None:
+        idx_color = CSV_HEADERS.index("Color")
+        idx_simplified = CSV_HEADERS.index("Color - Simplified")
+        idx_standardized = CSV_HEADERS.index("Color - Standardized")
+
+        by_color: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            key = (row[idx_color] or "").strip().lower()
+            if key:
+                by_color.setdefault(key, []).append(row)
+
+        for color_key, color_rows in by_color.items():
+            simplified_vals = [r[idx_simplified] for r in color_rows if r[idx_simplified]]
+            standardized_vals = [r[idx_standardized] for r in color_rows if r[idx_standardized]]
+            most_simplified = max(set(simplified_vals), key=simplified_vals.count) if simplified_vals else ""
+            most_standardized = max(set(standardized_vals), key=standardized_vals.count) if standardized_vals else ""
+            for r in color_rows:
+                if not r[idx_simplified] and most_simplified:
+                    r[idx_simplified] = most_simplified
+                if not r[idx_standardized] and most_standardized:
+                    r[idx_standardized] = most_standardized
+
+    def apply_petite_inseam_rule(self, rows: List[List[str]]) -> None:
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_color = CSV_HEADERS.index("Color")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        grouped: Dict[Tuple[str, str, str], List[List[str]]] = {}
+        for row in rows:
+            key = (row[idx_style_name], row[idx_color], row[idx_inseam])
+            grouped.setdefault(key, []).append(row)
+
+        for same_group_rows in grouped.values():
+            has_petite = any("petite" in row[idx_product].lower() for row in same_group_rows)
+            has_non_petite = any("petite" not in row[idx_product].lower() for row in same_group_rows)
+            if not (has_petite and has_non_petite):
+                continue
+            for row in same_group_rows:
+                if "petite" in row[idx_product].lower():
+                    row[idx_inseam] = ""
+
+    def write_csv(self, rows: List[List[str]]) -> Path:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_path = OUTPUT_DIR / f"PAIGE_{timestamp}.csv"
+        with output_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(CSV_HEADERS)
+            writer.writerows(rows)
+        log(f"Wrote {len(rows)} rows to {output_path}")
+        return output_path
+
+    def run(self) -> Path:
+        log("Starting Paige scrape")
+        try:
+            rows = self.build_rows()
+            output_path = self.write_csv(rows)
+            log("Scrape complete")
+            print("Done.")
+            return output_path
+        finally:
+            self.browser_extractor.close()
+
+
+def main() -> None:
+    scraper = PaigeScraper()
+    scraper.run()
+
+
+if __name__ == "__main__":
+    main()
