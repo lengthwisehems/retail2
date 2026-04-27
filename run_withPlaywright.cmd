@@ -219,6 +219,11 @@ goto :AfterAzCopy
   exit /b 0
 :AfterAzCopy
 
+echo [INFO] Removing CSV files older than 120 days...
+set "_CLEANUP_OUT=%OUT%"
+powershell -NoProfile -Command "Get-ChildItem $env:_CLEANUP_OUT -Recurse -File -Filter *.csv | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-120) } | ForEach-Object { Remove-Item $_.FullName -Force; Write-Output ('[INFO] Deleted: ' + $_.Name) }"
+echo [INFO] Old CSV cleanup complete.
+
 echo [INFO] Output directory snapshot:
 for %%B in (%BRANDS%) do (
   if exist "%OUT%\%%B\Output" (
