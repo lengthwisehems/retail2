@@ -28,8 +28,7 @@ set "BRANDS=ABrand AGJeans AMO DL1961 Edyson Fidelity Frame GoodAmerican Haikure
 set "SIZE_THRESHOLD=25600"
 
 echo Ensuring required Python packages...
-"%PY%" -m pip install --disable-pip-version-check -q --upgrade pip
-if errorlevel 1 echo([WARN] Pip upgrade reported an error; continuing with existing pip.
+"%PY%" -m pip cache purge >nul 2>&1
 "%PY%" -m pip install --disable-pip-version-check -q requests openpyxl beautifulsoup4 lxml html5lib
 if errorlevel 1 (
     echo([WARN] Package installation reported an error; scrapers may fail if dependencies are missing.
