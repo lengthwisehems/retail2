@@ -276,11 +276,21 @@ set "LEGACY_SOURCE=!SCRIPT_DIR!Output"
 set "LEGACY_DEST=!OUTDIR!"
 
 echo ===== !SCRAPER_START! START - !SCRAPER_NAME! =====>>"!LOGFILE!"
-"%PY%" "!SCRIPT!" >>"!LOGFILE!" 2>&1
+echo([INFO] !SCRAPER_START! - Starting !SCRAPER_NAME!...
+set "_RUN_PY=!PY!"
+set "_RUN_SCRIPT=!SCRIPT!"
+set "_RUN_LOG=!LOGFILE!"
+powershell -NoProfile -NonInteractive -Command "& { $p=Start-Process -FilePath $env:_RUN_PY -ArgumentList @($env:_RUN_SCRIPT) -NoNewWindow -PassThru -RedirectStandardOutput ($env:_RUN_LOG+'.out') -RedirectStandardError ($env:_RUN_LOG+'.err'); $ok=$p.WaitForExit(1500000); if(-not $ok){Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Add-Content -Encoding UTF8 $env:_RUN_LOG '[WARN] Scraper killed after 25-minute timeout.'; exit 124}; exit $p.ExitCode }"
 set "PYTHON_EXIT=%ERRORLEVEL%"
+if exist "!LOGFILE!.out" (type "!LOGFILE!.out" >> "!LOGFILE!" 2>nul & del /f /q "!LOGFILE!.out" 2>nul)
+if exist "!LOGFILE!.err" (type "!LOGFILE!.err" >> "!LOGFILE!" 2>nul & del /f /q "!LOGFILE!.err" 2>nul)
 set "SCRAPER_EXIT=!PYTHON_EXIT!"
 if not "!PYTHON_EXIT!"=="0" (
-    set "FAIL_REASON=Python exited with code !PYTHON_EXIT!."
+    if "!PYTHON_EXIT!"=="124" (
+        set "FAIL_REASON=Scraper killed after 25-minute timeout."
+    ) else (
+        set "FAIL_REASON=Python exited with code !PYTHON_EXIT!."
+    )
 )
 
 if defined LEGACY_SOURCE if defined LEGACY_DEST if exist "!LEGACY_SOURCE!" (
