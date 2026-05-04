@@ -1,13 +1,12 @@
+#No Playwrite#
 import csv
 import html
 import json
-import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -44,8 +43,11 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "W/ Wide Cuff", "W/Flap", "Wax", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper",
 ]
 
-PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
-PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
+ATTRIBUTE_KEYS_ORDER = (
+    "closure", "clothingtype", "colorcategory", "colorvariants",
+    "denimfabric", "fit", "fitvariants", "gender", "inseamvariants",
+    "length", "producttype", "rise", "specs", "stretch", "stylecontent",
+)
 
 CSV_HEADERS = [
     "Style Id",
@@ -483,30 +485,6 @@ def dedupe_description_parts(parts: Sequence[str]) -> List[str]:
     return deduped
 
 
-def extract_pdp_description(html_text: str) -> str:
-    soup = BeautifulSoup(html_text, "html.parser")
-    matches = [node for node in soup.select(PDP_SELECTOR) if isinstance(node, Tag)]
-    values = [normalize_text(node) for node in matches if normalize_text(node)]
-    if values:
-        return ", ".join(values)
-
-    parent = soup.select_one(PDP_PARENT_SELECTOR)
-    if parent is not None:
-        values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
-        if values:
-            return ", ".join(values)
-
-    keyword_hits: List[str] = []
-    for node in soup.find_all(["li", "p", "span"]):
-        node_text = normalize_text(node)
-        node_lower = node_text.lower()
-        if any(token in node_lower for token in ("front rise", "rise", "inseam", "leg opening", "stretch")):
-            keyword_hits.append(node_text)
-    if keyword_hits:
-        return ", ".join(dict.fromkeys(keyword_hits))
-
-    return ""
-
 
 def parse_mixed_fraction(raw_value: str) -> Optional[float]:
     value = raw_value.strip().replace("″", "").replace('"', "")
@@ -579,56 +557,6 @@ def extract_label_text(text: str, labels: Sequence[str]) -> str:
     return ""
 
 
-def extract_stretch_from_html(html_text: str) -> str:
-    """Parse the stretch-scale widget from static HTML.
-
-    The widget renders as a parent container holding an odd number of child divs
-    where every other child (positions 1, 3, 5, 7, 9) is a visible "dot" and the
-    active dot carries a class that includes the word "active".  We locate the
-    active dot by scanning all divs that contain both "dot" and "active" in their
-    combined class string, then count its 1-based position among all dot siblings.
-    """
-    if not html_text:
-        return ""
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # Find the active dot: any div whose class string contains both 'dot' and 'active'.
-    active_dot = None
-    for div in soup.find_all("div"):
-        cls = " ".join(div.get("class", [])).lower()
-        if "dot" in cls and "active" in cls:
-            active_dot = div
-            break
-
-    if active_dot is None:
-        return ""
-
-    dot_parent = active_dot.parent
-    if dot_parent is None:
-        return ""
-
-    # Collect all direct-child divs whose class includes "dot".
-    dot_siblings = [
-        d for d in dot_parent.find_all("div", recursive=False)
-        if "dot" in " ".join(d.get("class", [])).lower()
-    ]
-
-    # dot_siblings contains only the 5 actual dot elements (connectors/spacers filtered
-    # out). The active dot's 1-based position within this filtered list maps directly:
-    #   1 → High Stretch, 2 → Medium to High Stretch, 3 → Medium Stretch,
-    #   4 → Low Stretch,  5 → Rigid
-    mapping = {
-        1: "High Stretch",
-        2: "Medium to High Stretch",
-        3: "Medium Stretch",
-        4: "Low Stretch",
-        5: "Rigid",
-    }
-    for idx, child in enumerate(dot_siblings, start=1):
-        if child is active_dot:
-            return mapping.get(idx, "")
-    return ""
-
 
 def normalize_stretch_value(value: str) -> str:
     raw = (value or "").strip()
@@ -675,214 +603,6 @@ def derive_stretch_from_algolia_attrs(denim_fabric: str, stretch_attr: str) -> s
     return ""
 
 
-class PDPBrowserExtractor:
-    """Browser-driven PDP extractor for Headless UI DETAILS panels."""
-
-    def __init__(self) -> None:
-        self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
-        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._init_failed = False
-
-    def _ensure(self) -> bool:
-        if not self.enabled or self._init_failed:
-            return False
-        if self._page is not None:
-            return True
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception as exc:
-            log(f"Playwright import failed: {exc}")
-            self._init_failed = True
-            return False
-        try:
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            self._context = self._browser.new_context(
-                ignore_https_errors=True,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                locale="en-US",
-                viewport={"width": 1366, "height": 1800},
-            )
-            self._page = self._context.new_page()
-            self._page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            try:
-                # warm up first navigation so first PDP is less likely to be blocked/empty
-                self._page.goto(PDP_HOST, wait_until="domcontentloaded", timeout=15000)
-                self._page.wait_for_timeout(250)
-            except Exception:
-                pass
-            return True
-        except Exception as exc:
-            log(f"Playwright launch failed: {exc}")
-            self._init_failed = True
-            self.close()
-            return False
-
-    def _dismiss_overlays(self) -> None:
-        if self._page is None:
-            return
-        try:
-            self._page.evaluate(
-                """
-                () => {
-                  document.querySelectorAll(
-                    '#attentive_overlay, iframe#attentive_creative, [id*="attentive_overlay"], [data-testid*="attentive"]'
-                  ).forEach((el) => {
-                    try { el.remove(); } catch (e) {}
-                  });
-                }
-                """
-            )
-        except Exception:
-            pass
-
-    def fetch(self, handle: str) -> Dict[str, str]:
-        if not self._ensure():
-            return {"details": "", "stretch": "", "description": ""}
-        assert self._page is not None
-        url = f"{PDP_HOST}/products/{handle}"
-        start = time.time()
-        try:
-            self._page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        except Exception:
-            return {"details": "", "stretch": "", "description": ""}
-
-        # lightweight checkpoint wait; keep bounded for speed.
-        checkpoint_seen = False
-        for _ in range(5):
-            page_title = (self._page.title() or "").lower()
-            if "checkpoint" not in page_title:
-                break
-            checkpoint_seen = True
-            self._page.wait_for_timeout(400)
-
-        if checkpoint_seen and "checkpoint" in (self._page.title() or "").lower():
-            try:
-                self._page.reload(wait_until="domcontentloaded", timeout=20000)
-                self._page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-        self._dismiss_overlays()
-
-        details_text = ""
-        try:
-            btn = self._page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
-            if btn.count() == 0:
-                btn = self._page.locator("button:has-text('DETAILS')")
-            if btn.count():
-                expanded = btn.first.get_attribute("aria-expanded", timeout=500)
-                if expanded != "true":
-                    try:
-                        btn.first.click(timeout=1200)
-                    except Exception:
-                        btn.first.click(timeout=1200, force=True)
-                self._page.wait_for_timeout(120)
-
-            detail_nodes = self._page.locator(PDP_SELECTOR)
-            count = detail_nodes.count()
-            if count:
-                items = []
-                for i in range(count):
-                    text = detail_nodes.nth(i).inner_text(timeout=600).strip()
-                    if text:
-                        items.append(re.sub(r"\s+", " ", text))
-                details_text = ", ".join(items)
-        except Exception:
-            details_text = ""
-
-        stretch = ""
-        try:
-            # Broad selector: any div whose class contains both 'dot' and 'active'.
-            # We evaluate in JS so we can scan all matching elements and pick the
-            # one that lives inside a stretch-scale-like parent.
-            idx = self._page.evaluate(
-                """
-                () => {
-                  // Find the active dot among all divs that have 'dot' and 'active' in class.
-                  const allDivs = Array.from(document.querySelectorAll('div'));
-                  const activeDot = allDivs.find(el => {
-                    const cls = (el.className || '').toString().toLowerCase();
-                    return cls.includes('dot') && cls.includes('active');
-                  });
-                  if (!activeDot) return null;
-                  const parent = activeDot.parentElement;
-                  if (!parent) return null;
-                  const dotSiblings = Array.from(parent.children).filter(node => {
-                    const cls = (node.className || '').toString().toLowerCase();
-                    return cls.includes('dot');
-                  });
-                  const pos = dotSiblings.indexOf(activeDot) + 1;
-                  return pos > 0 ? pos : null;
-                }
-                """
-            )
-            if idx is not None:
-                # JS dotSiblings is filtered to dot-only (5 elements), so position is 1-5.
-                stretch = {
-                    1: "High Stretch",
-                    2: "Medium to High Stretch",
-                    3: "Medium Stretch",
-                    4: "Low Stretch",
-                    5: "Rigid",
-                }.get(int(idx), "")
-        except Exception:
-            stretch = ""
-
-        description_text = ""
-        try:
-            # Keep this selector broad but cheap.
-            desc_node = self._page.locator(
-                "div[class*='productDescription'], div[class*='description'] p"
-            ).first
-            if desc_node.count():
-                description_text = re.sub(r"\s+", " ", desc_node.inner_text(timeout=600)).strip()
-        except Exception:
-            description_text = ""
-
-        elapsed = time.time() - start
-        log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
-        return {"details": details_text, "stretch": stretch, "description": description_text}
-
-    def close(self) -> None:
-        try:
-            if self._context is not None:
-                self._context.close()
-        except Exception:
-            pass
-        try:
-            if self._browser is not None:
-                self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright is not None:
-                self._playwright.stop()
-        except Exception:
-            pass
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
-
 
 class PaigeScraper:
     def __init__(self) -> None:
@@ -905,7 +625,6 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
-        self.browser_extractor = PDPBrowserExtractor()
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
         response = self.session.post(
@@ -942,6 +661,26 @@ class PaigeScraper:
                 onlineStoreUrl
                 totalInventory
                 featuredImage { url }
+                metafields(identifiers: [
+                  {namespace: "attributes", key: "closure"},
+                  {namespace: "attributes", key: "clothingType"},
+                  {namespace: "attributes", key: "colorCategory"},
+                  {namespace: "attributes", key: "colorVariants"},
+                  {namespace: "attributes", key: "denimFabric"},
+                  {namespace: "attributes", key: "fit"},
+                  {namespace: "attributes", key: "fitVariants"},
+                  {namespace: "attributes", key: "gender"},
+                  {namespace: "attributes", key: "inseamVariants"},
+                  {namespace: "attributes", key: "length"},
+                  {namespace: "attributes", key: "productType"},
+                  {namespace: "attributes", key: "rise"},
+                  {namespace: "attributes", key: "specs"},
+                  {namespace: "attributes", key: "stretch"},
+                  {namespace: "attributes", key: "styleContent"},
+                ]) {
+                  key
+                  value
+                }
                 variants(first: 250) {
                   nodes {
                     id
@@ -983,23 +722,41 @@ class PaigeScraper:
                 cursor = block["pageInfo"]["endCursor"]
         return list(merged.values())
 
-    def fetch_collection_handles_json(self) -> set[str]:
-        handles: set[str] = set()
-        for collection in ("women-denim", "women-sale"):
-            page = 1
-            while True:
-                url = f"https://shop.paige.com/collections/{collection}/products.json?limit=250&page={page}"
-                response = self.session.get(url, timeout=30)
-                response.raise_for_status()
-                products = (response.json() or {}).get("products") or []
-                if not products:
-                    break
-                for product in products:
-                    handle = (product.get("handle") or "").strip()
-                    if handle:
-                        handles.add(handle)
-                page += 1
-        return handles
+    def fetch_collection_handles_json(self) -> Optional[set[str]]:
+        for host in HOST_ROTATION:
+            plain = requests.Session()
+            plain.headers.update(self.session.headers)
+            try:
+                handles: set[str] = set()
+                for collection in ("women-denim", "women-sale"):
+                    page = 1
+                    while True:
+                        url = f"{host}/collections/{collection}/products.json?limit=250&page={page}"
+                        response = plain.get(url, timeout=30)
+                        if response.status_code == 429:
+                            raise requests.exceptions.HTTPError("429", response=response)
+                        response.raise_for_status()
+                        products = (response.json() or {}).get("products") or []
+                        if not products:
+                            break
+                        for product in products:
+                            handle = (product.get("handle") or "").strip()
+                            if handle:
+                                handles.add(handle)
+                        page += 1
+                return handles
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    log(f"fetch_collection_handles_json: 429 from {host}, trying next host")
+                else:
+                    log(f"fetch_collection_handles_json: HTTP {status} from {host}, trying next host")
+            except Exception as exc:
+                log(f"fetch_collection_handles_json: {host} failed ({exc}), trying next host")
+            finally:
+                plain.close()
+        log("fetch_collection_handles_json: all hosts exhausted, skipping handle filter")
+        return None
 
     def algolia_request(self, params: Dict[str, str]) -> Dict:
         query_string = "&".join(
@@ -1081,79 +838,43 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(self, handle: str, description_seed: str = "") -> Dict[str, str]:
+    def fetch_pdp_fields(
+        self,
+        handle: str,
+        metafields: Dict[str, str],
+        description_seed: str = "",
+    ) -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
-        source = "seed"
-        description_parts: List[str] = [description_seed] if description_seed else []
-        description = ", ".join(dedupe_description_parts(description_parts))
-        stretch = normalize_stretch_value(extract_label_text(description, ["Stretch"]))
 
-        try:
-            product_json = self.session.get(
-                urljoin(PDP_HOST, f"/products/{handle}.json"),
-                timeout=20,
-                allow_redirects=True,
-            )
-            if product_json.status_code == 200:
-                body_html = (product_json.json().get("product") or {}).get("body_html") or ""
-                body_text = strip_html_text(body_html)
-                if body_text:
-                    description_parts.append(body_text)
-                    source = "product-json"
-        except Exception:
-            pass
+        # Rise, Inseam, Leg Opening from the "specs" metafield, e.g.:
+        #   Rise: 10 1/2"\nInseam: 32"\nLeg Opening: 19 1/2"
+        specs = metafields.get("specs", "")
+        rise = extract_measurement(specs, ["Front Rise", "Rise"])
+        inseam = extract_measurement(specs, ["Inseam", "Inleg"])
+        leg_opening = extract_measurement(specs, ["Leg Opening", "Opening"])
 
-        description = ", ".join(dedupe_description_parts(description_parts))
-        rise = extract_measurement(description, ["Front Rise", "Rise"])
-        inseam = extract_measurement(description, ["Inseam", "Inleg"])
-        leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+        stretch = ""  # derived in build_rows via derive_stretch_from_algolia_attrs
 
-        if not (rise and inseam and leg_opening):
-            url = urljoin(PDP_HOST, f"/products/{handle}")
-            try:
-                response = self.session.get(url, timeout=20, allow_redirects=True)
-                response.raise_for_status()
-                details_description = extract_pdp_description(response.text)
-                stretch_from_html = extract_stretch_from_html(response.text)
-                if stretch_from_html:
-                    stretch = normalize_stretch_value(stretch_from_html)
-                if details_description:
-                    description_parts.append(details_description)
-                    description = ", ".join(dedupe_description_parts(description_parts))
-                    rise = extract_measurement(description, ["Front Rise", "Rise"])
-                    inseam = extract_measurement(description, ["Inseam", "Inleg"])
-                    leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
-                    source = "pdp-html"
-            except Exception:
-                pass
-
-        # Browser-driven fallback for Headless UI DETAILS disclosure.
-        if not (rise and inseam and leg_opening):
-            browser_data = self.browser_extractor.fetch(handle)
-            browser_desc = browser_data.get("description", "")
-            browser_details = browser_data.get("details", "")
-            if browser_desc:
-                description_parts.insert(0, browser_desc)
-            if browser_details:
-                description_parts.append(browser_details)
-            if browser_data.get("stretch"):
-                stretch = normalize_stretch_value(browser_data["stretch"])
-            description = ", ".join(dedupe_description_parts(description_parts))
-            rise = extract_measurement(description, ["Front Rise", "Rise"])
-            inseam = extract_measurement(description, ["Inseam", "Inleg"])
-            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
-            if browser_details:
-                source = "pdp-browser"
-
-        description = ", ".join(dedupe_description_parts(description_parts))
+        # Build description: product description seed followed by each
+        # attribute metafield formatted as "key : value;".
+        meta_str = " ".join(
+            f"{key} : {metafields[key]};"
+            for key in ATTRIBUTE_KEYS_ORDER
+            if metafields.get(key)
+        )
+        if description_seed:
+            seed_clean = description_seed.rstrip().rstrip(";").rstrip()
+            description = (seed_clean + "; " + meta_str) if meta_str else seed_clean
+        else:
+            description = meta_str
 
         result = {
             "description": description,
             "rise": rise,
             "inseam": inseam,
             "leg_opening": leg_opening,
-            "stretch": stretch or normalize_stretch_value(extract_label_text(description, ["Stretch"])),
+            "stretch": stretch,
             "elapsed": "",
         }
         self._pdp_cache[handle] = result
@@ -1193,8 +914,9 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
-                    continue
+                # No collection_handles check here: the GraphQL query is already scoped to the
+                # target collections, and the REST cache can lag behind for recently-published
+                # products, which would incorrectly drop them from the output.
                 if not should_keep_product(tags, title, style.get("_source_collection", "")):
                     continue
                 variants = (style.get("variants") or {}).get("nodes") or []
@@ -1204,7 +926,7 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if handle not in collection_handles:
+                if collection_handles is not None and handle not in collection_handles:
                     continue
                 meta_attrs = ((style.get("meta") or {}).get("attributes") or {})
                 variants = self.fetch_variants(style_id)
@@ -1222,8 +944,15 @@ class PaigeScraper:
             if algolia_body_html:
                 algolia_text = strip_html_text(algolia_body_html)
                 seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
+            # Build metafields dict from the GraphQL product node.
+            metafields_list = style.get("metafields") or []
+            metafields: Dict[str, str] = {
+                mf["key"].lower(): mf["value"]
+                for mf in metafields_list
+                if mf and mf.get("key") and mf.get("value")
+            }
             pdp_start = time.time()
-            pdp_fields = self.fetch_pdp_fields(handle, seed_description)
+            pdp_fields = self.fetch_pdp_fields(handle, metafields, seed_description)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
             if pdp_fields["rise"]:
@@ -1238,14 +967,15 @@ class PaigeScraper:
             production_cost = extract_tag_value(tags, "productionCost:")
             site_exclusive = extract_tag_value(tags, "productType:")
             product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
-            fit_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("fit", "")
-            length_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("length", "")
-            rise_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("rise", "")
-            wash_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("wash", "")
-            color_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("colorCategory", "")
-            algolia_denim_fabric = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("denimFabric", "")
-            algolia_stretch_attr = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("stretch", "")
-            inseam_hint = safe_string(((style_algolia.get("meta") or {}).get("attributes") or {}).get("inseam", ""))
+            algolia_attrs = ((style_algolia.get("meta") or {}).get("attributes") or {})
+            fit_hint = metafields.get("fit") or algolia_attrs.get("fit", "")
+            length_hint = metafields.get("length") or algolia_attrs.get("length", "")
+            rise_hint = metafields.get("rise") or algolia_attrs.get("rise", "")
+            wash_hint = algolia_attrs.get("wash", "")
+            color_hint = metafields.get("colorcategory") or algolia_attrs.get("colorCategory", "")
+            algolia_denim_fabric = metafields.get("denimfabric") or algolia_attrs.get("denimFabric", "")
+            algolia_stretch_attr = metafields.get("stretch") or algolia_attrs.get("stretch", "")
+            inseam_hint = safe_string(algolia_attrs.get("inseam", ""))
 
             for variant in variants:
                 raw_size = safe_string(
@@ -1369,6 +1099,7 @@ class PaigeScraper:
                 )
             time.sleep(0.2)
 
+        self.apply_measurement_inference(rows)
         self.apply_style_name_rules(rows)
         self.apply_jean_style_inference(rows)
         self.apply_jean_style_fit_fallback(rows, fit_hint_by_sku, tags_by_sku)
@@ -1376,6 +1107,69 @@ class PaigeScraper:
         self.apply_color_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
+
+    def apply_measurement_inference(self, rows: List[List[str]]) -> None:
+        """Fill blank Rise, Inseam, and Leg Opening from style-family siblings.
+
+        Groups rows by the stem of the product title (everything before the
+        colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
+        Jean' colourways share their measurements.  When specs metafield is
+        missing for a subset of handles in a family, this propagates the
+        most-common non-blank values from the successfully-fetched siblings.
+
+        Petite inseam exception: if a petite row shares the same Style Name
+        and Color as any non-petite row, its Inseam is left blank so that
+        apply_petite_inseam_rule (which enforces this constraint after all
+        other post-processing) does not have to undo a value we set here.
+        """
+        idx_product = CSV_HEADERS.index("Product")
+        idx_style_name = CSV_HEADERS.index("Style Name")
+        idx_color = CSV_HEADERS.index("Color")
+        idx_inseam = CSV_HEADERS.index("Inseam")
+        idx_rise = CSV_HEADERS.index("Rise")
+        idx_leg = CSV_HEADERS.index("Leg Opening")
+
+        def _stem(title: str) -> str:
+            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
+
+        # Pre-build a set of (style_name, color, inseam) for every non-petite
+        # row that already has an inseam value, so we can enforce the petite
+        # inseam exception: only blank the petite row's inseam when a
+        # non-petite row has the exact same Style Name, Color, AND Inseam.
+        non_petite_key: set = {
+            (r[idx_style_name], r[idx_color], r[idx_inseam])
+            for r in rows
+            if "petite" not in r[idx_product].lower() and r[idx_inseam]
+        }
+
+        groups: Dict[str, List[List[str]]] = {}
+        for row in rows:
+            key = _stem(row[idx_product])
+            groups.setdefault(key, []).append(row)
+
+        for group_rows in groups.values():
+            rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
+            legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
+            inseams = [r[idx_inseam] for r in group_rows if r[idx_inseam]]
+            if not rises and not legs and not inseams:
+                continue
+            most_rise = max(set(rises), key=rises.count) if rises else ""
+            most_leg = max(set(legs), key=legs.count) if legs else ""
+            most_inseam = max(set(inseams), key=inseams.count) if inseams else ""
+            for row in group_rows:
+                if not row[idx_rise] and most_rise:
+                    row[idx_rise] = most_rise
+                if not row[idx_leg] and most_leg:
+                    row[idx_leg] = most_leg
+                if not row[idx_inseam] and most_inseam:
+                    # Petite exception: leave inseam blank when a non-petite
+                    # row shares the same Style Name, Color, AND Inseam value
+                    # so the two entries remain distinguishable.
+                    if "petite" in row[idx_product].lower() and (
+                        row[idx_style_name], row[idx_color], most_inseam
+                    ) in non_petite_key:
+                        continue
+                    row[idx_inseam] = most_inseam
 
     def apply_style_name_rules(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
@@ -1563,7 +1357,7 @@ class PaigeScraper:
     def write_csv(self, rows: List[List[str]]) -> Path:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_path = OUTPUT_DIR / f"PAIGE_{timestamp}.csv"
-        with output_path.open("w", newline="", encoding="utf-8") as fh:
+        with output_path.open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
             writer.writerow(CSV_HEADERS)
             writer.writerows(rows)
@@ -1572,14 +1366,11 @@ class PaigeScraper:
 
     def run(self) -> Path:
         log("Starting Paige scrape")
-        try:
-            rows = self.build_rows()
-            output_path = self.write_csv(rows)
-            log("Scrape complete")
-            print("Done.")
-            return output_path
-        finally:
-            self.browser_extractor.close()
+        rows = self.build_rows()
+        output_path = self.write_csv(rows)
+        log("Scrape complete")
+        print("Done.")
+        return output_path
 
 
 def main() -> None:
