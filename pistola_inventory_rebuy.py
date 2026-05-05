@@ -357,7 +357,7 @@ def derive_style_name_base(product_title: str) -> str:
     Step 1 removes the color suffix after any dash variant:
       'Name - Color', 'Name- Color', 'Name - Color'
     """
-    parts = re.split(r"\s*[-- - ]\s*", product_title or "")
+    parts = re.split(r"\s*[-–—]\s*", product_title or "")
     text = parts[0].strip()
     text = re.sub(r'"', " ", text)
     text = re.sub(r"\b\d+\b", " ", text)
@@ -889,7 +889,7 @@ def extract_color_from_title(title: str) -> str:
       'Name- Color'    (hyphen-space, no leading space)
       'Name - Color'   (en-dash with spaces)
     """
-    parts = re.split(r"\s*[-- - ]\s*", title)
+    parts = re.split(r"\s*[-–—]\s*", title)
     if len(parts) > 1:
         return parts[-1].strip()
     return ""
@@ -1074,7 +1074,7 @@ def apply_measurement_inference(rows: List[Dict[str, Any]]) -> None:
     """
     def _stem(title: str) -> str:
         # Split at any dash variant, strip PETITE prefix, lowercase
-        t = re.split(r"\s*[-- - ]\s*", title or "")[0].strip()
+        t = re.split(r"\s*[-–—]\s*", title or "")[0].strip()
         t = re.sub(r"^PETITE\s+", "", t, flags=re.IGNORECASE)
         return t.lower()
 
