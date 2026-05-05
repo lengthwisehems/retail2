@@ -53,6 +53,10 @@ COLLECTION_HANDLES = ["all-denim", "sale"]
 
 YOTPO_APP_KEY = "1maBA6ctnRD1GNlOziHctkBiWGhzUrBXY5Q2ErZn"
 
+REBUY_WIDGET_ID = "28256"
+REBUY_API_KEY = "d894da4c5b0317da53860dda0d297d9d8057c12e"
+REBUY_API_BASE = "https://rebuyengine.com/api/v1/custom/id"
+
 EXCLUDED_PRODUCT_TYPES = {
     "TEES & TANKS", "KNIT TOPS", "ONE PIECE", "DENIM SHORTS",
     "SWEATER", "DRESS", "DENIM JACKETS", "WOVEN TOPS", "SWEATERS",
@@ -268,23 +272,27 @@ def format_measurement(value: Optional[float]) -> str:
     return s
 
 
-def extract_measurement(text: str, labels: Sequence[str]) -> str:
-    """Pull a measurement number from text after any of the given labels."""
-    norm = text or ""
+def extract_measurement(text: str, labels: Sequence[str], require_colon: bool = False) -> str:
+    “””Pull a measurement number from text after any of the given labels.
+
+    require_colon=True prevents false matches like ‘High Rise 23’ when only
+    searching for label ‘Rise’ — a colon must separate the label from the value.
+    “””
+    norm = text or “”
     for sym, rep in FRACTION_MAP.items():
-        norm = norm.replace(sym, " " + rep)
-    norm = norm.replace("’", "'").replace("“", '"').replace("”", '"')
+        norm = norm.replace(sym, “ “ + rep)
+    norm = norm.replace(“’”, “’”).replace(“””, ‘”’).replace(“””, ‘”’)
+    colon_pat = r”\s*:\s*” if require_colon else r”\s*:?\s*”
     for label in labels:
-        # Pattern: label followed by optional colon/space then a number (possibly fractional)
         m = re.search(
-            rf"{re.escape(label)}\s*:?\s*([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)",
+            rf”{re.escape(label)}{colon_pat}([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)”,
             norm, re.IGNORECASE,
         )
         if m:
             val = parse_fraction(m.group(1))
             if val is not None:
                 return format_measurement(val)
-    return ""
+    return “”
 
 
 def extract_tag_value(tags: Iterable[str], prefix: str) -> str:
@@ -726,15 +734,30 @@ def fetch_pdp(handle: str) -> Dict[str, str]:
             resp.raise_for_status()
             html = resp.text
             result["html"] = html
-            # Measurements from bullet-point text
             soup = BeautifulSoup(html, "html.parser")
+
+            # Build a targeted measurement string from bullet list items first;
+            # this avoids false matches from product titles in the page header.
+            li_texts = [li.get_text(" ") for li in soup.find_all("li")]
+            li_text = " ".join(li_texts)
             all_text = soup.get_text(" ")
-            result["rise"] = extract_measurement(all_text, ["Front Rise", "Rise"])
-            result["inseam"] = extract_measurement(all_text, ["Inseam", "Inleg"])
-            result["leg_opening"] = extract_measurement(all_text, ["Leg Opening"])
-            # Stretch from scale marker
-            stretch = derive_stretch_from_html(html)
-            result["stretch"] = stretch
+
+            # Rise: require colon so "High Rise" in product titles doesn't
+            # accidentally match a nearby number.
+            result["rise"] = (
+                extract_measurement(li_text, ["Front Rise", "Rise"], require_colon=True)
+                or extract_measurement(all_text, ["Front Rise", "Rise"], require_colon=True)
+            )
+            # Inseam/LO: try bullets first, fall back to full page text.
+            result["inseam"] = (
+                extract_measurement(li_text, ["Inseam", "Inleg"])
+                or extract_measurement(all_text, ["Inseam", "Inleg"])
+            )
+            result["leg_opening"] = (
+                extract_measurement(li_text, ["Leg Opening"])
+                or extract_measurement(all_text, ["Leg Opening"])
+            )
+            result["stretch"] = derive_stretch_from_html(html)
             break
         except Exception as exc:
             log.debug("PDP fetch failed %s: %s", url, exc)
@@ -743,33 +766,41 @@ def fetch_pdp(handle: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Inventory from REST product JSON
+# Inventory from Rebuy API
+# The REST /products/{handle}.json endpoint caps inventory_quantity at 20;
+# Rebuy returns actual quantities without this limit.
 # ---------------------------------------------------------------------------
-_INV_CACHE: Dict[str, Dict[int, int]] = {}
+_REBUY_INV_CACHE: Dict[int, Dict[int, int]] = {}
 
 
-def fetch_inventory(handle: str) -> Dict[int, int]:
-    """Return {variant_id: inventory_quantity} for a product handle."""
-    if handle in _INV_CACHE:
-        return _INV_CACHE[handle]
+def fetch_rebuy_inventory(product_id: int) -> Dict[int, int]:
+    """Return {variant_id: inventory_quantity} from the Rebuy custom widget API."""
+    if product_id in _REBUY_INV_CACHE:
+        return _REBUY_INV_CACHE[product_id]
     mapping: Dict[int, int] = {}
-    for host in [PDP_HOST] + [h for h in HOST_ROTATION if h != PDP_HOST]:
-        url = f"{host.rstrip('/')}/products/{handle}.json"
-        try:
-            resp = SESSION.get(url, timeout=30)
-            if resp.status_code == 404:
-                continue
-            resp.raise_for_status()
-            payload = resp.json()
-            for v in payload.get("product", {}).get("variants", []):
-                vid = v.get("id")
-                qty = v.get("inventory_quantity")
-                if vid is not None and qty is not None:
-                    mapping[int(vid)] = int(qty)
-            break
-        except Exception as exc:
-            log.debug("Inventory fetch failed %s: %s", url, exc)
-    _INV_CACHE[handle] = mapping
+    try:
+        resp = SESSION.get(
+            f"{REBUY_API_BASE}/{REBUY_WIDGET_ID}",
+            params={
+                "key": REBUY_API_KEY,
+                "shopify_product_ids": str(product_id),
+                "limit": 1,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        for product in payload.get("data", []):
+            if int(product.get("id", 0)) == product_id:
+                for v in product.get("variants", []):
+                    vid = v.get("id")
+                    qty = v.get("inventory_quantity")
+                    if vid is not None and qty is not None:
+                        mapping[int(vid)] = int(qty)
+                break
+    except Exception as exc:
+        log.debug("Rebuy inventory fetch failed for product %d: %s", product_id, exc)
+    _REBUY_INV_CACHE[product_id] = mapping
     return mapping
 
 
@@ -919,8 +950,8 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         stretch_from_desc = derive_stretch_from_description(description_raw)
         stretch = stretch_from_desc or pdp.get("stretch", "")
 
-        # Inventory: from REST JSON
-        inv_map = fetch_inventory(handle)
+        # Inventory: from Rebuy API (REST JSON caps at 20; Rebuy returns real quantities)
+        inv_map = fetch_rebuy_inventory(product_id_int)
 
         # Style name base (Step 1+2 only; Steps 3-4 in post-processing)
         style_name_base = derive_style_name_base(title)
@@ -1229,9 +1260,12 @@ def apply_color_standardized_inference(rows: List[Dict[str, Any]]) -> None:
 
 def post_process(rows: List[Dict[str, Any]]) -> None:
     log.info("Post-processing %d rows …", len(rows))
+    # Description fallback runs FIRST so that a product whose PDP returned blank
+    # inseam but whose description has the value (e.g. "33 inch inseam") gets it
+    # set before peer inference can overwrite with a neighbour's incorrect value.
+    apply_inseam_from_description_fallback(rows)
     apply_measurement_inference(rows)
     apply_petite_inseam_rule(rows)
-    apply_inseam_from_description_fallback(rows)
     # Jean style needs style name first pass (before style name rules,
     # so we can use jean_style in one-word style name rule step 3b)
     apply_jean_style(rows)
