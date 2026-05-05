@@ -10,6 +10,7 @@ Data sources:
 from __future__ import annotations
 
 import csv
+import html as _html_mod
 import logging
 import re
 import sys
@@ -56,6 +57,8 @@ YOTPO_APP_KEY = "1maBA6ctnRD1GNlOziHctkBiWGhzUrBXY5Q2ErZn"
 REBUY_WIDGET_ID = "28256"
 REBUY_API_KEY = "d894da4c5b0317da53860dda0d297d9d8057c12e"
 REBUY_API_BASE = "https://rebuyengine.com/api/v1/custom/id"
+REBUY_SHOP = "pistola-denim.myshopify.com"
+REBUY_CHUNK_SIZE = 20
 
 EXCLUDED_PRODUCT_TYPES = {
     "TEES & TANKS", "KNIT TOPS", "ONE PIECE", "DENIM SHORTS",
@@ -766,42 +769,143 @@ def fetch_pdp(handle: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Inventory from Rebuy API
+# Inventory + metafields from Rebuy API
 # The REST /products/{handle}.json endpoint caps inventory_quantity at 20;
 # Rebuy returns actual quantities without this limit.
 # ---------------------------------------------------------------------------
-_REBUY_INV_CACHE: Dict[int, Dict[int, int]] = {}
+_REBUY_SETTINGS: Optional[Tuple[str, str]] = None
 
 
-def fetch_rebuy_inventory(product_id: int) -> Dict[int, int]:
-    """Return {variant_id: inventory_quantity} from the Rebuy custom widget API."""
-    if product_id in _REBUY_INV_CACHE:
-        return _REBUY_INV_CACHE[product_id]
-    mapping: Dict[int, int] = {}
-    try:
-        resp = SESSION.get(
-            f"{REBUY_API_BASE}/{REBUY_WIDGET_ID}",
-            params={
-                "key": REBUY_API_KEY,
-                "shopify_product_ids": str(product_id),
-                "limit": 1,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        for product in payload.get("data", []):
-            if int(product.get("id", 0)) == product_id:
-                for v in product.get("variants", []):
-                    vid = v.get("id")
-                    qty = v.get("inventory_quantity")
-                    if vid is not None and qty is not None:
-                        mapping[int(vid)] = int(qty)
+def _get_rebuy_key_endpoint() -> Tuple[str, str]:
+    """Return (api_key, /path/endpoint) from the Rebuy widget settings API.
+
+    Falls back to the hardcoded key + /custom/id/{widget_id} path if the
+    settings call fails (e.g. network error or unexpected response shape).
+    """
+    global _REBUY_SETTINGS
+    if _REBUY_SETTINGS:
+        return _REBUY_SETTINGS
+    for attempt in range(5):
+        try:
+            resp = SESSION.get(
+                "https://rebuyengine.com/api/v1/widgets/settings",
+                params={"shop": REBUY_SHOP, "id": REBUY_WIDGET_ID},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            key = data.get("key")
+            endpoint = data.get("endpoint")
+            if key and endpoint:
+                _REBUY_SETTINGS = (key, endpoint)
+                return _REBUY_SETTINGS
+        except Exception as exc:
+            log.debug("Rebuy settings attempt %d: %s", attempt + 1, exc)
+            time.sleep(1.5 ** attempt)
+    log.warning("Rebuy settings fetch failed; falling back to hardcoded key/endpoint")
+    _REBUY_SETTINGS = (REBUY_API_KEY, f"/custom/id/{REBUY_WIDGET_ID}")
+    return _REBUY_SETTINGS
+
+
+def fetch_all_rebuy_data(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Batch-fetch Rebuy inventory + metafields for all products.
+
+    Returns {product_id_str: {
+        "variant_qty":     {variant_id_str: int},
+        "wishlist_count":  str,
+        "tab1":            str  (raw HTML from metafield),
+        "tab2":            str  (raw HTML from metafield),
+    }}
+    """
+    if not product_ids:
+        return {}
+    key, endpoint = _get_rebuy_key_endpoint()
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for i in range(0, len(product_ids), REBUY_CHUNK_SIZE):
+        chunk = product_ids[i: i + REBUY_CHUNK_SIZE]
+        for attempt in range(5):
+            try:
+                resp = SESSION.get(
+                    f"https://rebuyengine.com/api/v1{endpoint}",
+                    params={
+                        "shop": REBUY_SHOP,
+                        "key": key,
+                        "shopify_product_ids": ",".join(chunk),
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+
+                # Products live in metadata.input_products[] (preferred) or data[]
+                products: List[Dict[str, Any]] = (
+                    (payload.get("metadata") or {}).get("input_products") or []
+                ) or (payload.get("data") or [])
+
+                for p in products:
+                    pid = str(p.get("id", ""))
+                    if not pid:
+                        continue
+                    variant_qty: Dict[str, int] = {}
+                    for v in (p.get("variants") or []):
+                        vid = str(v.get("id", ""))
+                        qty = v.get("inventory_quantity")
+                        if vid and qty is not None:
+                            try:
+                                variant_qty[vid] = int(qty)
+                            except (TypeError, ValueError):
+                                pass
+                    mf = p.get("metafield") or {}
+                    result[pid] = {
+                        "variant_qty": variant_qty,
+                        "wishlist_count": str(mf.get("wishlist_social_count") or ""),
+                        "tab1": str(mf.get("tab1") or ""),
+                        "tab2": str(mf.get("tab2") or ""),
+                    }
                 break
-    except Exception as exc:
-        log.debug("Rebuy inventory fetch failed for product %d: %s", product_id, exc)
-    _REBUY_INV_CACHE[product_id] = mapping
-    return mapping
+            except Exception as exc:
+                log.warning("Rebuy chunk attempt %d: %s", attempt + 1, exc)
+                time.sleep(1.5 ** attempt)
+        time.sleep(0.1)
+
+    log.info("Rebuy data fetched for %d / %d products", len(result), len(product_ids))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Metafield tab helpers
+# ---------------------------------------------------------------------------
+
+def _tab_plain(raw: str) -> str:
+    """Strip HTML tags from a metafield tab value, keeping plain text for measurement extraction."""
+    if not raw:
+        return ""
+    text = _html_mod.unescape(raw)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tab_clean(raw: str) -> str:
+    """Convert metafield tab HTML to semicolon-separated plain text for the Description field.
+
+    Input:  "&#8226 Rise: 10&#8221;<br> &#8226 Inseam: 27&#8221;<br> ..."
+    Output: Rise: 10"; Inseam: 27"; ...
+    """
+    if not raw:
+        return ""
+    text = _html_mod.unescape(raw)
+    # Normalize smart/curly quotes to plain ASCII using \u escapes
+    text = (text.replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2018", "'").replace("\u2019", "'"))
+    # <br> + optional bullet (U+2022) -> semicolon separator
+    text = re.sub("<br\\s*/?>\\s*\u2022?\\s*", "; ", text, flags=re.IGNORECASE)
+    # Strip remaining HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Remove any leading bullet / whitespace / semicolons
+    text = re.sub("^[\u2022\\s;]+", "", text.strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.rstrip(" ;")
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1019,15 @@ def inseam_from_description(description: str) -> str:
 # Build rows
 # ---------------------------------------------------------------------------
 def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Pre-fetch all Rebuy data in one batch (avoids per-product calls and
+    # returns real inventory quantities uncapped by the REST JSON 20-unit limit).
+    all_style_ids = [
+        strip_gid(p.get("id", ""), "gid://shopify/Product/")
+        for p in products
+        if strip_gid(p.get("id", ""), "gid://shopify/Product/").isdigit()
+    ]
+    rebuy_all: Dict[str, Dict[str, Any]] = fetch_all_rebuy_data(all_style_ids)
+
     rows: List[Dict[str, Any]] = []
     total = len(products)
     for idx, product in enumerate(products, 1):
@@ -950,8 +1063,22 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         stretch_from_desc = derive_stretch_from_description(description_raw)
         stretch = stretch_from_desc or pdp.get("stretch", "")
 
-        # Inventory: from Rebuy API (REST JSON caps at 20; Rebuy returns real quantities)
-        inv_map = fetch_rebuy_inventory(product_id_int)
+        # Rebuy data: inventory, wishlist count, metafield tabs
+        rebuy_prod = rebuy_all.get(style_id, {})
+        inv_map_str: Dict[str, int] = rebuy_prod.get("variant_qty", {})  # {variant_id_str: qty}
+        wishlist_count: str = rebuy_prod.get("wishlist_count", "")
+        tab1_raw: str = rebuy_prod.get("tab1", "")
+        tab2_raw: str = rebuy_prod.get("tab2", "")
+
+        # Inseam fallback: if PDP scraping returned blank, try Rebuy tab1
+        if not inseam and tab1_raw:
+            inseam = extract_measurement(_tab_plain(tab1_raw), ["Inseam", "Inleg"])
+
+        # Enrich description: append cleaned tab1 and tab2 content
+        tab1_text = _tab_clean(tab1_raw)
+        tab2_text = _tab_clean(tab2_raw)
+        desc_parts = [description_raw] + [t for t in (tab1_text, tab2_text) if t]
+        enriched_description = " ".join(desc_parts)
 
         # Style name base (Step 1+2 only; Steps 3-4 in post-processing)
         style_name_base = derive_style_name_base(title)
@@ -959,8 +1086,8 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Reviews
         avg_score, total_reviews = fetch_yotpo(product_id_int)
 
-        # Quantity of style = sum of all variant inventory
-        quantity_of_style = sum(inv_map.values()) if inv_map else ""
+        # Quantity of style = sum of all variant inventory from Rebuy
+        quantity_of_style: Any = sum(inv_map_str.values()) if inv_map_str else ""
 
         variants = (product.get("variants") or {}).get("nodes") or []
         for variant in variants:
@@ -973,9 +1100,8 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             available = variant.get("availableForSale")
             available_str = "TRUE" if available else "FALSE"
 
-            # Inventory quantity from REST
-            variant_id_int = int(sku_shopify) if sku_shopify.isdigit() else 0
-            qty_available = inv_map.get(variant_id_int, "")
+            # Inventory quantity from Rebuy (string-keyed variant id)
+            qty_available = inv_map_str.get(sku_shopify, "")
 
             price_raw = (variant.get("price") or {}).get("amount", "")
             compare_raw = (variant.get("compareAtPrice") or {}).get("amount", "")
@@ -994,7 +1120,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "Product Type": product_type,
                 "Tags": tags_str,
                 "Vendor": vendor,
-                "Description": description_raw,
+                "Description": enriched_description,
                 "Variant Title": variant_title,
                 "Color": color,
                 "Size": size,
@@ -1020,7 +1146,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "Stretch": stretch,
                 "Review AVG": avg_score,
                 "Review Count": total_reviews,
-                "Wishlist count": "",
+                "Wishlist count": wishlist_count,
                 # Internal flags (removed before CSV output)
                 "_is_petite": is_petite or "petite" in title.lower(),
                 "_tags_list": tags,
