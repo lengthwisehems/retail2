@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pistola Denim inventory scraper — GraphQL + PDP + Yotpo edition.
+"""Pistola Denim inventory scraper  -  GraphQL + PDP + Yotpo edition.
 
 Data sources:
   - Shopify Storefront GraphQL API: product/variant core data
@@ -247,7 +247,7 @@ def parse_fraction(raw: str) -> Optional[float]:
     text = (raw or "").strip()
     for sym, rep in FRACTION_MAP.items():
         text = text.replace(sym, rep)
-    text = re.sub(r"[\"“”″′'’]", "", text)
+    text = re.sub('[\u201c\u201d\u2033\u2032\u2018\u2019"\']', "", text)
     text = re.sub(r"\b(in|inch|inches)\b", "", text, flags=re.IGNORECASE).strip()
     if not text:
         return None
@@ -273,26 +273,26 @@ def format_measurement(value: Optional[float]) -> str:
 
 
 def extract_measurement(text: str, labels: Sequence[str], require_colon: bool = False) -> str:
-    “””Pull a measurement number from text after any of the given labels.
+    """Pull a measurement number from text after any of the given labels.
 
-    require_colon=True prevents false matches like ‘High Rise 23’ when only
-    searching for label ‘Rise’ — a colon must separate the label from the value.
-    “””
-    norm = text or “”
+    require_colon=True prevents false matches like 'High Rise 23' when only
+    searching for label 'Rise'  -  a colon must separate the label from the value.
+    """
+    norm = text or ""
     for sym, rep in FRACTION_MAP.items():
-        norm = norm.replace(sym, “ “ + rep)
-    norm = norm.replace(“’”, “’”).replace(“””, ‘”’).replace(“””, ‘”’)
-    colon_pat = r”\s*:\s*” if require_colon else r”\s*:?\s*”
+        norm = norm.replace(sym, " " + rep)
+    norm = norm.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    colon_pat = r"\s*:\s*" if require_colon else r"\s*:?\s*"
     for label in labels:
         m = re.search(
-            rf”{re.escape(label)}{colon_pat}([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)”,
+            rf"{re.escape(label)}{colon_pat}([0-9]+(?:\s+[0-9]+/[0-9]+|/[0-9]+|\.[0-9]+)?)",
             norm, re.IGNORECASE,
         )
         if m:
             val = parse_fraction(m.group(1))
             if val is not None:
                 return format_measurement(val)
-    return “”
+    return ""
 
 
 def extract_tag_value(tags: Iterable[str], prefix: str) -> str:
@@ -315,7 +315,7 @@ def text_has_any(text: str, phrases: Sequence[str]) -> bool:
 
 
 def fix_smart_quotes(text: str) -> str:
-    return (text or "").replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    return (text or "").replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +355,9 @@ def derive_style_name_base(product_title: str) -> str:
     """Step 1+2: clean title then remove styling words.
 
     Step 1 removes the color suffix after any dash variant:
-      'Name - Color', 'Name- Color', 'Name – Color'
+      'Name - Color', 'Name- Color', 'Name - Color'
     """
-    parts = re.split(r"\s*[-–—]\s*", product_title or "")
+    parts = re.split(r"\s*[-- - ]\s*", product_title or "")
     text = parts[0].strip()
     text = re.sub(r'"', " ", text)
     text = re.sub(r"\b\d+\b", " ", text)
@@ -384,7 +384,7 @@ def _map_jean_from_text(text: str, lo_str: str, allow_mom: bool = False) -> str:
     t = (text or "").lower()
     if not t:
         return ""
-    # Step order matters — first match wins
+    # Step order matters  -  first match wins
     taper_words = ["balloon", "tapered", "mom"] if allow_mom else ["balloon", "tapered"]
     if text_has_any(t, taper_words):
         return "Tapered"
@@ -573,13 +573,13 @@ def derive_rise_label(title: str, description: str, tags: List[str],
         if "Rise: Low" in tag_val:
             return "Low"
     elif len(rise_tags) > 1:
-        # Multiple rise tags — defer to inference step (handled in post-processing)
+        # Multiple rise tags  -  defer to inference step (handled in post-processing)
         pass
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Color — Standardized
+# Color  -  Standardized
 # ---------------------------------------------------------------------------
 def _color_std_from_text(text: str, whole_word_only: bool = True) -> str:
     """Map text against color rules. Returns first match."""
@@ -887,9 +887,9 @@ def extract_color_from_title(title: str) -> str:
     Handles all three formats:
       'Name - Color'   (space-hyphen-space)
       'Name- Color'    (hyphen-space, no leading space)
-      'Name – Color'   (en-dash with spaces)
+      'Name - Color'   (en-dash with spaces)
     """
-    parts = re.split(r"\s*[-–—]\s*", title)
+    parts = re.split(r"\s*[-- - ]\s*", title)
     if len(parts) > 1:
         return parts[-1].strip()
     return ""
@@ -1068,13 +1068,13 @@ def apply_inseam_from_description_fallback(rows: List[Dict[str, Any]]) -> None:
 def apply_measurement_inference(rows: List[Dict[str, Any]]) -> None:
     """Propagate Inseam and Leg Opening within product-title stem families.
 
-    Rise is NOT propagated — if a product has no Rise measurement it stays blank.
+    Rise is NOT propagated  -  if a product has no Rise measurement it stays blank.
     Petite products are grouped with their non-petite counterparts (PETITE prefix stripped)
     so that inseam/LO can propagate across both.
     """
     def _stem(title: str) -> str:
         # Split at any dash variant, strip PETITE prefix, lowercase
-        t = re.split(r"\s*[-–—]\s*", title or "")[0].strip()
+        t = re.split(r"\s*[-- - ]\s*", title or "")[0].strip()
         t = re.sub(r"^PETITE\s+", "", t, flags=re.IGNORECASE)
         return t.lower()
 
@@ -1122,7 +1122,7 @@ def apply_style_name_rules(rows: List[Dict[str, Any]]) -> None:
             for r in non_mat:
                 r["Style Name"] = most_common
 
-    # Step 3b: one-word style names — look for multi-word peers with same first word
+    # Step 3b: one-word style names  -  look for multi-word peers with same first word
     # and same leg opening; if found use the most common. Otherwise append full Jean Style.
     for row in rows:
         sn = row["Style Name"].strip()
@@ -1207,7 +1207,7 @@ def apply_rise_label_inference(rows: List[Dict[str, Any]]) -> None:
             closest = min(peers, key=_dist)
             row["Rise Label"] = closest["Rise Label"]
 
-    # Multiple rise tags — resolve using Rise measurement
+    # Multiple rise tags  -  resolve using Rise measurement
     for row in rows:
         if row["Rise Label"]:
             continue
@@ -1359,7 +1359,7 @@ def validate_style_names(rows: List[Dict[str, Any]]) -> None:
     if all_ok:
         log.info("VALIDATION: all %d examples passed", len(VALIDATION_EXAMPLES))
     else:
-        log.warning("VALIDATION: some examples failed — check Style Name derivation")
+        log.warning("VALIDATION: some examples failed  -  check Style Name derivation")
 
 
 # ---------------------------------------------------------------------------
