@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -23,18 +23,20 @@ from openpyxl import Workbook
 # =========================
 # USER INPUTS (EDIT THESE)
 # =========================
-BRAND = "Ksubi"
+BRAND = "Paige"
 COLLECTION_URL = [
-    "https://ksubi.com/collections/womens-denim",
-    "https://ksubi.com/collections/womens-denim-sale",
+    "https://shop.paige.com/collections/women-denim",
 ]
-SELECTOR = (
-    "#shopify-section-template--19885400981690__default > section > div > section > "
-    "div > div.product_section.js-product_section.container.is-justify-space-between."
-    "has-padding-bottom > div.product__information.has-product-sticker.one-half.column."
-    "medium-down--one-whole > div > div.product-features-section.product-features-features.active "
-    "> div.product-features-content.product-web-des-2 > ul"
-)
+SELECTOR = "#headlessui-disclosure-panel-_r_27_ > div > ul > li"
+# Optional click-open controls for accordions/tabs.
+# Example for Paige:
+# PARENT_SELECTOR = "div[data-headlessui-state]"
+# SET_PARENT_SELECTOR_TO_OPEN = True
+PARENT_SELECTOR = ""
+SET_PARENT_SELECTOR_TO_OPEN = False
+CLICK_TARGET_TEXTS: List[str] = ["DETAILS"]
+BROWSER_RENDER_ENABLED = True
+BROWSER_RENDER_TIMEOUT_MS = 45000
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
@@ -149,45 +151,6 @@ def child_letter(index: int) -> str:
     return letters
 
 
-def find_parent_with_fallbacks(soup: BeautifulSoup, selector: str, logger: logging.Logger) -> Tag | None:
-    parent = soup.select_one(selector)
-    if parent is not None:
-        return parent
-
-    normalized = re.sub(r"#shopify-section-template--\d+__default", "[id^='shopify-section-template--'][id$='__default']", selector)
-    if normalized != selector:
-        parent = soup.select_one(normalized)
-        if parent is not None:
-            logger.info("Selector matched with dynamic section-id fallback")
-            return parent
-
-    # Staud (and similar themes) use block ids like:
-    # #Details-Content-content_block_NMNAMR > div
-    # where the trailing block token can vary by product.
-    details_normalized = re.sub(
-        r"#Details-Content-content_block_[A-Za-z0-9_-]+",
-        "[id^='Details-Content-content_block_']",
-        selector,
-    )
-    if details_normalized != selector:
-        parent = soup.select_one(details_normalized)
-        if parent is not None:
-            logger.info("Selector matched with dynamic details-block-id fallback")
-            return parent
-
-    parts = [part.strip() for part in selector.split(">") if part.strip()]
-    for start in range(1, len(parts)):
-        reduced = " > ".join(parts[start:])
-        parent = soup.select_one(reduced)
-        if parent is not None:
-            logger.info("Selector matched with reduced path fallback: %s", reduced)
-            return parent
-
-    return soup.select_one("div.product-features-content.product-web-des-2 > ul")
-
-
-
-
 def selector_with_dynamic_id_fallbacks(selector: str) -> List[str]:
     candidates = [selector]
 
@@ -207,7 +170,40 @@ def selector_with_dynamic_id_fallbacks(selector: str) -> List[str]:
     if normalized_details not in candidates:
         candidates.append(normalized_details)
 
+    normalized_headless = re.sub(
+        r"#headlessui-disclosure-panel-[A-Za-z0-9_-]+",
+        "[id^='headlessui-disclosure-panel-']",
+        selector,
+    )
+    if normalized_headless not in candidates:
+        candidates.append(normalized_headless)
+
     return candidates
+
+
+def find_parent_with_fallbacks(soup: BeautifulSoup, selector: str, logger: logging.Logger) -> Tag | None:
+    for candidate in selector_with_dynamic_id_fallbacks(selector):
+        parent = soup.select_one(candidate)
+        if parent is not None:
+            if candidate != selector:
+                logger.info("Selector matched with dynamic-id fallback: %s", candidate)
+            return parent
+
+    # For strongly scoped dynamic-id selectors (Headless UI / details blocks),
+    # do not fall back to overly broad reduced paths like "div > ul > li".
+    if "headlessui-disclosure-panel" in selector or "Details-Content-content_block_" in selector:
+        return None
+
+    parts = [part.strip() for part in selector.split(">") if part.strip()]
+    for start in range(1, len(parts)):
+        reduced = " > ".join(parts[start:])
+        for candidate in selector_with_dynamic_id_fallbacks(reduced):
+            parent = soup.select_one(candidate)
+            if parent is not None:
+                logger.info("Selector matched with reduced path fallback: %s", candidate)
+                return parent
+
+    return soup.select_one("div.product-features-content.product-web-des-2 > ul")
 
 
 def build_soup_candidates(html: str) -> List[BeautifulSoup]:
@@ -218,15 +214,12 @@ def build_soup_candidates(html: str) -> List[BeautifulSoup]:
         except FeatureNotFound:
             continue
         soups.append(soup)
-    if not soups:  # pragma: no cover - BeautifulSoup always has html.parser
+    if not soups:  # pragma: no cover
         soups.append(BeautifulSoup(html, "html.parser"))
     return soups
 
 
 def extract_child_columns_from_soup(soup: BeautifulSoup, selector: str, logger: logging.Logger) -> Dict[str, str]:
-
-    # If selector targets a repeated child (e.g., ... > li), capture every match
-    # instead of only traversing from a single parent node.
     for candidate in selector_with_dynamic_id_fallbacks(selector):
         matches = [node for node in soup.select(candidate) if isinstance(node, Tag)]
         if len(matches) > 1:
@@ -270,6 +263,162 @@ def extract_child_columns(html: str, selector: str, logger: logging.Logger) -> D
     return best_result
 
 
+def render_page_html_with_clicks(
+    url: str,
+    parent_selector: str,
+    set_parent_selector_to_open: bool,
+    click_target_texts: Sequence[str],
+    logger: logging.Logger,
+    timeout_ms: int = BROWSER_RENDER_TIMEOUT_MS,
+) -> Optional[str]:
+    """Render a PDP with Playwright, click disclosure toggles, and return DOM HTML."""
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        logger.info("Playwright unavailable, skipping browser-render pass: %s", exc)
+        return None
+
+    def dismiss_known_overlays(page) -> None:
+        overlay_selectors = [
+            "#attentive_overlay",
+            "iframe#attentive_creative",
+            "[id*='attentive_overlay']",
+            "[data-testid*='attentive']",
+        ]
+        for selector in overlay_selectors:
+            try:
+                page.evaluate(
+                    """(sel) => {
+                        document.querySelectorAll(sel).forEach((el) => {
+                            try { el.remove(); } catch (e) {}
+                            if (el.style) {
+                                el.style.display = 'none';
+                                el.style.visibility = 'hidden';
+                                el.style.pointerEvents = 'none';
+                            }
+                        });
+                    }""",
+                    selector,
+                )
+            except Exception:
+                continue
+        try:
+            page.add_style_tag(
+                content="""
+                #attentive_overlay, iframe#attentive_creative, [id*='attentive_overlay'] {
+                    display: none !important;
+                    visibility: hidden !important;
+                    pointer-events: none !important;
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def click_with_fallback(locator, label: str) -> bool:
+        try:
+            locator.click(timeout=5000)
+            return True
+        except Exception as exc:
+            logger.info("Normal click failed for %s; retrying with force: %s", label, exc)
+        try:
+            locator.click(timeout=5000, force=True)
+            return True
+        except Exception as exc:
+            logger.info("Force click failed for %s; retrying with JS click: %s", label, exc)
+        try:
+            handle = locator.element_handle(timeout=5000)
+            if handle is None:
+                return False
+            locator.page.evaluate("(el) => el.click()", handle)
+            return True
+        except Exception as exc:
+            logger.info("JS click failed for %s: %s", label, exc)
+            return False
+
+    html: Optional[str] = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+            except PlaywrightTimeoutError:
+                logger.info("Network idle wait timed out for %s; continuing", url)
+
+            dismiss_known_overlays(page)
+            clicked = 0
+
+            if set_parent_selector_to_open and parent_selector.strip():
+                parent_locator = page.locator(parent_selector)
+                parent_count = parent_locator.count()
+                logger.info("Found %s parent-selector nodes for click-open check", parent_count)
+                for idx in range(parent_count):
+                    current = parent_locator.nth(idx)
+                    state = (current.get_attribute("data-headlessui-state") or "").strip().lower()
+                    aria_expanded = (current.get_attribute("aria-expanded") or "").strip().lower()
+                    if state == "open" or aria_expanded == "true":
+                        continue
+                    button_locator = current.locator("button,[role='button']")
+                    if button_locator.count() > 0:
+                        if click_with_fallback(button_locator.first, f"{parent_selector}[{idx}] button"):
+                            clicked += 1
+                    elif click_with_fallback(current, f"{parent_selector}[{idx}]"):
+                        clicked += 1
+
+            for label in click_target_texts:
+                target = label.strip()
+                if not target:
+                    continue
+                locator = page.locator(f"button:has-text('{target}')")
+                if locator.count() > 0:
+                    first = locator.first
+                    state = (first.get_attribute("data-headlessui-state") or "").strip().lower()
+                    aria_expanded = (first.get_attribute("aria-expanded") or "").strip().lower()
+                    if state != "open" and aria_expanded != "true":
+                        if click_with_fallback(first, f"button:{target}"):
+                            clicked += 1
+                    continue
+
+                fallback = page.locator(f"text={target}")
+                if fallback.count() > 0 and click_with_fallback(fallback.first, f"text:{target}"):
+                    clicked += 1
+
+            if clicked:
+                page.wait_for_timeout(500)
+            else:
+                logger.info("No click target matched for %s", url)
+
+            html = page.content()
+            browser.close()
+    except Exception as exc:
+        logger.warning("Browser-render pass failed for %s: %s", url, exc)
+        return None
+
+    return html
+
+
+def select_best_extraction(
+    html_candidates: Sequence[Tuple[str, str]],
+    selector: str,
+    logger: logging.Logger,
+) -> Dict[str, str]:
+    best: Dict[str, str] = {}
+    best_count = 0
+    best_source = ""
+    for source_label, html in html_candidates:
+        cols = extract_child_columns(html, selector, logger)
+        if len(cols) > best_count:
+            best = cols
+            best_count = len(cols)
+            best_source = source_label
+    if best_source:
+        logger.info("Selector extraction source chosen: %s (%s columns)", best_source, best_count)
+    return best
+
+
 def probe_pdp_rows(session: requests.Session, logger: logging.Logger) -> List[PDPRow]:
     seen_handles: set[str] = set()
     rows: List[PDPRow] = []
@@ -283,8 +432,28 @@ def probe_pdp_rows(session: requests.Session, logger: logging.Logger) -> List[PD
 
             product_url = urljoin(collection_url, f"/products/{handle}")
             try:
-                response = get_with_retries(session, product_url, logger)
-                child_values = extract_child_columns(response.text, SELECTOR, logger)
+                html_candidates: List[Tuple[str, str]] = []
+                try:
+                    response = get_with_retries(session, product_url, logger)
+                    html_candidates.append(("http", response.text))
+                except Exception as exc:
+                    logger.warning("HTTP fetch failed for %s; will try browser-render path: %s", product_url, exc)
+
+                if BROWSER_RENDER_ENABLED and (CLICK_TARGET_TEXTS or (SET_PARENT_SELECTOR_TO_OPEN and PARENT_SELECTOR.strip())):
+                    rendered_html = render_page_html_with_clicks(
+                        product_url,
+                        PARENT_SELECTOR,
+                        SET_PARENT_SELECTOR_TO_OPEN,
+                        CLICK_TARGET_TEXTS,
+                        logger,
+                    )
+                    if rendered_html:
+                        html_candidates.insert(0, ("browser_click", rendered_html))
+
+                if not html_candidates:
+                    raise RuntimeError("No HTML candidates available after HTTP and browser-render attempts")
+
+                child_values = select_best_extraction(html_candidates, SELECTOR, logger)
                 rows.append(PDPRow(handle=handle, child_values=child_values, url=product_url))
                 logger.info("PDP parsed | handle=%s | columns=%s", handle, len(child_values))
             except Exception as exc:
