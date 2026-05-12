@@ -1,12 +1,15 @@
-#No Playwrite#
 import csv
 import html
 import json
+import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -43,11 +46,8 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "W/ Wide Cuff", "W/Flap", "Wax", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper",
 ]
 
-ATTRIBUTE_KEYS_ORDER = (
-    "closure", "clothingtype", "colorcategory", "colorvariants",
-    "denimfabric", "fit", "fitvariants", "gender", "inseamvariants",
-    "length", "producttype", "rise", "specs", "stretch", "stylecontent",
-)
+PDP_SELECTOR = "[id^='headlessui-disclosure-panel-'] > div > ul > li"
+PDP_PARENT_SELECTOR = "div[data-headlessui-state]"
 
 CSV_HEADERS = [
     "Style Id",
@@ -485,6 +485,70 @@ def dedupe_description_parts(parts: Sequence[str]) -> List[str]:
     return deduped
 
 
+def extract_pdp_description(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    matches = [node for node in soup.select(PDP_SELECTOR) if isinstance(node, Tag)]
+    values = [normalize_text(node) for node in matches if normalize_text(node)]
+    if values:
+        return ", ".join(values)
+
+    parent = soup.select_one(PDP_PARENT_SELECTOR)
+    if parent is not None:
+        values = [normalize_text(node) for node in parent.find_all("li") if normalize_text(node)]
+        if values:
+            return ", ".join(values)
+
+    keyword_hits: List[str] = []
+    for node in soup.find_all(["li", "p", "span"]):
+        node_text = normalize_text(node)
+        node_lower = node_text.lower()
+        if any(token in node_lower for token in ("front rise", "rise", "inseam", "leg opening", "stretch")):
+            keyword_hits.append(node_text)
+    if keyword_hits:
+        return ", ".join(dict.fromkeys(keyword_hits))
+
+    return ""
+
+
+def extract_next_data_description(html_text: str) -> str:
+    """Extract product description from Next.js __NEXT_DATA__ JSON embedded in the page.
+
+    Paige's headless Shopify + Next.js site embeds server-rendered product data in a
+    <script id="__NEXT_DATA__"> tag.  This data often includes the full product
+    description (body_html / descriptionHtml) with measurement details that are not
+    available in the Shopify JSON endpoint or in the rendered static HTML elements.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    script = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script or not script.string:
+        return ""
+    try:
+        data = json.loads(script.string)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+
+    measurement_keywords = ("front rise", "inseam", "leg opening", "stretch")
+    candidates: List[str] = []
+
+    def _search(obj: object, depth: int = 0) -> None:
+        if depth > 20:
+            return
+        if isinstance(obj, str) and len(obj) < 8000:
+            text = strip_html_text(obj) if "<" in obj else obj
+            if any(k in text.lower() for k in measurement_keywords):
+                candidates.append(text)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _search(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _search(item, depth + 1)
+
+    _search(data)
+    if candidates:
+        return ", ".join(dict.fromkeys(c for c in candidates if c))
+    return ""
+
 
 def parse_mixed_fraction(raw_value: str) -> Optional[float]:
     value = raw_value.strip().replace("″", "").replace('"', "")
@@ -557,6 +621,56 @@ def extract_label_text(text: str, labels: Sequence[str]) -> str:
     return ""
 
 
+def extract_stretch_from_html(html_text: str) -> str:
+    """Parse the stretch-scale widget from static HTML.
+
+    The widget renders as a parent container holding an odd number of child divs
+    where every other child (positions 1, 3, 5, 7, 9) is a visible "dot" and the
+    active dot carries a class that includes the word "active".  We locate the
+    active dot by scanning all divs that contain both "dot" and "active" in their
+    combined class string, then count its 1-based position among all dot siblings.
+    """
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    # Find the active dot: any div whose class string contains both 'dot' and 'active'.
+    active_dot = None
+    for div in soup.find_all("div"):
+        cls = " ".join(div.get("class", [])).lower()
+        if "dot" in cls and "active" in cls:
+            active_dot = div
+            break
+
+    if active_dot is None:
+        return ""
+
+    dot_parent = active_dot.parent
+    if dot_parent is None:
+        return ""
+
+    # Collect all direct-child divs whose class includes "dot".
+    dot_siblings = [
+        d for d in dot_parent.find_all("div", recursive=False)
+        if "dot" in " ".join(d.get("class", [])).lower()
+    ]
+
+    # dot_siblings contains only the 5 actual dot elements (connectors/spacers filtered
+    # out). The active dot's 1-based position within this filtered list maps directly:
+    #   1 → High Stretch, 2 → Medium to High Stretch, 3 → Medium Stretch,
+    #   4 → Low Stretch,  5 → Rigid
+    mapping = {
+        1: "High Stretch",
+        2: "Medium to High Stretch",
+        3: "Medium Stretch",
+        4: "Low Stretch",
+        5: "Rigid",
+    }
+    for idx, child in enumerate(dot_siblings, start=1):
+        if child is active_dot:
+            return mapping.get(idx, "")
+    return ""
+
 
 def normalize_stretch_value(value: str) -> str:
     raw = (value or "").strip()
@@ -603,6 +717,325 @@ def derive_stretch_from_algolia_attrs(denim_fabric: str, stretch_attr: str) -> s
     return ""
 
 
+class PDPBrowserExtractor:
+    """Browser-driven PDP extractor for HeadlessUI DETAILS panels.
+
+    Uses a single shared Chromium process with a fresh browser context created
+    for every fetch() call.  This prevents a dead/blocked context from cascading
+    into silent failures for all subsequent handles — the previous design reused
+    one thread-local page, so a TargetClosedError on handle N caused handles
+    N+1…end to fail silently because _thread_ensure() saw page is not None and
+    returned True without noticing the page was already dead.
+    """
+
+    _LAUNCH_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",       # required: Azure App Service cannot nest sandboxes
+        "--disable-gpu",      # no GPU on server
+        "--disable-dev-shm-usage",
+    ]
+    _BLOCKED_TYPES = {"image", "media", "font", "stylesheet"}
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("PAIGE_PDP_BROWSER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+        self.headless = os.getenv("PAIGE_PDP_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
+        self._workers: int = max(1, int(os.getenv("PAIGE_PDP_BROWSER_WORKERS", "2")))
+        self._playwright_importable: Optional[bool] = None
+        self._import_lock = threading.Lock()
+        # Single shared browser (thread-safe: Playwright allows concurrent contexts).
+        self._pw = None
+        self._browser = None
+        self._browser_lock = threading.Lock()
+        self._init_failed = False
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _playwright_available(self) -> bool:
+        if self._playwright_importable is not None:
+            return self._playwright_importable
+        with self._import_lock:
+            if self._playwright_importable is not None:
+                return self._playwright_importable
+            try:
+                import playwright  # noqa: F401
+                self._playwright_importable = True
+            except Exception as exc:
+                log(f"Playwright import failed: {exc}")
+                self._playwright_importable = False
+        return self._playwright_importable
+
+    def _ensure_browser(self) -> bool:
+        """Launch the shared Chromium browser if not already running."""
+        if not self.enabled or not self._playwright_available():
+            return False
+        if self._init_failed:
+            return False
+        if self._browser is not None:
+            return True
+        with self._browser_lock:
+            if self._browser is not None:
+                return True
+            if self._init_failed:
+                return False
+            try:
+                from playwright.sync_api import sync_playwright
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(
+                    headless=self.headless,
+                    args=self._LAUNCH_ARGS,
+                )
+                log(f"Playwright Chromium launched (headless={self.headless})")
+                return True
+            except Exception as exc:
+                log(f"Playwright launch failed: {exc}")
+                self._init_failed = True
+                return False
+
+    @staticmethod
+    def _dismiss_overlays(page: object) -> None:
+        try:
+            page.evaluate(  # type: ignore[attr-defined]
+                """() => {
+                  document.querySelectorAll(
+                    '#attentive_overlay, iframe#attentive_creative,'
+                    ' [id*="attentive_overlay"], [data-testid*="attentive"]'
+                  ).forEach(el => { try { el.remove(); } catch(e) {} });
+                }"""
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fetch(self, handle: str) -> Dict[str, str]:
+        _empty: Dict[str, str] = {"details": "", "stretch": "", "description": ""}
+        if not self._ensure_browser():
+            log(f"PDP browser {handle} | SKIP: browser unavailable")
+            return _empty
+
+        url = f"{PDP_HOST}/products/{handle}"
+        start = time.time()
+        _page_timeout_s = float(os.getenv("PAIGE_PDP_FETCH_TIMEOUT_S", "0") or "0")
+
+        # Fresh context per fetch: clears cookies/state so a blocked prior page
+        # cannot cascade into failures here.
+        ctx = None
+        try:
+            ctx = self._browser.new_context(  # type: ignore[union-attr]
+                ignore_https_errors=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1366, "height": 768},
+            )
+            ctx.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in self._BLOCKED_TYPES
+                else route.continue_(),
+            )
+            page = ctx.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        except Exception as exc:
+            log(f"PDP browser {handle} | context error: {type(exc).__name__}: {str(exc)[:80]}")
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            return _empty
+
+        try:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            except Exception as exc:
+                log(f"PDP browser {handle} | goto FAIL ({type(exc).__name__}): {str(exc)[:100]}")
+                return _empty
+
+            if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
+                log(f"PDP browser {handle} | timeout after goto ({time.time()-start:.1f}s)")
+                return _empty
+
+            # Detect bot-check / access-denied pages early.
+            try:
+                page_title = (page.title() or "").lower()
+                if "checkpoint" in page_title or "access denied" in page_title or "blocked" in page_title:
+                    log(f"PDP browser {handle} | blocked page detected: {page_title!r}")
+                    return _empty
+            except Exception:
+                pass
+
+            self._dismiss_overlays(page)
+
+            # Wait for React to hydrate before interacting with HeadlessUI.
+            # HeadlessUI sets data-headlessui-state on its buttons only after hydration.
+            try:
+                page.wait_for_selector(
+                    "[data-headlessui-state]", timeout=7000, state="attached"
+                )
+            except Exception:
+                pass  # Continue anyway — page may not use HeadlessUI
+
+            if _page_timeout_s > 0 and (time.time() - start) > _page_timeout_s:
+                log(f"PDP browser {handle} | timeout after hydration wait")
+                return _empty
+
+            details_text = ""
+            try:
+                btn = page.get_by_role("button", name=re.compile("DETAILS", re.IGNORECASE))
+                if btn.count() == 0:
+                    btn = page.locator("button:has-text('DETAILS')")
+                if btn.count():
+                    try:
+                        expanded = btn.first.get_attribute("aria-expanded", timeout=500)
+                    except Exception:
+                        expanded = None
+                    if expanded != "true":
+                        try:
+                            btn.first.click(timeout=1500)
+                        except Exception:
+                            try:
+                                btn.first.click(timeout=1500, force=True)
+                            except Exception:
+                                pass
+                    # Wait for the HeadlessUI panel to become visible after the click.
+                    try:
+                        page.locator(
+                            "[id^='headlessui-disclosure-panel-']"
+                        ).first.wait_for(state="visible", timeout=3000)
+                    except Exception:
+                        page.wait_for_timeout(300)
+
+                # Primary extraction: JavaScript search across the full DOM.
+                # Works for HeadlessUI v1 (panel in DOM after click) and v2 (always in DOM).
+                try:
+                    js_result = page.evaluate(
+                        """() => {
+                            var keys = ['front rise', 'inseam', 'leg opening', 'stretch'];
+                            var found = [];
+                            document.querySelectorAll('li, dd, td').forEach(function(el) {
+                                var t = (el.textContent || '').trim();
+                                var tl = t.toLowerCase();
+                                if (t.length > 3 && t.length < 200
+                                        && keys.some(function(k) { return tl.indexOf(k) !== -1; })) {
+                                    found.push(t.replace(/\\s+/g, ' '));
+                                }
+                            });
+                            var seen = {};
+                            return found.filter(function(x) {
+                                if (seen[x]) return false;
+                                seen[x] = true;
+                                return true;
+                            }).join(', ');
+                        }"""
+                    ) or ""
+                    if js_result:
+                        details_text = js_result
+                except Exception:
+                    pass
+
+                # Fallback: strict CSS selector on HeadlessUI panel children.
+                if not details_text:
+                    detail_nodes = page.locator(PDP_SELECTOR)
+                    count = detail_nodes.count()
+                    if count:
+                        items = []
+                        for i in range(count):
+                            try:
+                                text = detail_nodes.nth(i).inner_text(timeout=600).strip()
+                            except Exception:
+                                continue
+                            if text:
+                                items.append(re.sub(r"\s+", " ", text))
+                        details_text = ", ".join(items)
+
+                # Second fallback: read the entire panel element.
+                if not details_text:
+                    panel = page.locator("[id^='headlessui-disclosure-panel-']").first
+                    if panel.count():
+                        try:
+                            raw = panel.inner_text(timeout=1500).strip()
+                            if raw:
+                                details_text = re.sub(r"\s+", " ", raw)
+                        except Exception:
+                            pass
+            except Exception:
+                details_text = ""
+
+            stretch = ""
+            try:
+                idx = page.evaluate(
+                    """() => {
+                      const allDivs = Array.from(document.querySelectorAll('div'));
+                      const activeDot = allDivs.find(el => {
+                        const cls = (el.className || '').toString().toLowerCase();
+                        return cls.includes('dot') && cls.includes('active');
+                      });
+                      if (!activeDot) return null;
+                      const parent = activeDot.parentElement;
+                      if (!parent) return null;
+                      const dotSiblings = Array.from(parent.children).filter(node => {
+                        const cls = (node.className || '').toString().toLowerCase();
+                        return cls.includes('dot');
+                      });
+                      const pos = dotSiblings.indexOf(activeDot) + 1;
+                      return pos > 0 ? pos : null;
+                    }"""
+                )
+                if idx is not None:
+                    stretch = {
+                        1: "High Stretch",
+                        2: "Medium to High Stretch",
+                        3: "Medium Stretch",
+                        4: "Low Stretch",
+                        5: "Rigid",
+                    }.get(int(idx), "")
+            except Exception:
+                stretch = ""
+
+            description_text = ""
+            try:
+                desc_node = page.locator(
+                    "div[class*='productDescription'], div[class*='description'] p"
+                ).first
+                if desc_node.count():
+                    description_text = re.sub(
+                        r"\s+", " ", desc_node.inner_text(timeout=600)
+                    ).strip()
+            except Exception:
+                description_text = ""
+
+            elapsed = time.time() - start
+            log(f"PDP browser {handle} | {elapsed:.2f}s | details={'yes' if details_text else 'no'}")
+            return {"details": details_text, "stretch": stretch, "description": description_text}
+
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+
 
 class PaigeScraper:
     def __init__(self) -> None:
@@ -625,6 +1058,113 @@ class PaigeScraper:
             }
         )
         self._pdp_cache: Dict[str, Dict[str, str]] = {}
+        self.browser_extractor = PDPBrowserExtractor()
+
+    def _prefetch_http_concurrent(self, handles: List[str], seed_by_handle: Dict[str, str]) -> None:
+        """Pre-fetch tier 1+2 (HTTP only, no browser) for all handles concurrently."""
+        todo = [h for h in handles if h and h not in self._pdp_cache]
+        if not todo:
+            return
+        # 4 workers: aggressive enough to be fast, conservative enough to avoid
+        # triggering Cloudflare rate-limiting that would then block the browser phase.
+        workers = max(1, int(os.getenv("PAIGE_PDP_HTTP_WORKERS", "4")))
+        log(f"Pre-fetching {len(todo)} PDP handles via HTTP ({workers} workers)…")
+        start = time.time()
+
+        _was_enabled = self.browser_extractor.enabled
+        self.browser_extractor.enabled = False
+
+        def _fetch_one(handle: str) -> None:
+            try:
+                self.fetch_pdp_fields(handle, seed_by_handle.get(handle, ""))
+            except Exception as exc:
+                log(f"HTTP pre-fetch error for {handle}: {exc}")
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_fetch_one, todo))
+        finally:
+            self.browser_extractor.enabled = _was_enabled
+
+        elapsed = time.time() - start
+        cached = sum(1 for h in todo if h in self._pdp_cache)
+        log(f"HTTP pre-fetch complete: {cached}/{len(todo)} handles cached in {elapsed:.1f}s")
+
+    def _prefetch_browser_concurrent(self, handles: List[str]) -> None:
+        """Pre-fetch browser data for handles missing measurements, then merge into pdp_cache.
+
+        Results are merged immediately after all fetches complete so the main loop
+        reads complete (HTTP + browser) data from _pdp_cache without re-fetching.
+        """
+        if not self.browser_extractor.enabled:
+            log("Browser pre-fetch skipped: PAIGE_PDP_BROWSER_ENABLED is off")
+            return
+        todo = [h for h in handles if h]
+        if not todo:
+            log("Browser pre-fetch skipped: all handles already have measurements")
+            return
+        workers = self.browser_extractor._workers
+        playwright_ok = self.browser_extractor._playwright_available()
+        log(f"Browser pre-fetch starting: {len(todo)} handles, {workers} workers, playwright_available={playwright_ok}")
+        if not playwright_ok:
+            log("Browser pre-fetch aborted: Playwright not importable — run: pip install playwright && playwright install chromium")
+            return
+        log(f"Pre-fetching {len(todo)} PDP handles via browser ({workers} workers)…")
+        start = time.time()
+
+        def _fetch_one(handle: str) -> Tuple[str, Dict[str, str]]:
+            try:
+                return handle, self.browser_extractor.fetch(handle)
+            except Exception as exc:
+                log(f"Pre-fetch browser error for {handle}: {exc}")
+                return handle, {}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results: List[Tuple[str, Dict[str, str]]] = list(pool.map(_fetch_one, todo))
+
+        elapsed = time.time() - start
+        per_page = elapsed / len(todo) if todo else 0.0
+        log(f"Browser pre-fetch complete: {len(todo)} handles in {elapsed:.1f}s ({per_page:.2f}s/page)")
+
+        # Merge browser results into pdp_cache (single-threaded, no race conditions).
+        merged = 0
+        for handle, browser_data in results:
+            cached = self._pdp_cache.get(handle)
+            if cached is None:
+                continue
+            browser_details = browser_data.get("details", "")
+            browser_desc = browser_data.get("description", "")
+            browser_stretch = browser_data.get("stretch", "")
+            if not (browser_details or browser_desc or browser_stretch):
+                continue
+            parts: List[str] = []
+            if browser_desc:
+                parts.append(browser_desc)
+            existing_desc = cached.get("description", "")
+            if existing_desc:
+                parts.append(existing_desc)
+            if browser_details:
+                parts.append(browser_details)
+            description = ", ".join(dedupe_description_parts(parts))
+            rise = extract_measurement(description, ["Front Rise", "Rise"]) or cached.get("rise", "")
+            inseam = extract_measurement(description, ["Inseam", "Inleg"]) or cached.get("inseam", "")
+            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"]) or cached.get("leg_opening", "")
+            stretch = (
+                (normalize_stretch_value(browser_stretch) if browser_stretch else "")
+                or cached.get("stretch", "")
+                or normalize_stretch_value(extract_label_text(description, ["Stretch"]))
+            )
+            cached.update({
+                "description": description,
+                "rise": rise,
+                "inseam": inseam,
+                "leg_opening": leg_opening,
+                "stretch": stretch,
+            })
+            if rise or leg_opening:
+                merged += 1
+        if merged:
+            log(f"Applied browser measurements to {merged} handles in pdp_cache")
 
     def graphql_request(self, query: str, variables: Dict) -> Dict:
         response = self.session.post(
@@ -661,26 +1201,6 @@ class PaigeScraper:
                 onlineStoreUrl
                 totalInventory
                 featuredImage { url }
-                metafields(identifiers: [
-                  {namespace: "attributes", key: "closure"},
-                  {namespace: "attributes", key: "clothingType"},
-                  {namespace: "attributes", key: "colorCategory"},
-                  {namespace: "attributes", key: "colorVariants"},
-                  {namespace: "attributes", key: "denimFabric"},
-                  {namespace: "attributes", key: "fit"},
-                  {namespace: "attributes", key: "fitVariants"},
-                  {namespace: "attributes", key: "gender"},
-                  {namespace: "attributes", key: "inseamVariants"},
-                  {namespace: "attributes", key: "length"},
-                  {namespace: "attributes", key: "productType"},
-                  {namespace: "attributes", key: "rise"},
-                  {namespace: "attributes", key: "specs"},
-                  {namespace: "attributes", key: "stretch"},
-                  {namespace: "attributes", key: "styleContent"},
-                ]) {
-                  key
-                  value
-                }
                 variants(first: 250) {
                   nodes {
                     id
@@ -722,41 +1242,23 @@ class PaigeScraper:
                 cursor = block["pageInfo"]["endCursor"]
         return list(merged.values())
 
-    def fetch_collection_handles_json(self) -> Optional[set[str]]:
-        for host in HOST_ROTATION:
-            plain = requests.Session()
-            plain.headers.update(self.session.headers)
-            try:
-                handles: set[str] = set()
-                for collection in ("women-denim", "women-sale"):
-                    page = 1
-                    while True:
-                        url = f"{host}/collections/{collection}/products.json?limit=250&page={page}"
-                        response = plain.get(url, timeout=30)
-                        if response.status_code == 429:
-                            raise requests.exceptions.HTTPError("429", response=response)
-                        response.raise_for_status()
-                        products = (response.json() or {}).get("products") or []
-                        if not products:
-                            break
-                        for product in products:
-                            handle = (product.get("handle") or "").strip()
-                            if handle:
-                                handles.add(handle)
-                        page += 1
-                return handles
-            except requests.exceptions.HTTPError as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 429:
-                    log(f"fetch_collection_handles_json: 429 from {host}, trying next host")
-                else:
-                    log(f"fetch_collection_handles_json: HTTP {status} from {host}, trying next host")
-            except Exception as exc:
-                log(f"fetch_collection_handles_json: {host} failed ({exc}), trying next host")
-            finally:
-                plain.close()
-        log("fetch_collection_handles_json: all hosts exhausted, skipping handle filter")
-        return None
+    def fetch_collection_handles_json(self) -> set[str]:
+        handles: set[str] = set()
+        for collection in ("women-denim", "women-sale"):
+            page = 1
+            while True:
+                url = f"https://shop.paige.com/collections/{collection}/products.json?limit=250&page={page}"
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                products = (response.json() or {}).get("products") or []
+                if not products:
+                    break
+                for product in products:
+                    handle = (product.get("handle") or "").strip()
+                    if handle:
+                        handles.add(handle)
+                page += 1
+        return handles
 
     def algolia_request(self, params: Dict[str, str]) -> Dict:
         query_string = "&".join(
@@ -838,43 +1340,89 @@ class PaigeScraper:
         log(f"Loaded {total_hits} Algolia variant hits via per-style pagination")
         return by_id
 
-    def fetch_pdp_fields(
-        self,
-        handle: str,
-        metafields: Dict[str, str],
-        description_seed: str = "",
-    ) -> Dict[str, str]:
+    def fetch_pdp_fields(self, handle: str, description_seed: str = "") -> Dict[str, str]:
         if handle in self._pdp_cache:
             return self._pdp_cache[handle]
+        source = "seed"
+        description_parts: List[str] = [description_seed] if description_seed else []
+        description = ", ".join(dedupe_description_parts(description_parts))
+        stretch = normalize_stretch_value(extract_label_text(description, ["Stretch"]))
 
-        # Rise, Inseam, Leg Opening from the "specs" metafield, e.g.:
-        #   Rise: 10 1/2"\nInseam: 32"\nLeg Opening: 19 1/2"
-        specs = metafields.get("specs", "")
-        rise = extract_measurement(specs, ["Front Rise", "Rise"])
-        inseam = extract_measurement(specs, ["Inseam", "Inleg"])
-        leg_opening = extract_measurement(specs, ["Leg Opening", "Opening"])
+        try:
+            product_json = self.session.get(
+                urljoin(PDP_HOST, f"/products/{handle}.json"),
+                timeout=20,
+                allow_redirects=True,
+            )
+            if product_json.status_code == 200:
+                body_html = (product_json.json().get("product") or {}).get("body_html") or ""
+                body_text = strip_html_text(body_html)
+                if body_text:
+                    description_parts.append(body_text)
+                    source = "product-json"
+        except Exception:
+            pass
 
-        stretch = ""  # derived in build_rows via derive_stretch_from_algolia_attrs
+        description = ", ".join(dedupe_description_parts(description_parts))
+        rise = extract_measurement(description, ["Front Rise", "Rise"])
+        inseam = extract_measurement(description, ["Inseam", "Inleg"])
+        leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
 
-        # Build description: product description seed followed by each
-        # attribute metafield formatted as "key : value;".
-        meta_str = " ".join(
-            f"{key} : {metafields[key]};"
-            for key in ATTRIBUTE_KEYS_ORDER
-            if metafields.get(key)
-        )
-        if description_seed:
-            seed_clean = description_seed.rstrip().rstrip(";").rstrip()
-            description = (seed_clean + "; " + meta_str) if meta_str else seed_clean
-        else:
-            description = meta_str
+        if not (rise and inseam and leg_opening):
+            url = urljoin(PDP_HOST, f"/products/{handle}")
+            try:
+                response = self.session.get(url, timeout=20, allow_redirects=True)
+                response.raise_for_status()
+                details_description = extract_pdp_description(response.text)
+                next_data_desc = extract_next_data_description(response.text)
+                stretch_from_html = extract_stretch_from_html(response.text)
+                if stretch_from_html:
+                    stretch = normalize_stretch_value(stretch_from_html)
+                added = False
+                if details_description:
+                    description_parts.append(details_description)
+                    added = True
+                if next_data_desc:
+                    description_parts.append(next_data_desc)
+                    added = True
+                if added:
+                    description = ", ".join(dedupe_description_parts(description_parts))
+                    rise = extract_measurement(description, ["Front Rise", "Rise"])
+                    inseam = extract_measurement(description, ["Inseam", "Inleg"])
+                    leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+                    source = "pdp-html"
+            except Exception:
+                pass
+
+        # Browser-driven fallback for Headless UI DETAILS disclosure.
+        # Guard: skip when browser is intentionally disabled (e.g. HTTP pre-fetch
+        # phase) to avoid generating hundreds of "SKIP: browser unavailable" log
+        # entries that look like real failures.
+        if not (rise and inseam and leg_opening) and self.browser_extractor.enabled:
+            browser_data = self.browser_extractor.fetch(handle)
+            browser_desc = browser_data.get("description", "")
+            browser_details = browser_data.get("details", "")
+            if browser_desc:
+                description_parts.insert(0, browser_desc)
+            if browser_details:
+                description_parts.append(browser_details)
+            if browser_data.get("stretch"):
+                stretch = normalize_stretch_value(browser_data["stretch"])
+            description = ", ".join(dedupe_description_parts(description_parts))
+            rise = extract_measurement(description, ["Front Rise", "Rise"])
+            inseam = extract_measurement(description, ["Inseam", "Inleg"])
+            leg_opening = extract_measurement(description, ["Leg Opening", "Opening"])
+            if browser_details:
+                source = "pdp-browser"
+
+        description = ", ".join(dedupe_description_parts(description_parts))
 
         result = {
             "description": description,
             "rise": rise,
             "inseam": inseam,
             "leg_opening": leg_opening,
-            "stretch": stretch,
+            "stretch": stretch or normalize_stretch_value(extract_label_text(description, ["Stretch"])),
             "elapsed": "",
         }
         self._pdp_cache[handle] = result
@@ -908,15 +1456,48 @@ class PaigeScraper:
             styles = self.fetch_styles()
             use_graphql = False
 
+        # ── Concurrent pre-fetch: HTTP tier 1+2, then browser for gaps ──────
+        _seen_pf: set = set()
+        _prefetch_handles: List[str] = []
+        for _s in styles:
+            _h = _s.get("handle", "")
+            if _h and _h in collection_handles and _h not in _seen_pf:
+                _seen_pf.add(_h)
+                _prefetch_handles.append(_h)
+
+        # Build per-handle seed descriptions (mirrors logic in the main loop).
+        _seed_by_handle: Dict[str, str] = {}
+        for _s in styles:
+            _h = _s.get("handle", "")
+            if not _h:
+                continue
+            _sd = safe_string(_s.get("description", "")) if use_graphql else ""
+            _as = algolia_style_map.get(_h, {})
+            _ab = safe_string(_as.get("body_html_safe", ""))
+            if _ab:
+                _at = strip_html_text(_ab)
+                _sd = ", ".join(dedupe_description_parts([_sd, _at]))
+            _seed_by_handle[_h] = _sd
+
+        # Phase 1: HTTP pre-fetch (tiers 1+2) — fills inseam for ~30% of handles.
+        self._prefetch_http_concurrent(_prefetch_handles, _seed_by_handle)
+
+        # Phase 2: browser pre-fetch for handles still missing rise or leg_opening.
+        _browser_todo = [
+            h for h in _prefetch_handles
+            if not all(self._pdp_cache.get(h, {}).get(k) for k in ("rise", "inseam", "leg_opening"))
+        ]
+        self._prefetch_browser_concurrent(_browser_todo)
+        # ─────────────────────────────────────────────────────────────────────
+
         for idx, style in enumerate(styles, start=1):
             if use_graphql:
                 style_id = style.get("id", "").replace("gid://shopify/Product/", "")
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                # No collection_handles check here: the GraphQL query is already scoped to the
-                # target collections, and the REST cache can lag behind for recently-published
-                # products, which would incorrectly drop them from the output.
+                if handle not in collection_handles:
+                    continue
                 if not should_keep_product(tags, title, style.get("_source_collection", "")):
                     continue
                 variants = (style.get("variants") or {}).get("nodes") or []
@@ -926,7 +1507,7 @@ class PaigeScraper:
                 handle = style.get("handle", "")
                 tags = style.get("tags", [])
                 title = style.get("title", "")
-                if collection_handles is not None and handle not in collection_handles:
+                if handle not in collection_handles:
                     continue
                 meta_attrs = ((style.get("meta") or {}).get("attributes") or {})
                 variants = self.fetch_variants(style_id)
@@ -944,15 +1525,8 @@ class PaigeScraper:
             if algolia_body_html:
                 algolia_text = strip_html_text(algolia_body_html)
                 seed_description = ", ".join(dedupe_description_parts([seed_description, algolia_text]))
-            # Build metafields dict from the GraphQL product node.
-            metafields_list = style.get("metafields") or []
-            metafields: Dict[str, str] = {
-                mf["key"].lower(): mf["value"]
-                for mf in metafields_list
-                if mf and mf.get("key") and mf.get("value")
-            }
             pdp_start = time.time()
-            pdp_fields = self.fetch_pdp_fields(handle, metafields, seed_description)
+            pdp_fields = self.fetch_pdp_fields(handle, seed_description)
             pdp_total_seconds += (time.time() - pdp_start)
             processed_handles += 1
             if pdp_fields["rise"]:
@@ -967,15 +1541,14 @@ class PaigeScraper:
             production_cost = extract_tag_value(tags, "productionCost:")
             site_exclusive = extract_tag_value(tags, "productType:")
             product_line = extract_tag_value(tags, "sizeType:") or meta_attrs.get("sizeType", "")
-            algolia_attrs = ((style_algolia.get("meta") or {}).get("attributes") or {})
-            fit_hint = metafields.get("fit") or algolia_attrs.get("fit", "")
-            length_hint = metafields.get("length") or algolia_attrs.get("length", "")
-            rise_hint = metafields.get("rise") or algolia_attrs.get("rise", "")
-            wash_hint = algolia_attrs.get("wash", "")
-            color_hint = metafields.get("colorcategory") or algolia_attrs.get("colorCategory", "")
-            algolia_denim_fabric = metafields.get("denimfabric") or algolia_attrs.get("denimFabric", "")
-            algolia_stretch_attr = metafields.get("stretch") or algolia_attrs.get("stretch", "")
-            inseam_hint = safe_string(algolia_attrs.get("inseam", ""))
+            fit_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("fit", "")
+            length_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("length", "")
+            rise_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("rise", "")
+            wash_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("wash", "")
+            color_hint = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("colorCategory", "")
+            algolia_denim_fabric = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("denimFabric", "")
+            algolia_stretch_attr = ((style_algolia.get("meta") or {}).get("attributes") or {}).get("stretch", "")
+            inseam_hint = safe_string(((style_algolia.get("meta") or {}).get("attributes") or {}).get("inseam", ""))
 
             for variant in variants:
                 raw_size = safe_string(
@@ -1099,7 +1672,6 @@ class PaigeScraper:
                 )
             time.sleep(0.2)
 
-        self.apply_measurement_inference(rows)
         self.apply_style_name_rules(rows)
         self.apply_jean_style_inference(rows)
         self.apply_jean_style_fit_fallback(rows, fit_hint_by_sku, tags_by_sku)
@@ -1107,69 +1679,6 @@ class PaigeScraper:
         self.apply_color_inference(rows)
         self.apply_petite_inseam_rule(rows)
         return rows
-
-    def apply_measurement_inference(self, rows: List[List[str]]) -> None:
-        """Fill blank Rise, Inseam, and Leg Opening from style-family siblings.
-
-        Groups rows by the stem of the product title (everything before the
-        colour separator ' - ') so that, e.g., all 'Anessa 31 Inch Wide Leg
-        Jean' colourways share their measurements.  When specs metafield is
-        missing for a subset of handles in a family, this propagates the
-        most-common non-blank values from the successfully-fetched siblings.
-
-        Petite inseam exception: if a petite row shares the same Style Name
-        and Color as any non-petite row, its Inseam is left blank so that
-        apply_petite_inseam_rule (which enforces this constraint after all
-        other post-processing) does not have to undo a value we set here.
-        """
-        idx_product = CSV_HEADERS.index("Product")
-        idx_style_name = CSV_HEADERS.index("Style Name")
-        idx_color = CSV_HEADERS.index("Color")
-        idx_inseam = CSV_HEADERS.index("Inseam")
-        idx_rise = CSV_HEADERS.index("Rise")
-        idx_leg = CSV_HEADERS.index("Leg Opening")
-
-        def _stem(title: str) -> str:
-            return (title.split(" - ")[0] if " - " in title else title).strip().lower()
-
-        # Pre-build a set of (style_name, color, inseam) for every non-petite
-        # row that already has an inseam value, so we can enforce the petite
-        # inseam exception: only blank the petite row's inseam when a
-        # non-petite row has the exact same Style Name, Color, AND Inseam.
-        non_petite_key: set = {
-            (r[idx_style_name], r[idx_color], r[idx_inseam])
-            for r in rows
-            if "petite" not in r[idx_product].lower() and r[idx_inseam]
-        }
-
-        groups: Dict[str, List[List[str]]] = {}
-        for row in rows:
-            key = _stem(row[idx_product])
-            groups.setdefault(key, []).append(row)
-
-        for group_rows in groups.values():
-            rises = [r[idx_rise] for r in group_rows if r[idx_rise]]
-            legs = [r[idx_leg] for r in group_rows if r[idx_leg]]
-            inseams = [r[idx_inseam] for r in group_rows if r[idx_inseam]]
-            if not rises and not legs and not inseams:
-                continue
-            most_rise = max(set(rises), key=rises.count) if rises else ""
-            most_leg = max(set(legs), key=legs.count) if legs else ""
-            most_inseam = max(set(inseams), key=inseams.count) if inseams else ""
-            for row in group_rows:
-                if not row[idx_rise] and most_rise:
-                    row[idx_rise] = most_rise
-                if not row[idx_leg] and most_leg:
-                    row[idx_leg] = most_leg
-                if not row[idx_inseam] and most_inseam:
-                    # Petite exception: leave inseam blank when a non-petite
-                    # row shares the same Style Name, Color, AND Inseam value
-                    # so the two entries remain distinguishable.
-                    if "petite" in row[idx_product].lower() and (
-                        row[idx_style_name], row[idx_color], most_inseam
-                    ) in non_petite_key:
-                        continue
-                    row[idx_inseam] = most_inseam
 
     def apply_style_name_rules(self, rows: List[List[str]]) -> None:
         idx_product = CSV_HEADERS.index("Product")
@@ -1357,7 +1866,7 @@ class PaigeScraper:
     def write_csv(self, rows: List[List[str]]) -> Path:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_path = OUTPUT_DIR / f"PAIGE_{timestamp}.csv"
-        with output_path.open("w", newline="", encoding="utf-8-sig") as fh:
+        with output_path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(CSV_HEADERS)
             writer.writerows(rows)
@@ -1366,11 +1875,14 @@ class PaigeScraper:
 
     def run(self) -> Path:
         log("Starting Paige scrape")
-        rows = self.build_rows()
-        output_path = self.write_csv(rows)
-        log("Scrape complete")
-        print("Done.")
-        return output_path
+        try:
+            rows = self.build_rows()
+            output_path = self.write_csv(rows)
+            log("Scrape complete")
+            print("Done.")
+            return output_path
+        finally:
+            self.browser_extractor.close()
 
 
 def main() -> None:

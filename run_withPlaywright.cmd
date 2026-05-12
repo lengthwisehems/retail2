@@ -9,6 +9,8 @@ if not exist "%PY%" (
 )
 for %%D in ("%PY%") do set "PY_DIR=%%~dpD"
 set "PATH=%PY_DIR%;%PY_DIR%Scripts;%PATH%"
+set "PYTHONUNBUFFERED=1"
+set "PYTHONIOENCODING=utf-8"
 
 REM ---------- Persistent folders ----------
 set "ROOT=%~dp0"
@@ -16,6 +18,10 @@ set "OUT=%HOME%\data\outputs"
 set "LOGS=%HOME%\data\logs"
 if not exist "%OUT%"  mkdir "%OUT%"
 if not exist "%LOGS%" mkdir "%LOGS%"
+
+REM ---------- Playwright browser cache (persistent across runs) ----------
+set "PLAYWRIGHT_BROWSERS_PATH=%HOME%\playwright-browsers"
+if not exist "%PLAYWRIGHT_BROWSERS_PATH%" mkdir "%PLAYWRIGHT_BROWSERS_PATH%"
 
 set "FINAL_EXIT=0"
 set "BRANDS=ABrand AGJeans AMO DL1961 Edyson Fidelity Frame GoodAmerican Haikure IconDenim LAgence MotherDenim Neuw Paige Pistola RamyBrook ReDone Rollas Rudes Selfcontrast Staud Triarchy Warpweft"
@@ -31,10 +37,17 @@ if errorlevel 1 (
     echo Packages verified.
 )
 echo Installing Playwright for browser-based scrapers...
-"%PY%" -m pip install --disable-pip-version-check -q playwright
+REM Pin to the same version you have locally (run "python -m playwright --version" on your machine).
+REM Pinning prevents pip from silently upgrading to a new version, which would require
+REM downloading a different Chromium build and force a re-download on every run.
+"%PY%" -m pip install --disable-pip-version-check -q "playwright==1.56.0"
 if errorlevel 1 (
     echo([WARN] Playwright package install failed; browser-based scraping will be skipped.
 ) else (
+    REM Always call playwright install — it exits in ~2 s when the right browser is already
+    REM present, and downloads only when something is missing.  A folder-name check is
+    REM unreliable because Playwright has used both "chromium-XXXX" and
+    REM "chromium_headless_shell-XXXX" naming schemes across versions.
     "%PY%" -m playwright install chromium
     if errorlevel 1 (
         echo([WARN] Playwright Chromium browser install failed; browser-based scraping will be skipped.
@@ -43,6 +56,7 @@ if errorlevel 1 (
     )
 )
 "%PY%" -V
+
 
 REM ---------- Run each scraper ----------
 call :RunScraper "ABrand"      "%ROOT%ABrand\abrand_inventory.py"                   "%OUT%\ABrand\Output"           "%LOGS%\ABrand\abrand_run.log"
@@ -137,6 +151,10 @@ call :UpdateFinalExit %ERRORLEVEL%
 
 call :RunScraper "Warpweft"    "%ROOT%Warpweft\warpweft_inventory.py"               "%OUT%\Warpweft\Output"         "%LOGS%\Warpweft\warpweft_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
+
+call :RunScraper "Paige"       "%ROOT%Paige\Paige_test.py"                     "%OUT%\Paige\Output"            "%LOGS%\Paige\paigetest_inventory.log"
+call :UpdateFinalExit %ERRORLEVEL%
+
 
 REM ===== Upload outputs to Blob Storage via Managed Identity (AzCopy MSI auto-login) =====
 call :DoAzCopy
