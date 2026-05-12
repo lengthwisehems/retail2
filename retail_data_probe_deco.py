@@ -1,4 +1,4 @@
-"""Brand-agnostic probe that inspects Shopify collection feeds and Storefront APIs."""
+"""Brand-agnostic probe that inspects Shopify collection feeds, Storefront APIs, and Deco app data."""
 
 from __future__ import annotations
 
@@ -24,53 +24,20 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "paige"
+BRAND = "Triarchy"
 COLLECTION_URL = [
-    "https://paige.com/collection/women-denim",
+    "https://triarchy.com/collections/jeans",
 ]
-MYSHOPIFY = "paige-7873.myshopify.com"
-GRAPHQL = "https://paige-7873.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["383d494a76122b5e6cadffc2c7667ef2"]
+MYSHOPIFY = "https://triarchy-atelier-denim.myshopify.com"
+GRAPHQL = "https://triarchy-atelier-denim.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["a1a822d8fe8512d5d00e92c7918111ce"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["women-denim"]
-ALGOLIA_APP_ID = "DK4YY42827"
-ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
-ALGOLIA_INDEX = "production_products"
-ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
-ALGOLIA_EXTRA_PARAMS: Dict[str, Any] = {}
-ALGOLIA_QUERY = ""
-ALGOLIA_HITS_PER_PAGE = 1000
-ALGOLIA_DISTINCT = "true"
-ALGOLIA_DISTINCT_PASSES: List[str] = ["true", "false"]
-METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = [
-    ("attributes", "colorVariants"),
-    ("attributes", "inseamVariants"),
-    ("attributes", "fitVariants"),
-    ("attributes", "fabricationVariants"),
-    ("attributes", "shopTheLook"),
-    ("attributes", "specs"),
-    ("attributes", "fit"),
-    ("attributes", "rise"),
-    ("attributes", "denimFabric"),
-    ("attributes", "gender"),
-    ("attributes", "categoryPrimary"),
-    ("attributes", "sizeType"),
-    ("attributes", "sku"),
-    ("attributes", "stretch"),
-    ("attributes", "styleContent"),
-    ("attributes", "color"),
-    ("attributes", "colorCategory"),
-    ("attributes", "colorCategory2"),
-    ("attributes", "dressLength"),
-    ("attributes", "wash"),
-    ("attributes", "closure"),
-    ("attributes", "sleeveLength"),
-    ("attributes", "length"),
-    ("attributes", "clothingType"),
-    ("attributes", "clothingFamily"),
-    ("attributes", "category"),
-    ("attributes", "productType"),
-]
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["jeans"]
+DECO_SEARCH_URL = "https://triarchy.com/apps/search-deco-label/search"
+DECO_HANDLE_BATCH_SIZE = 20
+# Keep this list editable for future Storefront probes. Deco itself returns all metafields
+# exposed in its app-proxy payload and does not need hard-coded metafield identifiers.
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
 VIEW_JSON_ENRICHMENT_ENABLED = False
 VIEW_JSON_FIELDS = [
@@ -1725,348 +1692,195 @@ def extract_algolia_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
     return variants
 
 
-def fetch_algolia_data(
+def _coerce_deco_metafields(product: Dict[str, Any]) -> None:
+    """Normalize Deco metafields so flattening preserves every exposed key/value."""
+    raw_metafields = product.get("metafields")
+    if isinstance(raw_metafields, dict):
+        product["metafields_json"] = json.dumps(raw_metafields, sort_keys=True, default=str)
+        for key, value in raw_metafields.items():
+            safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", str(key)).strip("_") or "value"
+            product[f"metafield_{safe_key}"] = value
+    elif isinstance(raw_metafields, list):
+        product["metafields_json"] = json.dumps(raw_metafields, sort_keys=True, default=str)
+        for index, entry in enumerate(raw_metafields, start=1):
+            if not isinstance(entry, dict):
+                continue
+            namespace = _safe_metafield_token(entry.get("namespace") or "deco")
+            key = _safe_metafield_token(entry.get("key") or f"metafield_{index}")
+            if entry.get("value") not in (None, ""):
+                product[f"metafield_{namespace}_{key}"] = entry.get("value")
+            if entry.get("type") not in (None, ""):
+                product[f"metafield_{namespace}_{key}_type"] = entry.get("type")
+
+
+def fetch_collection_handles_for_deco(
     session: requests.Session, logger: logging.Logger
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    if not ALGOLIA_APP_ID or not ALGOLIA_API_KEY or not ALGOLIA_SEARCH_URL:
-        return [], []
+) -> List[str]:
+    handles: List[str] = []
+    seen: Set[str] = set()
+    collection_urls = [url for url in COLLECTION_URL if url]
+    if not collection_urls:
+        logger.info("No collection URLs configured; skipping Deco handle discovery")
+        return []
 
-    endpoint = ALGOLIA_SEARCH_URL.strip()
-
-    filters: Optional[str] = None
-    handles = [handle.strip() for handle in STOREFRONT_COLLECTION_HANDLES if handle.strip()]
-    if handles:
-        filters = " OR ".join(f"collections:{handle}" for handle in handles)
-    extra_filters = ALGOLIA_EXTRA_PARAMS.get("filters")
-    if extra_filters:
-        filters = str(extra_filters)
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Algolia-Application-Id": ALGOLIA_APP_ID,
-        "X-Algolia-API-Key": ALGOLIA_API_KEY,
-    }
-
-    def row_identity(row: Dict[str, Any]) -> str:
-        variant_id = str(row.get("variant.id") or "").strip()
-        if variant_id:
-            return f"variant:{variant_id}"
-        product_id = str(row.get("product.id") or row.get("product.algolia_id") or "").strip()
-        variant_sku = str(row.get("variant.sku") or "").strip()
-        variant_title = str(row.get("variant.title") or "").strip()
-        variant_option1 = str(row.get("variant.option1") or "").strip()
-        if product_id and (variant_sku or variant_title or variant_option1):
-            return f"pv:{product_id}|{variant_sku}|{variant_title}|{variant_option1}"
-        handle = str(row.get("product.handle") or "").strip()
-        if handle and (variant_sku or variant_title or variant_option1):
-            return f"hv:{handle}|{variant_sku}|{variant_title}|{variant_option1}"
-        if product_id:
-            return f"product:{product_id}"
-        if handle:
-            return f"handle:{handle}"
-        return json.dumps(row, sort_keys=True, default=str)
-
-    def product_identity(row: Dict[str, Any]) -> str:
-        product_id = str(row.get("product.id") or row.get("product.algolia_id") or "").strip()
-        if product_id:
-            return f"product:{product_id}"
-        handle = str(row.get("product.handle") or "").strip()
-        if handle:
-            return f"handle:{handle}"
-        return ""
-
-    def looks_like_variant_row(row: Dict[str, Any]) -> bool:
-        for key in ("variant.id", "variant.sku", "variant.option1", "variant.title"):
-            if str(row.get(key) or "").strip():
-                return True
-        return False
-
-    def merge_rows(preferred: Dict[str, Any], supplement: Dict[str, Any]) -> Dict[str, Any]:
-        merged = dict(preferred)
-        for key, value in supplement.items():
-            if key not in merged or merged.get(key) in (None, "", []):
-                merged[key] = value
-        return merged
-
-    def fetch_for_distinct(distinct_value: str) -> Tuple[List[Dict[str, Any]], Counter[str]]:
-        page = 0
-        pass_rows: List[Dict[str, Any]] = []
-        pass_tag_counts: Counter[str] = Counter()
-
+    for collection_url in collection_urls:
+        page = 1
         while True:
-            params: Dict[str, Any] = {
-                "query": ALGOLIA_QUERY,
-                "page": page,
-                "hitsPerPage": ALGOLIA_HITS_PER_PAGE,
-                "distinct": str(distinct_value),
-                "analytics": "false",
-                "clickAnalytics": "false",
-                "enablePersonalization": "false",
-            }
-            if filters:
-                params["filters"] = filters
-            for key, value in ALGOLIA_EXTRA_PARAMS.items():
-                if key in {"filters", "distinct"}:
-                    continue
-                params[key] = value
-
-            payload_body = {"params": urlencode(params, doseq=True)}
-            logger.info("Fetching Algolia page %s (distinct=%s)", page + 1, distinct_value)
+            products_json_url = f"{collection_url.rstrip('/')}/products.json?limit=250&page={page}"
+            logger.info("Fetching Deco handle collection page %s from %s", page, products_json_url)
             try:
-                response = session.post(
-                    endpoint,
-                    headers=headers,
-                    json=payload_body,
-                    timeout=REQUEST_TIMEOUT,
-                    verify=False,
-                )
+                response = session.get(products_json_url, timeout=REQUEST_TIMEOUT, verify=False)
             except requests.RequestException as exc:
-                logger.warning(
-                    "Algolia request failed on page %s (distinct=%s): %s",
-                    page + 1,
-                    distinct_value,
-                    exc,
-                )
+                logger.warning("Deco handle collection request failed for %s: %s", products_json_url, exc)
                 break
-
             if not response.ok:
                 logger.warning(
-                    "Algolia request returned status %s on page %s (distinct=%s)",
+                    "Deco handle collection request returned status %s for %s",
                     response.status_code,
-                    page + 1,
-                    distinct_value,
+                    products_json_url,
                 )
                 break
-
             try:
                 payload = response.json()
             except ValueError:
-                logger.warning(
-                    "Algolia response on page %s was not valid JSON (distinct=%s)",
-                    page + 1,
-                    distinct_value,
-                )
+                logger.warning("Deco handle collection response was not valid JSON for %s", products_json_url)
                 break
-
-            results = extract_algolia_results(payload)
-            if not results:
-                logger.info(
-                    "Algolia page %s returned no results (distinct=%s); stopping",
-                    page + 1,
-                    distinct_value,
-                )
+            products = payload.get("products") if isinstance(payload, dict) else []
+            if not products:
+                logger.info("Deco handle collection page %s returned no products", page)
                 break
-
-            for product in results:
+            logger.info("Deco handle collection page %s returned %s products", page, len(products))
+            for product in products:
                 if not isinstance(product, dict):
                     continue
-                product_copy = dict(product)
-                raw_id = product_copy.get("id")
-                if raw_id not in (None, ""):
-                    product_copy.setdefault("variant_id", raw_id)
-                product_copy.setdefault(
-                    "algolia_id", product_copy.get("objectID") or product_copy.get("id")
-                )
-                if (
-                    "inventory_quantity" in product_copy
-                    and "variants_inventory_count" not in product_copy
-                ):
-                    product_copy.setdefault(
-                        "variants_inventory_count", product_copy.get("inventory_quantity")
-                    )
-                if "url" not in product_copy and product_copy.get("handle"):
-                    product_copy["url"] = f"/products/{product_copy['handle']}"
-                if product_copy.get("body_html_safe") and not product_copy.get("description"):
-                    product_copy["description"] = BeautifulSoup(
-                        str(product_copy.get("body_html_safe")), "html.parser"
-                    ).get_text(" ", strip=True)
-                if product_copy.get("body_html_safe") and not product_copy.get("descriptionHtml"):
-                    product_copy["descriptionHtml"] = product_copy.get("body_html_safe")
-                if product_copy.get("inventory_available") is not None:
-                    product_copy.setdefault(
-                        "availableForSale", product_copy.get("inventory_available")
-                    )
-
-                variant_seed: Dict[str, Any] = {
-                    "variant_id": product_copy.get("id"),
-                    "id": product_copy.get("id"),
-                    "title": product_copy.get("variant_title") or product_copy.get("option1"),
-                    "option1": product_copy.get("option1")
-                    or (product_copy.get("options") or {}).get("size"),
-                    "option2": product_copy.get("option2"),
-                    "option3": product_copy.get("option3"),
-                    "price": product_copy.get("price"),
-                    "compare_at_price": product_copy.get("compare_at_price"),
-                    "inventory_quantity": product_copy.get("inventory_quantity"),
-                    "availableForSale": product_copy.get("inventory_available"),
-                    "sku": product_copy.get("sku"),
-                    "barcode": product_copy.get("barcode"),
-                }
-                variants = [variant_seed]
-                parsed_variants = extract_algolia_variants(product_copy)
-                if parsed_variants:
-                    variants.extend(parsed_variants)
-
-                tags = collect_tag_values(product_copy)
-                tag_groups = group_tags_for_columns(tags)
-
-                def attach_tag_groups(target_row: Dict[str, Any]) -> None:
-                    for column_name, tag_values in tag_groups.items():
-                        joined = ", ".join(tag_values)
-                        target_row[column_name] = joined
-                        pass_tag_counts[column_name] += 1
-
-                image_candidates = [
-                    product_copy.get(key)
-                    for key in (
-                        "image",
-                        "image_url",
-                        "imageUrl",
-                        "image_link",
-                        "thumbnail",
-                        "thumbnail_url",
-                        "thumbnailImageUrl",
-                    )
-                ]
-                image_src = next((candidate for candidate in image_candidates if candidate), None)
-                if image_src:
-                    product_copy.setdefault("images", [{"src": image_src}])
-
-                flat_product = flatten_record({"product": product_copy})
-                base_row = dict(flat_product)
-                if tags:
-                    base_row["product.tags_all"] = ", ".join(tags)
-
-                for key in (
-                    "product.image",
-                    "product.image_url",
-                    "product.imageUrl",
-                    "product.image_link",
-                    "product.thumbnail",
-                    "product.thumbnail_url",
-                    "product.thumbnailImageUrl",
-                ):
-                    if key in base_row and not base_row.get("product.images[0].src"):
-                        base_row["product.images[0].src"] = base_row[key]
-
-                if not variants:
-                    attach_tag_groups(base_row)
-                    finalize_json_row(base_row, product_copy, None)
-                    pass_rows.append(base_row)
+                handle = str(product.get("handle") or "").strip()
+                if not handle or handle in seen:
                     continue
+                seen.add(handle)
+                handles.append(handle)
+            page += 1
+            time.sleep(0.25)
+    logger.info("Discovered %s unique collection handles for Deco", len(handles))
+    return handles
 
-                seen_variant_keys: Set[str] = set()
-                for variant in variants:
-                    if not isinstance(variant, dict):
-                        continue
-                    variant_copy = dict(variant)
-                    dedupe_key = json.dumps(variant_copy, sort_keys=True, default=str)
-                    if dedupe_key in seen_variant_keys:
-                        continue
-                    seen_variant_keys.add(dedupe_key)
-                    if "inventory_quantity" not in variant_copy:
-                        for candidate in (
-                            "inventory_quantity",
-                            "inventoryQuantity",
-                            "inventory",
-                            "qty",
-                            "quantity",
-                            "available_quantity",
-                        ):
-                            value = variant_copy.get(candidate)
-                            if value not in (None, ""):
-                                variant_copy["inventory_quantity"] = value
-                                break
-                    if "availableForSale" not in variant_copy and isinstance(
-                        variant_copy.get("available"), bool
-                    ):
-                        variant_copy["availableForSale"] = variant_copy.get("available")
 
-                    flat_variant = flatten_record({"variant": variant_copy})
-                    row = dict(base_row)
-                    row.update(flat_variant)
-                    attach_tag_groups(row)
-                    finalize_json_row(row, product_copy, variant_copy)
-                    pass_rows.append(row)
-
-            nb_pages = payload.get("nbPages") if isinstance(payload, dict) else None
-            if isinstance(nb_pages, int) and page + 1 < nb_pages:
-                page += 1
-                time.sleep(0.5)
-                continue
-            break
-        return pass_rows, pass_tag_counts
-
-    pass_values = [str(v).strip().lower() for v in ALGOLIA_DISTINCT_PASSES if str(v).strip()]
-    if not pass_values:
-        pass_values = [str(ALGOLIA_DISTINCT).strip().lower() or "true"]
-
-    all_pass_rows: List[List[Dict[str, Any]]] = []
-    all_pass_tag_counts: List[Counter[str]] = []
-    for distinct_value in pass_values:
-        pass_rows, pass_tag_counts = fetch_for_distinct(distinct_value)
-        all_pass_rows.append(pass_rows)
-        all_pass_tag_counts.append(pass_tag_counts)
-        logger.info(
-            "Algolia pass complete (distinct=%s): rows=%s", distinct_value, len(pass_rows)
-        )
-
-    if not all_pass_rows:
+def fetch_deco_data(
+    session: requests.Session, logger: logging.Logger
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if not DECO_SEARCH_URL:
+        logger.info("Deco search URL missing; skipping Deco extraction")
         return [], []
 
-    # Primary row set should be variant-level output (distinct=false where configured).
-    primary_index = len(all_pass_rows) - 1
-    for index, value in enumerate(pass_values):
-        if value == "false":
-            primary_index = index
-            break
+    handles = fetch_collection_handles_for_deco(session, logger)
+    if not handles:
+        return [], []
 
-    primary_rows_raw = all_pass_rows[primary_index] if all_pass_rows else []
-    variant_primary_rows = [row for row in primary_rows_raw if looks_like_variant_row(row)]
-    if variant_primary_rows:
-        primary_rows = variant_primary_rows
-    else:
-        primary_rows = primary_rows_raw
-
-    # Index supplemental rows by row identity and by product identity.
-    supplemental_by_row_key: Dict[str, Dict[str, Any]] = {}
-    supplemental_by_product_key: Dict[str, Dict[str, Any]] = {}
-    for pass_index, pass_rows in enumerate(all_pass_rows):
-        if pass_index == primary_index:
-            continue
-        for row in pass_rows:
-            rkey = row_identity(row)
-            existing = supplemental_by_row_key.get(rkey)
-            supplemental_by_row_key[rkey] = merge_rows(existing or {}, row)
-
-            pkey = product_identity(row)
-            if pkey:
-                p_existing = supplemental_by_product_key.get(pkey)
-                supplemental_by_product_key[pkey] = merge_rows(p_existing or {}, row)
-
-    # Preserve every primary row (variant-level) and enrich from supplemental passes.
     rows: List[Dict[str, Any]] = []
-    for primary_row in primary_rows:
-        row = dict(primary_row)
-        key = row_identity(row)
-        same_variant = supplemental_by_row_key.get(key)
-        if same_variant:
-            row = merge_rows(row, same_variant)
-        pkey = product_identity(row)
-        if pkey and pkey in supplemental_by_product_key:
-            row = merge_rows(row, supplemental_by_product_key[pkey])
-        rows.append(row)
+    tag_counts: Counter[str] = Counter()
 
-    tag_group_counts: Counter[str] = Counter()
-    for counter in all_pass_tag_counts:
-        tag_group_counts.update(counter)
+    for start in range(0, len(handles), DECO_HANDLE_BATCH_SIZE):
+        batch = handles[start : start + DECO_HANDLE_BATCH_SIZE]
+        logger.info(
+            "Fetching Deco batch %s-%s of %s handles",
+            start + 1,
+            start + len(batch),
+            len(handles),
+        )
+        try:
+            response = session.get(
+                DECO_SEARCH_URL,
+                params={"handleSearch": ",".join(batch)},
+                timeout=REQUEST_TIMEOUT,
+                verify=False,
+            )
+        except requests.RequestException as exc:
+            logger.warning("Deco request failed for batch starting %s: %s", start + 1, exc)
+            continue
+        if not response.ok:
+            logger.warning(
+                "Deco request returned status %s for batch starting %s",
+                response.status_code,
+                start + 1,
+            )
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("Deco response was not valid JSON for batch starting %s", start + 1)
+            continue
+        if not isinstance(payload, dict):
+            logger.warning("Deco response was not an object for batch starting %s", start + 1)
+            continue
 
-    if not rows:
-        return [], []
-    columns = {key for row in rows for key in row.keys()}
-    tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
-    tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
-    return rows, tag_group_columns
+        for handle in batch:
+            product = payload.get(handle)
+            if not isinstance(product, dict):
+                logger.warning("Deco response missing product handle %s", handle)
+                continue
+            product_copy = dict(product)
+            product_copy.setdefault("url", f"/products/{product_copy.get('handle') or handle}")
+            product_copy.setdefault("onlineStoreUrl", urljoin(COLLECTION_URL[0], f"/products/{product_copy.get('handle') or handle}"))
+            product_copy.setdefault("deco_id", product_copy.get("id"))
+            _coerce_deco_metafields(product_copy)
+
+            tags = collect_tag_values(product_copy)
+            tag_groups = group_tags_for_columns(tags)
+
+            def attach_tag_groups(target_row: Dict[str, Any]) -> None:
+                for column_name, tag_values in tag_groups.items():
+                    joined = ", ".join(tag_values)
+                    target_row[column_name] = joined
+                    tag_counts[column_name] += 1
+
+            variants = product_copy.get("variants") or []
+            product_for_flatten = dict(product_copy)
+            if isinstance(variants, list):
+                product_for_flatten["variants_count"] = len(variants)
+            product_for_flatten.pop("variants", None)
+            flat_product = flatten_record({"product": product_for_flatten})
+            base_row = dict(flat_product)
+            if tags:
+                base_row["product.tags_all"] = ", ".join(tags)
+
+            image_src = product_copy.get("featured_image")
+            if image_src:
+                if isinstance(image_src, str) and image_src.startswith("//"):
+                    image_src = f"https:{image_src}"
+                base_row.setdefault("product.images[0].src", image_src)
+
+            if not isinstance(variants, list) or not variants:
+                attach_tag_groups(base_row)
+                finalize_json_row(base_row, product_copy, None)
+                rows.append(base_row)
+                continue
+
+            seen_variant_ids: Set[str] = set()
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                variant_copy = dict(variant)
+                variant_id = str(variant_copy.get("id") or "").strip()
+                if variant_id and variant_id in seen_variant_ids:
+                    continue
+                if variant_id:
+                    seen_variant_ids.add(variant_id)
+                variant_copy.setdefault("variant_id", variant_copy.get("id"))
+                if variant_copy.get("featured_image") and isinstance(variant_copy.get("featured_image"), str):
+                    if str(variant_copy["featured_image"]).startswith("//"):
+                        variant_copy["featured_image"] = f"https:{variant_copy['featured_image']}"
+                if "inventory_quantity" in variant_copy:
+                    variant_copy.setdefault("quantityAvailable", variant_copy.get("inventory_quantity"))
+                    variant_copy.setdefault("availableForSale", (variant_copy.get("inventory_quantity") or 0) > 0)
+
+                flat_variant = flatten_record({"variant": variant_copy})
+                row = dict(base_row)
+                row.update(flat_variant)
+                attach_tag_groups(row)
+                finalize_json_row(row, product_copy, variant_copy)
+                rows.append(row)
+
+    logger.info("Deco extraction complete: %s rows", len(rows))
+    return rows, sorted(tag_counts)
 
 
 def make_absolute(url: str, base: Any) -> str:
@@ -2084,13 +1898,13 @@ def discover_tokens(
     session: requests.Session, html_blobs: List[Tuple[str, str]], logger: logging.Logger
 ) -> List[Tuple[str, str]]:
     tokens: Dict[str, str] = {}
-    for base_url, html in html_blobs:
-        if not html:
+    for base_url, html_text in html_blobs:
+        if not html_text:
             continue
-        for token in set(TOKEN_REGEX.findall(html)):
+        for token in set(TOKEN_REGEX.findall(html_text)):
             tokens.setdefault(token, "collection_html")
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html_text, "html.parser")
         script_urls: List[str] = []
         for script in soup.find_all("script"):
             src = script.get("src")
@@ -2116,9 +1930,7 @@ def discover_tokens(
                 logger.debug("Failed to fetch script %s: %s", script_url, exc)
                 continue
             if not response.ok:
-                logger.debug(
-                    "Script %s returned status %s", script_url, response.status_code
-                )
+                logger.debug("Script %s returned status %s", script_url, response.status_code)
                 continue
             for token in set(TOKEN_REGEX.findall(response.text)):
                 tokens.setdefault(token, f"script_body:{script_url}")
@@ -2716,6 +2528,8 @@ class GraphQLQueryBuilder:
         return f"variants{args} {{\n{self._indent(body)}\n}}"
 
     def _build_store_availability_selection(self) -> str:
+        if "storeAvailability" in self.forbidden_fields.get("ProductVariant", set()):
+            return ""
         variant_type = self.schema.get_type("ProductVariant") or {}
         fields = variant_type.get("fields", [])
         store_field = next(
@@ -3809,10 +3623,10 @@ def export_workbook(
     json_rows: List[Dict[str, Any]],
     storefront_rows: List[Dict[str, Any]],
     access_rows: List[Dict[str, Any]],
-    algolia_rows: List[Dict[str, Any]],
+    deco_rows: List[Dict[str, Any]],
     *,
     json_priority_columns: Optional[Sequence[str]] = None,
-    algolia_priority_columns: Optional[Sequence[str]] = None,
+    deco_priority_columns: Optional[Sequence[str]] = None,
 ) -> Path:
     workbook = Workbook()
     sheet = workbook.active
@@ -3825,16 +3639,14 @@ def export_workbook(
     write_sheet(sheet, json_rows, column_order=json_columns)
     group_tag_columns(sheet, json_columns)
 
-    algolia_sheet = workbook.create_sheet("Algolia")
-    algolia_columns = (
-        build_column_order(
-            algolia_rows, extra_priority=algolia_priority_columns
-        )
-        if algolia_rows
+    deco_sheet = workbook.create_sheet("Deco")
+    deco_columns = (
+        build_column_order(deco_rows, extra_priority=deco_priority_columns)
+        if deco_rows
         else list(COLUMN_ORDER_BASE)
     )
-    write_sheet(algolia_sheet, algolia_rows, column_order=algolia_columns)
-    group_tag_columns(algolia_sheet, algolia_columns)
+    write_sheet(deco_sheet, deco_rows, column_order=deco_columns)
+    group_tag_columns(deco_sheet, deco_columns)
 
     storefront_sheet = workbook.create_sheet("Storefront")
     storefront_columns = (
@@ -3855,7 +3667,7 @@ def export_workbook(
 # Main entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Retail data probe")
+    parser = argparse.ArgumentParser(description="Retail data Deco probe")
     parser.add_argument(
         "--metafield",
         dest="metafields",
@@ -3883,18 +3695,14 @@ def main() -> None:
         logger,
         fallback_online_store_urls=fallback_urls,
     )
-    if ALGOLIA_APP_ID and ALGOLIA_SEARCH_URL:
-        algolia_rows, algolia_tag_columns = fetch_algolia_data(session, logger)
-    else:
-        logger.info("Algolia configuration missing; skipping Algolia extraction")
-        algolia_rows, algolia_tag_columns = [], []
+    deco_rows, deco_tag_columns = fetch_deco_data(session, logger)
     output_path = export_workbook(
         json_rows,
         storefront_rows,
         access_rows,
-        algolia_rows,
+        deco_rows,
         json_priority_columns=tag_group_columns,
-        algolia_priority_columns=algolia_tag_columns,
+        deco_priority_columns=deco_tag_columns,
     )
     logger.info("Workbook written to %s", output_path.as_posix())
 
