@@ -148,7 +148,7 @@ def format_date(value: Optional[str]) -> str:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return value
-    return dt.strftime("%-m/%-d/%Y")
+    return f"{dt.month}/{dt.day}/{dt.year}"
 
 
 def format_price(value) -> str:
