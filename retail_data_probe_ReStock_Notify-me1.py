@@ -1653,6 +1653,18 @@ def extract_restock_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
     return variants
 
 
+_RESTOCK_SKIP_SEGMENTS = ("custom_styles", "inject_to_all_wrappers", ".widget.")
+
+
+def _restock_clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove widget CSS/UI config columns from a ReStock row."""
+    return {
+        k: v
+        for k, v in row.items()
+        if not any(seg in k for seg in _RESTOCK_SKIP_SEGMENTS)
+    }
+
+
 def fetch_restock_data(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -1738,6 +1750,7 @@ def fetch_restock_data(
             rows.append(row)
 
         if rows:
+            rows = [_restock_clean_row(r) for r in rows]
             logger.info("ReStock API: %s total rows collected", len(rows))
             return rows, []
         logger.info("ReStock API returned no data; falling back to PDP HTML scraping")
@@ -1903,6 +1916,7 @@ def fetch_restock_data(
 
     if not html_rows:
         return [], []
+    html_rows = [_restock_clean_row(r) for r in html_rows]
     columns = {key for row in html_rows for key in row.keys()}
     tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
     tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
@@ -3121,7 +3135,14 @@ def collect_storefront_from_collections(
                 return [], first_status, "errors"
             continue
 
-        note = "success" if rows else "no_rows"
+        _inventory_fields = {"totalInventory", "quantityAvailable"}
+        _all_blocked: Set[str] = set()
+        for _f in newly_blocked.values():
+            _all_blocked.update(_f)
+        if rows:
+            note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
+        else:
+            note = "no_rows"
         return rows, first_status, note
 
 
@@ -3144,107 +3165,165 @@ def collect_storefront_from_products(
     logger: logging.Logger,
     metafield_identifiers: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[int], str]:
-    rows: List[Dict[str, Any]] = []
-    cursor: Optional[str] = None
-    query_string = build_product_query_string()
     first_status: Optional[int] = None
     view_json_state = ViewJSONEnrichmentState(
         VIEW_JSON_ENRICHMENT_ENABLED,
         VIEW_JSON_FIELDS,
         VIEW_JSON_PROBE_LIMIT,
     )
+    query_string = build_product_query_string()
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
-
-    try:
-        builder = GraphQLQueryBuilder(
-            session,
-            endpoint,
-            token,
-            logger,
-            forbidden_fields=forbidden,
-            metafield_identifiers=metafield_identifiers or METAFIELD_IDENTIFIERS,
-        )
-    except GraphQLIntrospectionError as exc:
-        logger.debug("Unable to build products query for %s: %s", endpoint, exc)
-        return [], None, "builder_error"
-
-    query_text = builder.products_query
+    newly_blocked: Dict[str, Set[str]] = defaultdict(set)
 
     while True:
-        payload = {
-            "query": query_text,
-            "variables": {
-                "cursor": cursor,
-                "pageSize": GRAPHQL_PAGE_SIZE,
-                "query": query_string,
-            },
-        }
-        response, data = perform_graphql_request(session, endpoint, payload, token)
-        if first_status is None and response is not None:
-            first_status = response.status_code
-        if response is None:
-            return [], first_status, "request_exception"
-        if not response.ok:
-            return [], first_status, f"HTTP_{response.status_code}"
-
-        products_connection = ((data or {}).get("data") or {}).get("products") if data else None
-        if not products_connection:
-            errors = (data or {}).get("errors") if data else None
-            if errors:
-                return [], first_status, format_error_note(errors)
-            return [], first_status, "no_products_data"
-
-        errors = (data or {}).get("errors") if data else None
-        if errors:
-            logger.debug(
-                "Products query returned %s errors on %s",
-                len(errors),
+        try:
+            builder = GraphQLQueryBuilder(
+                session,
                 endpoint,
+                token,
+                logger,
+                forbidden_fields=forbidden,
+                metafield_identifiers=metafield_identifiers or METAFIELD_IDENTIFIERS,
             )
+        except GraphQLIntrospectionError as exc:
+            logger.debug("Unable to build products query for %s: %s", endpoint, exc)
+            return [], None, "builder_error"
 
-        edges: Iterable[Dict[str, Any]] = products_connection.get("edges") or []
-        for edge in edges:
-            product = edge.get("node") or {}
-            if not apply_tag_filter(product):
-                continue
-            variants_connection = product.get("variants") or {}
-            variant_entries = extract_graphql_variant_entries(variants_connection)
-            if not variant_entries:
-                rows.append(
-                    flatten_graphql_product(
-                        {"collection_handle": ""},
-                        edge.get("cursor", ""),
-                        product,
-                        None,
-                        session=session,
-                        logger=logger,
-                        view_json_state=view_json_state,
-                    )
+        query_text = builder.products_query
+        rows: List[Dict[str, Any]] = []
+        need_retry = False
+
+        while True:
+            payload = {
+                "query": query_text,
+                "variables": {
+                    "cursor": None,
+                    "pageSize": GRAPHQL_PAGE_SIZE,
+                    "query": query_string,
+                },
+            }
+            cursor: Optional[str] = None
+
+            # inner pagination loop
+            while True:
+                payload["variables"]["cursor"] = cursor
+                response, data = perform_graphql_request(session, endpoint, payload, token)
+                if first_status is None and response is not None:
+                    first_status = response.status_code
+                if response is None:
+                    return [], first_status, "request_exception"
+                if not response.ok:
+                    return [], first_status, f"HTTP_{response.status_code}"
+
+                products_connection = (
+                    ((data or {}).get("data") or {}).get("products") if data else None
                 )
-            else:
-                for variant_edge in variant_entries:
-                    rows.append(
-                        flatten_graphql_product(
-                            {"collection_handle": ""},
-                            edge.get("cursor", ""),
-                            product,
-                            variant_edge,
-                            session=session,
-                            logger=logger,
-                            view_json_state=view_json_state,
+                errors = (data or {}).get("errors") if data else None
+
+                if not products_connection:
+                    if errors:
+                        unrecoverable = True
+                        for error in errors:
+                            path = error.get("path") or []
+                            field_name = extract_field_from_error_path(path)
+                            if not field_name:
+                                continue
+                            unrecoverable = False
+                            target_type = infer_error_target_type(path)
+                            if field_name not in forbidden[target_type]:
+                                forbidden[target_type].add(field_name)
+                                newly_blocked[target_type].add(field_name)
+                                need_retry = True
+                        if unrecoverable:
+                            return [], first_status, format_error_note(errors)
+                        break
+                    return [], first_status, "no_products_data"
+
+                if errors:
+                    new_field_added = False
+                    for error in errors:
+                        path = error.get("path") or []
+                        field_name = extract_field_from_error_path(path)
+                        if not field_name:
+                            continue
+                        target_type = infer_error_target_type(path)
+                        if field_name not in forbidden[target_type]:
+                            forbidden[target_type].add(field_name)
+                            newly_blocked[target_type].add(field_name)
+                            need_retry = True
+                            new_field_added = True
+                    if need_retry:
+                        break
+                    if not new_field_added:
+                        return [], first_status, format_error_note(errors)
+
+                edges = products_connection.get("edges") or []
+                for edge in edges:
+                    product = edge.get("node") or {}
+                    if not apply_tag_filter(product):
+                        continue
+                    variants_connection = product.get("variants") or {}
+                    variant_entries = extract_graphql_variant_entries(variants_connection)
+                    if not variant_entries:
+                        rows.append(
+                            flatten_graphql_product(
+                                {"collection_handle": ""},
+                                edge.get("cursor", ""),
+                                product,
+                                None,
+                                session=session,
+                                logger=logger,
+                                view_json_state=view_json_state,
+                            )
                         )
+                    else:
+                        for variant_edge in variant_entries:
+                            rows.append(
+                                flatten_graphql_product(
+                                    {"collection_handle": ""},
+                                    edge.get("cursor", ""),
+                                    product,
+                                    variant_edge,
+                                    session=session,
+                                    logger=logger,
+                                    view_json_state=view_json_state,
+                                )
+                            )
+                page_info = products_connection.get("pageInfo") or {}
+                if page_info.get("hasNextPage"):
+                    cursor = page_info.get("endCursor")
+                    logger.info("Products query returned more pages; continuing")
+                    time.sleep(0.5)
+                else:
+                    break
+
+            if need_retry:
+                blocked_summary = {
+                    parent: sorted(fields)
+                    for parent, fields in newly_blocked.items()
+                    if fields
+                }
+                if blocked_summary:
+                    logger.info(
+                        "Retrying products query without restricted fields: %s",
+                        blocked_summary,
                     )
-        page_info = products_connection.get("pageInfo") or {}
-        if page_info.get("hasNextPage"):
-            cursor = page_info.get("endCursor")
-            logger.info("Products query returned more pages; continuing")
-            time.sleep(0.5)
-        else:
-            break
-    note = "success" if rows else "no_rows"
-    return rows, first_status, note
+                else:
+                    return [], first_status, "errors"
+                need_retry = False
+                continue
+
+            _inventory_fields = {"totalInventory", "quantityAvailable"}
+            _all_blocked: Set[str] = set()
+            for _f in newly_blocked.values():
+                _all_blocked.update(_f)
+            if rows:
+                note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
+            else:
+                note = "no_rows"
+            return rows, first_status, note
 
 
 def fallback_collect_storefront(
@@ -3502,181 +3581,174 @@ def gather_storefront_data(
     html_blobs: List[Tuple[str, str]],
     logger: logging.Logger,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Gather Storefront data following priority order:
+    Phase 1 — provided tokens, prefer full inventory access.
+    Phase 2 — discovered tokens, prefer full inventory access.
+    Phase 3 — any authenticated token that works (restricted fields stripped).
+    Phase 4 — unauthenticated fallback.
+    """
     endpoints = determine_graphql_endpoints()
     if not endpoints:
         logger.info("No GraphQL endpoints configured; skipping Storefront extraction")
         return [], []
 
     provided_tokens = [
-        (token, "provided_token") for token in normalize_tokens(X_SHOPIFY_STOREFRONT_ACCESS_TOKEN)
+        (token, "provided_token")
+        for token in normalize_tokens(X_SHOPIFY_STOREFRONT_ACCESS_TOKEN)
     ]
+
+    # Initial probe: determine which tokens/endpoints pass the shop query
     access_rows, _operational, succealgolia_map = probe_graphql_endpoints(
         session, endpoints, provided_tokens, logger
     )
     endpoints_to_use = list(dict.fromkeys(endpoints))
     token_succealgolia_map: Dict[str, Set[Optional[str]]] = {
-        endpoint: set(tokens) for endpoint, tokens in succealgolia_map.items()
+        ep: set(toks) for ep, toks in succealgolia_map.items()
     }
-    metafield_identifier_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    metafield_identifier_cache: Dict[Tuple[str, Optional[str]], List[Tuple[str, str]]] = {}
 
-    def attempt_with_token(
-        token: Optional[str], source: str
-    ) -> Optional[List[Dict[str, Any]]]:
-        global METAFIELD_IDENTIFIERS
-        endpoints_iterable = endpoints_to_use
-        if token is not None:
-            eligible = [
-                endpoint
-                for endpoint in endpoints_to_use
-                if token in token_succealgolia_map.get(endpoint, set())
-            ]
-            if not eligible:
-                logger.debug(
-                    "Skipping token %s entirely; no endpoints reported a successful probe",
-                    token,
-                )
-                return None
-            endpoints_iterable = eligible
+    # Inventory-related fields — their absence means degraded mode
+    _INVENTORY_FIELDS = {"totalInventory", "quantityAvailable"}
 
-        for endpoint in endpoints_iterable:
-            cache_key = (endpoint, token or "")
-            if cache_key not in metafield_identifier_cache:
-                discovered_identifiers = discover_metafield_identifiers(
-                    session,
-                    html_blobs,
-                    endpoint,
-                    token,
-                    logger,
-                    METAFIELD_IDENTIFIERS,
-                )
-                metafield_identifier_cache[cache_key] = discovered_identifiers
-            effective_metafields = metafield_identifier_cache[cache_key]
-            METAFIELD_IDENTIFIERS = list(effective_metafields)
-
-            if STOREFRONT_COLLECTION_HANDLES:
-                rows, status, note = collect_storefront_from_collections(
-                    session,
-                    endpoint,
-                    token,
-                    logger,
-                    metafield_identifiers=effective_metafields,
-                )
-            else:
-                rows, status, note = collect_storefront_from_products(
-                    session,
-                    endpoint,
-                    token,
-                    logger,
-                    metafield_identifiers=effective_metafields,
-                )
-
-            access_rows.append(
-                {
-                    "endpoint": endpoint,
-                    "token": token or "",
-                    "token_source": source,
-                    "status_code": status or "",
-                    "ok": note == "success",
-                    "note": note,
-                }
+    def _get_metafields(endpoint: str, token: Optional[str]) -> List[Tuple[str, str]]:
+        cache_key = (endpoint, token)
+        if cache_key not in metafield_identifier_cache:
+            global METAFIELD_IDENTIFIERS
+            discovered = discover_metafield_identifiers(
+                session, html_blobs, endpoint, token, logger, METAFIELD_IDENTIFIERS
             )
+            metafield_identifier_cache[cache_key] = discovered
+            METAFIELD_IDENTIFIERS = list(discovered)
+        return metafield_identifier_cache[cache_key]
 
+    def _try_token_on_endpoint(
+        token: Optional[str], source: str, endpoint: str
+    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """Try collection query then products query for one token+endpoint pair.
+        Returns (rows_or_None, note) where note is 'success', 'success_no_inventory',
+        or something else when nothing was returned."""
+        if token is not None and token not in token_succealgolia_map.get(endpoint, set()):
+            return None, "not_probed"
+
+        mf = _get_metafields(endpoint, token)
+
+        # --- Try collection query first ---
+        if STOREFRONT_COLLECTION_HANDLES:
+            rows, status, note = collect_storefront_from_collections(
+                session, endpoint, token, logger, metafield_identifiers=mf
+            )
+            access_rows.append({
+                "endpoint": endpoint,
+                "token": token or "",
+                "token_source": source,
+                "status_code": status or "",
+                "ok": note in ("success", "success_no_inventory"),
+                "note": note,
+            })
             if rows:
-                logger.info(
-                    "Storefront extraction succeeded with endpoint %s using token source %s",
-                    endpoint,
-                    source,
-                )
-                return rows
+                return rows, note
+
+        # --- Fall through to products query ---
+        rows, status, note = collect_storefront_from_products(
+            session, endpoint, token, logger, metafield_identifiers=mf
+        )
+        access_rows.append({
+            "endpoint": endpoint,
+            "token": token or "",
+            "token_source": source + "_products",
+            "status_code": status or "",
+            "ok": note in ("success", "success_no_inventory"),
+            "note": note,
+        })
+        if rows:
+            return rows, note
+
+        return None, note
+
+    # best authenticated result without full inventory access — used in Phase 3
+    best_no_inv: Optional[List[Dict[str, Any]]] = None
+    attempted: Set[Tuple[Optional[str], str, str]] = set()
+
+    def _try_tokens(
+        token_list: List[Tuple[Optional[str], str]]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Try each token on each eligible endpoint.
+        Returns rows immediately on 'success' (full inventory).
+        Saves first 'success_no_inventory' result to best_no_inv for Phase 3.
+        Returns None if nothing with full inventory found."""
+        nonlocal best_no_inv
+        for token, source in token_list:
+            for endpoint in endpoints_to_use:
+                key = (token, source, endpoint)
+                if key in attempted:
+                    continue
+                attempted.add(key)
+                rows, note = _try_token_on_endpoint(token, source, endpoint)
+                if rows:
+                    if note == "success":
+                        logger.info(
+                            "Storefront: full inventory access via %s / %s", source, endpoint
+                        )
+                        return rows
+                    # success_no_inventory — save as Phase 3 fallback
+                    if best_no_inv is None:
+                        logger.info(
+                            "Storefront: authenticated (no inventory) via %s / %s", source, endpoint
+                        )
+                        best_no_inv = rows
         return None
 
-    attempted_sources: set = set()
+    # ── Phase 1: try provided tokens ─────────────────────────────────────────
+    result = _try_tokens(provided_tokens)
+    if result:
+        return result, access_rows
 
-    if provided_tokens:
-        for provided_token, source in provided_tokens:
-            if (provided_token, source) in attempted_sources:
-                continue
-            result = attempt_with_token(provided_token, source)
-            attempted_sources.add((provided_token, source))
-            if result:
-                return result, access_rows
+    # Check if any provided token got a 200 (regardless of inventory)
+    any_provided_200 = any(
+        token in token_succealgolia_map.get(ep, set())
+        for token, _ in provided_tokens
+        for ep in endpoints_to_use
+    )
 
+    # ── Phase 1b/1c: token discovery ─────────────────────────────────────────
+    # Trigger whenever provided tokens did not give full inventory access
+    # (covers 1b = 200 but no inventory, and 1c = no 200 at all)
     discovered_tokens: List[Tuple[Optional[str], str]] = []
     if html_blobs:
         new_tokens = discover_tokens(session, html_blobs, logger)
         if new_tokens:
-            discovery_rows, _ops, discovery_success = probe_graphql_endpoints(
+            disc_rows, _ops, disc_success = probe_graphql_endpoints(
                 session,
                 endpoints_to_use,
                 new_tokens,
                 logger,
                 include_unauthenticated=False,
             )
-            access_rows.extend(discovery_rows)
-            for endpoint, tokens in discovery_success.items():
-                if tokens:
-                    token_succealgolia_map.setdefault(endpoint, set()).update(tokens)
+            access_rows.extend(disc_rows)
+            for ep, toks in disc_success.items():
+                if toks:
+                    token_succealgolia_map.setdefault(ep, set()).update(toks)
         discovered_tokens.extend(new_tokens)
 
-    for token, source in discovered_tokens:
-        if (token, source) in attempted_sources:
-            continue
-        result = attempt_with_token(token, source)
-        attempted_sources.add((token, source))
-        if result:
-            return result, access_rows
+    # ── Phase 2: try discovered tokens ───────────────────────────────────────
+    result = _try_tokens(discovered_tokens)
+    if result:
+        return result, access_rows
 
-    if (None, "no_token") not in attempted_sources:
-        result = attempt_with_token(None, "no_token")
-        attempted_sources.add((None, "no_token"))
-        if result:
-            return result, access_rows
+    # ── Phase 3: authenticated token without inventory ────────────────────────
+    if best_no_inv is not None:
+        logger.info(
+            "Storefront: using authenticated token (restricted fields stripped) — "
+            "description/tags available, inventory counts unavailable"
+        )
+        return best_no_inv, access_rows
 
-    # All collection-based attempts failed. If a token proved valid via the shop
-    # probe (status 200) but the collection handle returned no rows, try the
-    # products query with that token before falling back to unauthenticated.
-    # This preserves authenticated access to fields like description and tags.
-    if STOREFRONT_COLLECTION_HANDLES:
-        for _fb_endpoint in endpoints_to_use:
-            _proven = sorted(
-                t
-                for t in token_succealgolia_map.get(_fb_endpoint, set())
-                if t is not None
-            )
-            for _good_token in _proven:
-                _cache_key = (_fb_endpoint, _good_token)
-                _effective_mf = metafield_identifier_cache.get(
-                    _cache_key, list(METAFIELD_IDENTIFIERS)
-                )
-                _fb_rows, _fb_status, _fb_note = collect_storefront_from_products(
-                    session,
-                    _fb_endpoint,
-                    _good_token,
-                    logger,
-                    metafield_identifiers=_effective_mf,
-                )
-                access_rows.append(
-                    {
-                        "endpoint": _fb_endpoint,
-                        "token": _good_token,
-                        "token_source": "authenticated_products_fallback",
-                        "status_code": _fb_status or "",
-                        "ok": _fb_note == "success",
-                        "note": _fb_note,
-                    }
-                )
-                if _fb_rows:
-                    logger.info(
-                        "Storefront authenticated-products fallback succeeded: %s",
-                        _fb_endpoint,
-                    )
-                    return _fb_rows, access_rows
-
+    # ── Phase 4: unauthenticated fallback ────────────────────────────────────
     fallback_rows, fallback_entry = fallback_collect_storefront(
         session, endpoints_to_use, logger
     )
     if fallback_rows:
-        logger.info("Storefront fallback succeeded without a token")
+        logger.info("Storefront: unauthenticated fallback succeeded")
         if fallback_entry:
             access_rows.append(fallback_entry)
         return fallback_rows, access_rows
