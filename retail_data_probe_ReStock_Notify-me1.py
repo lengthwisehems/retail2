@@ -34,7 +34,7 @@ X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["58ea06b1762dd2cd2daa40fa0ec73fc
 GRAPHQL_FILTER_TAG = ""
 STOREFRONT_COLLECTION_HANDLES: List[str] = ["shop-all"]
 RESTOCK_API_BASE = "https://api.notify-me.app"
-RESTOCK_SHOP_ID: Optional[int] = None  # Auto-discovered from PDP HTML
+RESTOCK_API_KEY = ""  # From notify-me Admin Panel → API Keys
 METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = [
     ("attributes", "colorVariants"),
     ("attributes", "inseamVariants"),
@@ -1656,109 +1656,191 @@ def extract_restock_variants(product: Dict[str, Any]) -> List[Dict[str, Any]]:
 def fetch_restock_data(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Scrape _ReStockConfig data from each product PDP page and return rows."""
+    """Fetch ReStock data: API (subscriptions + pre-orders) when RESTOCK_API_KEY is
+    set; otherwise fall back to scraping _ReStockConfig from each product PDP page."""
+
+    # ── API path ─────────────────────────────────────────────────────────────
+    if RESTOCK_API_KEY:
+        api_base = RESTOCK_API_BASE.rstrip("/")
+        api_headers = {"X-Api-Key": RESTOCK_API_KEY, "Accept": "application/json"}
+
+        def _paginate(path: str, label: str) -> List[Dict[str, Any]]:
+            url = f"{api_base}/{path.lstrip('/')}"
+            collected: List[Dict[str, Any]] = []
+            offset = 0
+            limit = 100
+            while True:
+                params: Dict[str, Any] = {
+                    "limit": limit,
+                    "offset": offset,
+                    "ordering": "-created_at",
+                }
+                logger.info("ReStock API [%s]: offset=%s", label, offset)
+                try:
+                    resp = session.get(
+                        url,
+                        headers=api_headers,
+                        params=params,
+                        timeout=REQUEST_TIMEOUT,
+                        verify=False,
+                    )
+                except requests.RequestException as exc:
+                    logger.warning("ReStock API [%s]: request failed: %s", label, exc)
+                    break
+                if not resp.ok:
+                    logger.warning(
+                        "ReStock API [%s]: status %s", label, resp.status_code
+                    )
+                    break
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.warning(
+                        "ReStock API [%s]: response not valid JSON", label
+                    )
+                    break
+                results = data.get("results") if isinstance(data, dict) else None
+                if not isinstance(results, list):
+                    break
+                collected.extend(results)
+                logger.info(
+                    "ReStock API [%s]: fetched %s / %s",
+                    label,
+                    len(collected),
+                    data.get("count", "?"),
+                )
+                if not data.get("next") or len(results) < limit:
+                    break
+                offset += limit
+                time.sleep(0.5)
+            return collected
+
+        rows: List[Dict[str, Any]] = []
+
+        for sub in _paginate("/v1/subscriptions/", "subscriptions"):
+            if not isinstance(sub, dict):
+                continue
+            row: Dict[str, Any] = {
+                f"restock.subscription.{k}": v for k, v in sub.items()
+            }
+            row.setdefault("variant.sku", sub.get("sku"))
+            row.setdefault("variant.id", sub.get("variant_id"))
+            row.setdefault("product.id", sub.get("product_id"))
+            rows.append(row)
+
+        for order in _paginate("/v1/pre-orders/", "pre-orders"):
+            if not isinstance(order, dict):
+                continue
+            row = {f"restock.preorder.{k}": v for k, v in order.items()}
+            row.setdefault("variant.sku", order.get("sku"))
+            row.setdefault("variant.id", order.get("variant_id"))
+            row.setdefault("product.id", order.get("product_id"))
+            rows.append(row)
+
+        if rows:
+            logger.info("ReStock API: %s total rows collected", len(rows))
+            return rows, []
+        logger.info("ReStock API returned no data; falling back to PDP HTML scraping")
+
+    # ── HTML scraping fallback ────────────────────────────────────────────────
     products_json_urls = build_products_json_urls()
     if not products_json_urls:
-        logger.info("ReStock: No collection JSON URL computed; skipping ReStock extraction")
+        logger.info("ReStock: No collection JSON URL; skipping HTML scraping")
         return [], []
 
-    # Collect all product handles from the collection JSON feed.
     all_handles: List[str] = []
     seen_handles: Set[str] = set()
     for products_json_url in products_json_urls:
         page = 1
         while True:
-            params = {"limit": 250, "page": page}
+            params_pj = {"limit": 250, "page": page}
             try:
                 resp = session.get(
-                    products_json_url, params=params, timeout=REQUEST_TIMEOUT, verify=False
+                    products_json_url,
+                    params=params_pj,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=False,
                 )
             except requests.RequestException as exc:
-                logger.warning("ReStock: Collection JSON request failed: %s", exc)
+                logger.warning("ReStock HTML: collection JSON failed: %s", exc)
                 break
             if not resp.ok:
-                logger.warning(
-                    "ReStock: Collection JSON returned status %s", resp.status_code
-                )
                 break
             try:
-                data = resp.json()
+                pj_data = resp.json()
             except ValueError:
-                logger.warning("ReStock: Collection JSON was not valid JSON")
                 break
-            products = data.get("products") if isinstance(data, dict) else None
-            if not products:
+            pj_products = (
+                pj_data.get("products") if isinstance(pj_data, dict) else None
+            )
+            if not pj_products:
                 break
-            for p in products:
+            for p in pj_products:
                 if not isinstance(p, dict):
                     continue
-                handle = str(p.get("handle") or "").strip()
-                if handle and handle not in seen_handles:
-                    all_handles.append(handle)
-                    seen_handles.add(handle)
-            if len(products) < 250:
+                h = str(p.get("handle") or "").strip()
+                if h and h not in seen_handles:
+                    all_handles.append(h)
+                    seen_handles.add(h)
+            if len(pj_products) < 250:
                 break
             page += 1
             time.sleep(0.25)
 
     if not all_handles:
-        logger.info("ReStock: No product handles found; skipping ReStock extraction")
+        logger.info("ReStock HTML: no product handles found")
         return [], []
 
-    logger.info("ReStock: Scraping %s product PDP pages for ReStock data", len(all_handles))
+    logger.info("ReStock HTML: scraping %s PDP pages", len(all_handles))
 
     primary_url = _primary_collection_url()
     if primary_url:
-        parts = urlsplit(primary_url)
-        store_base = f"{parts.scheme}://{parts.netloc}"
+        _parts = urlsplit(primary_url)
+        store_base = f"{_parts.scheme}://{_parts.netloc}"
     else:
         store_base = f"https://{MYSHOPIFY}"
 
-    rows: List[Dict[str, Any]] = []
+    html_rows: List[Dict[str, Any]] = []
     tag_group_counts: Counter[str] = Counter()
 
-    def fetch_for_distinct(handle: str) -> Tuple[List[Dict[str, Any]], Counter[str]]:
-        """Fetch ReStock data for a single product handle by scraping its PDP page."""
-        pass_rows: List[Dict[str, Any]] = []
-        pass_tag_counts: Counter[str] = Counter()
-
+    for handle in all_handles:
         pdp_url = f"{store_base}/products/{handle}"
-        logger.info("ReStock: Fetching PDP %s", pdp_url)
+        logger.info("ReStock HTML: fetching %s", pdp_url)
         try:
             response = session.get(pdp_url, timeout=REQUEST_TIMEOUT, verify=False)
         except requests.RequestException as exc:
-            logger.warning("ReStock: PDP request failed for %s: %s", handle, exc)
-            return pass_rows, pass_tag_counts
+            logger.warning("ReStock HTML: request failed for %s: %s", handle, exc)
+            continue
         if not response.ok:
             logger.warning(
-                "ReStock: PDP returned status %s for handle %s",
-                response.status_code,
-                handle,
+                "ReStock HTML: status %s for %s", response.status_code, handle
             )
-            return pass_rows, pass_tag_counts
+            continue
 
         page_text = response.text
 
-        # Extract _ReStockConfig.product object.
         product_raw = _extract_js_assignment(page_text, "_ReStockConfig.product")
-        product_data: Optional[Dict[str, Any]] = _safe_json_parse(product_raw) if product_raw else None
+        product_data: Optional[Dict[str, Any]] = (
+            _safe_json_parse(product_raw) if product_raw else None
+        )
         if not isinstance(product_data, dict):
-            logger.warning("ReStock: Could not extract product data from %s", pdp_url)
-            return pass_rows, pass_tag_counts
+            logger.warning("ReStock HTML: no product data at %s", pdp_url)
+            continue
 
-        # Extract all three metafield config objects and attach as flat fields.
         config_raw = _extract_js_assignment(page_text, "metafieldConfigData")
-        config_data: Optional[Dict[str, Any]] = _safe_json_parse(config_raw) if config_raw else None
-
+        config_data: Optional[Dict[str, Any]] = (
+            _safe_json_parse(config_raw) if config_raw else None
+        )
         preorder_raw = _extract_js_assignment(page_text, "metafieldPreOrderData")
-        preorder_data: Optional[Dict[str, Any]] = _safe_json_parse(preorder_raw) if preorder_raw else None
-
+        preorder_data: Optional[Dict[str, Any]] = (
+            _safe_json_parse(preorder_raw) if preorder_raw else None
+        )
         wishlist_raw = _extract_js_assignment(page_text, "metafieldWishlistData")
-        wishlist_data: Optional[Dict[str, Any]] = _safe_json_parse(wishlist_raw) if wishlist_raw else None
+        wishlist_data: Optional[Dict[str, Any]] = (
+            _safe_json_parse(wishlist_raw) if wishlist_raw else None
+        )
 
         product_copy = dict(product_data)
-
-        # Flatten metafield configs into the product dict as restock.* columns.
         if isinstance(config_data, dict):
             for k, v in config_data.items():
                 product_copy[f"restock_config.{k}"] = v
@@ -1769,9 +1851,7 @@ def fetch_restock_data(
             for k, v in wishlist_data.items():
                 product_copy[f"restock_wishlist.{k}"] = v
 
-        # Pull variants out before flattening the product.
         parsed_variants = extract_restock_variants(product_copy)
-
         product_copy.setdefault("handle", handle)
         if product_copy.get("featured_image") and not product_copy.get("images"):
             product_copy["images"] = [{"src": product_copy["featured_image"]}]
@@ -1779,11 +1859,13 @@ def fetch_restock_data(
         tags = collect_tag_values(product_copy)
         tag_groups = group_tags_for_columns(tags)
 
-        def attach_tag_groups(target_row: Dict[str, Any]) -> None:
-            for column_name, tag_values in tag_groups.items():
-                joined = ", ".join(tag_values)
-                target_row[column_name] = joined
-                pass_tag_counts[column_name] += 1
+        def attach_tag_groups(
+            target_row: Dict[str, Any],
+            _tg: Dict[str, Any] = tag_groups,
+        ) -> None:
+            for col_name, tag_vals in _tg.items():
+                target_row[col_name] = ", ".join(tag_vals)
+                tag_group_counts[col_name] += 1
 
         flat_product = flatten_record({"product": product_copy})
         base_row = dict(flat_product)
@@ -1793,48 +1875,38 @@ def fetch_restock_data(
         if not parsed_variants:
             attach_tag_groups(base_row)
             finalize_json_row(base_row, product_copy, None)
-            pass_rows.append(base_row)
-            return pass_rows, pass_tag_counts
+            html_rows.append(base_row)
+            time.sleep(0.1)
+            continue
 
         seen_variant_keys: Set[str] = set()
         for variant in parsed_variants:
             if not isinstance(variant, dict):
                 continue
             variant_copy = dict(variant)
-            dedupe_key = json.dumps(variant_copy, sort_keys=True, default=str)
-            if dedupe_key in seen_variant_keys:
+            dk = json.dumps(variant_copy, sort_keys=True, default=str)
+            if dk in seen_variant_keys:
                 continue
-            seen_variant_keys.add(dedupe_key)
-
+            seen_variant_keys.add(dk)
             if "availableForSale" not in variant_copy and isinstance(
                 variant_copy.get("available"), bool
             ):
                 variant_copy["availableForSale"] = variant_copy["available"]
-
             flat_variant = flatten_record({"variant": variant_copy})
-            row = dict(base_row)
-            row.update(flat_variant)
-            attach_tag_groups(row)
-            finalize_json_row(row, product_copy, variant_copy)
-            pass_rows.append(row)
+            row_html = dict(base_row)
+            row_html.update(flat_variant)
+            attach_tag_groups(row_html)
+            finalize_json_row(row_html, product_copy, variant_copy)
+            html_rows.append(row_html)
 
-        return pass_rows, pass_tag_counts
+        time.sleep(0.1)
 
-    for handle in all_handles:
-        handle_rows, handle_tag_counts = fetch_for_distinct(handle)
-        rows.extend(handle_rows)
-        tag_group_counts.update(handle_tag_counts)
-        logger.info(
-            "ReStock: handle=%s rows=%s total=%s", handle, len(handle_rows), len(rows)
-        )
-        time.sleep(0.15)
-
-    if not rows:
+    if not html_rows:
         return [], []
-    columns = {key for row in rows for key in row.keys()}
+    columns = {key for row in html_rows for key in row.keys()}
     tag_group_columns = [col for col in columns if col.startswith("tags_group_")]
     tag_group_columns.sort(key=lambda col: (-tag_group_counts.get(col, 0), col))
-    return rows, tag_group_columns
+    return html_rows, tag_group_columns
 
 
 def make_absolute(url: str, base: Any) -> str:
@@ -3559,6 +3631,46 @@ def gather_storefront_data(
         attempted_sources.add((None, "no_token"))
         if result:
             return result, access_rows
+
+    # All collection-based attempts failed. If a token proved valid via the shop
+    # probe (status 200) but the collection handle returned no rows, try the
+    # products query with that token before falling back to unauthenticated.
+    # This preserves authenticated access to fields like description and tags.
+    if STOREFRONT_COLLECTION_HANDLES:
+        for _fb_endpoint in endpoints_to_use:
+            _proven = sorted(
+                t
+                for t in token_succealgolia_map.get(_fb_endpoint, set())
+                if t is not None
+            )
+            for _good_token in _proven:
+                _cache_key = (_fb_endpoint, _good_token)
+                _effective_mf = metafield_identifier_cache.get(
+                    _cache_key, list(METAFIELD_IDENTIFIERS)
+                )
+                _fb_rows, _fb_status, _fb_note = collect_storefront_from_products(
+                    session,
+                    _fb_endpoint,
+                    _good_token,
+                    logger,
+                    metafield_identifiers=_effective_mf,
+                )
+                access_rows.append(
+                    {
+                        "endpoint": _fb_endpoint,
+                        "token": _good_token,
+                        "token_source": "authenticated_products_fallback",
+                        "status_code": _fb_status or "",
+                        "ok": _fb_note == "success",
+                        "note": _fb_note,
+                    }
+                )
+                if _fb_rows:
+                    logger.info(
+                        "Storefront authenticated-products fallback succeeded: %s",
+                        _fb_endpoint,
+                    )
+                    return _fb_rows, access_rows
 
     fallback_rows, fallback_entry = fallback_collect_storefront(
         session, endpoints_to_use, logger
