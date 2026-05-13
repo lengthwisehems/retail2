@@ -1816,8 +1816,9 @@ def fetch_restock_data(
             rows.append(variant_row)
 
         time.sleep(0.2)
-        logger.info("ReStock: processed handle=%s  variants=%s", handle, len(variants_raw))
+        logger.debug("ReStock: processed handle=%s  variants=%s", handle, len(variants_raw))
 
+    logger.info("ReStock extraction complete: %s rows from %s handles", len(rows), len(handles))
     return rows, []
 
 
