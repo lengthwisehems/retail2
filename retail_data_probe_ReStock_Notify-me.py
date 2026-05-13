@@ -24,13 +24,13 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "rudesdenim"
+BRAND = "rudes"
 COLLECTION_URL = [
     "https://rudesdenim.com/collections/shop-all",
 ]
 MYSHOPIFY = "rudesdenim.myshopify.com"
-GRAPHQL = "https://rudesdenim.myshopify.com/api/2025-01/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = []
+GRAPHQL = "https://rudesdenim.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = []
 GRAPHQL_FILTER_TAG = ""
 STOREFRONT_COLLECTION_HANDLES: List[str] = ["shop-all"]
 RESTOCK_BASE_URL = "https://api.notify-me.app"
@@ -39,11 +39,11 @@ RESTOCK_PDP_BASE = "https://rudesdenim.com/products"
 METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
 VIEW_JSON_ENRICHMENT_ENABLED = False
-VIEW_JSON_FIELDS: List[str] = []
-VIEW_JSON_PROBE_LIMIT = 0
-METAFIELD_AUTO_DISCOVER = False
-METAFIELD_DISCOVERY_MAX_SCRIPTS = 0
-METAFIELD_DEFAULT_NAMESPACE = "custom"
+VIEW_JSON_FIELDS = []
+VIEW_JSON_PROBE_LIMIT = 6
+METAFIELD_AUTO_DISCOVER = True
+METAFIELD_DISCOVERY_MAX_SCRIPTS = 60
+METAFIELD_DEFAULT_NAMESPACE = "attributes"
 # ---------------------------------------------------------------------------
 # Derived paths and constants
 # ---------------------------------------------------------------------------
