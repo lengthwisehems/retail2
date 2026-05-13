@@ -24,18 +24,22 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "paige"
+BRAND = "rudes"
 COLLECTION_URL = [
-    "https://paige.com/collection/women-denim",
+    "https://rudesdenim.com/collections/shop-all",
 ]
-MYSHOPIFY = "paige-7873.myshopify.com"
-GRAPHQL = "https://paige-7873.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["383d494a76122b5e6cadffc2c7667ef2"]
+MYSHOPIFY = "rudes-jeans.myshopify.com"
+GRAPHQL = "https://rudes-jeans.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["58ea06b1762dd2cd2daa40fa0ec73fc7", "613495450fdb8311dc884a818be104cc"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["women-denim"]
-ALGOLIA_APP_ID = "DK4YY42827"
-ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
-ALGOLIA_INDEX = "production_products"
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["shop-all"]
+#ALGOLIA_APP_ID = "DK4YY42827"
+#ALGOLIA_API_KEY = "333da36aea28227274c0ad598d0fbdb0"
+#ALGOLIA_INDEX = "production_products"
+#ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
+ALGOLIA_APP_ID = ""
+ALGOLIA_API_KEY = ""
+ALGOLIA_INDEX = ""
 ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query"
 ALGOLIA_EXTRA_PARAMS: Dict[str, Any] = {}
 ALGOLIA_QUERY = ""
