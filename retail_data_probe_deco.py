@@ -24,16 +24,17 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "Triarchy"
+BRAND = "rudes"
 COLLECTION_URL = [
-    "https://triarchy.com/collections/jeans",
+    "https://rudesdenim.com/collections/shop-all",
 ]
-MYSHOPIFY = "https://triarchy-atelier-denim.myshopify.com"
-GRAPHQL = "https://triarchy-atelier-denim.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["a1a822d8fe8512d5d00e92c7918111ce"]
+MYSHOPIFY = "rudes-jeans.myshopify.com"
+GRAPHQL = "https://rudes-jeans.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN = ["58ea06b1762dd2cd2daa40fa0ec73fc7", "613495450fdb8311dc884a818be104cc"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["jeans"]
-DECO_SEARCH_URL = "https://triarchy.com/apps/search-deco-label/search"
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["shop-all"]
+#DECO_SEARCH_URL = "https://triarchy.com/apps/search-deco-label/search"
+DECO_SEARCH_URL = ""
 DECO_HANDLE_BATCH_SIZE = 20
 # Keep this list editable for future Storefront probes. Deco itself returns all metafields
 # exposed in its app-proxy payload and does not need hard-coded metafield identifiers.
@@ -72,14 +73,10 @@ TOKEN_REGEX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 DEFAULT_GRAPHQL_VERSIONS = [
     "api/2025-10/graphql.json",
-    "api/2024-01/graphql.json",
     "api/2025-01/graphql.json",
     "api/2025-07/graphql.json",
     "api/2025-04/graphql.json",
     "api/unstable/graphql.json",
-    "api/2024-04/graphql.json",
-    "api/2023-01/graphql.json",
-    "api/2023-04/graphql.json",
 ]
 
 COLUMN_ORDER_BASE: Tuple[str, ...] = (
