@@ -219,20 +219,9 @@ def _normalise_measurement(raw: str) -> str:
         except ZeroDivisionError:
             pass
 
-    # Format: drop .0, keep fractions as /  e.g. 12.25 → "12 1/4"
-    frac_part = base - int(base)
-    whole = int(base)
-    frac_str = ""
-    frac_threshold = {0.25: "1/4", 0.5: "1/2", 0.75: "3/4",
-                      0.125: "1/8", 0.375: "3/8", 0.625: "5/8", 0.875: "7/8"}
-    for fval, ftext in frac_threshold.items():
-        if abs(frac_part - fval) < 0.04:
-            frac_str = f" {ftext}"
-            break
-
-    if frac_str:
-        return f'{whole}{frac_str}"'
-    return f'{whole}"'
+    if base == int(base):
+        return str(int(base))
+    return f'{base:.3f}'
 
 
 # ---------------------------------------------------------------------------
@@ -443,11 +432,12 @@ def ocr_size_chart(
     }
 
     def find_measurement_row(label_words: Tuple[str, ...]) -> Optional[List]:
-        """Return the row that contains the first matching label word."""
+        """Return the row that contains the first matching label word (substring match)."""
         for row in rows:
-            row_texts_upper = {w[0].upper() for w in row}
-            if row_texts_upper & set(label_words):
-                return row
+            for w in row:
+                w_upper = w[0].upper()
+                if any(label in w_upper for label in label_words):
+                    return row
         return None
 
     results: Dict[str, str] = {}
@@ -512,14 +502,9 @@ def _parse_number_like(s: str) -> str:
     base = float(m.group(1))
     if m.group(2) and m.group(3):
         base += float(m.group(2)) / float(m.group(3))
-    frac = base - int(base)
-    whole = int(base)
-    frac_map = {0.25: "1/4", 0.5: "1/2", 0.75: "3/4",
-                0.125: "1/8", 0.375: "3/8", 0.625: "5/8", 0.875: "7/8"}
-    for fval, ftext in frac_map.items():
-        if abs(frac - fval) < 0.04:
-            return f'{whole} {ftext}"'
-    return f'{whole}"'
+    if base == int(base):
+        return str(int(base))
+    return f'{base:.3f}'
 
 
 def extract_measures_from_body(body_html: str) -> Tuple[str, str, str]:
@@ -540,9 +525,25 @@ def extract_measures_from_body(body_html: str) -> Tuple[str, str, str]:
                 return _parse_number_like(m.group(1).split("|")[0].strip())
         return ""
 
-    rise    = grab(["Front Rise", "Rise"])
-    inseam  = grab(["Inseam"])
-    leg     = grab(["Leg Opening", "Leg Openning", "Opening"])
+    rise_patterns = [
+        r"(?:Front )?Rise:\s*([0-9][^,;|<\n]*)",   # "Rise: 13""
+        r"\|\s*Rise\s+([0-9][^,;|<\n]*)",           # "| Rise 13""
+    ]
+    inseam_patterns = [
+        r"Inseam:\s*([0-9][^,;|<\n]*)",             # "Inseam: 32""
+        r":\s*Inseam\s+([0-9][^,;|<\n]*)",          # ": Inseam 32""
+    ]
+
+    def grab_first(patterns: List[str]) -> str:
+        for pat in patterns:
+            m = re.search(pat, txt, re.IGNORECASE)
+            if m:
+                return _parse_number_like(m.group(1).split("|")[0].strip())
+        return ""
+
+    rise   = grab_first(rise_patterns)
+    inseam = grab_first(inseam_patterns)
+    leg    = grab(["Leg Opening", "Leg Openning", "Opening"])
     return rise, inseam, leg
 
 
