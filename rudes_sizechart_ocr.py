@@ -1,0 +1,687 @@
+"""
+rudes_sizechart_ocr.py
+======================
+Finds the size-chart image (URL contains '___') for every product on
+rudesdenim.com/collections/shop-all, OCRs it, and extracts Rise, Inseam,
+and Leg Opening for a target size (default: 26).
+
+When no size-chart image is found it falls back to parsing the product
+description HTML for inline measurement text (e.g. "Inseam 32\" | Rise 11\"").
+
+Output: Output/rudes_sizechart_ocr_<timestamp>.xlsx
+        One row per product.
+
+Requirements
+------------
+  sudo apt-get install -y tesseract-ocr
+  pip install pytesseract pillow openpyxl requests
+"""
+
+from __future__ import annotations
+
+import html as _html
+import io
+import json
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import requests
+import urllib3
+from requests.adapters import HTTPAdapter, Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+COLLECTION_URL  = "https://rudesdenim.com/collections/shop-all"
+TARGET_SIZE     = "26"          # Rudes denim size to extract measurements for
+REQUEST_TIMEOUT = 30
+BASE_DIR   = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def _configure_logging() -> logging.Logger:
+    logger = logging.getLogger("rudes_ocr")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s %(message)s")
+    for path in (BASE_DIR / "rudes_sizechart_ocr.log", OUTPUT_DIR / "rudes_sizechart_ocr.log"):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(path, encoding="utf-8")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+            break
+        except OSError:
+            pass
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# HTTP session
+# ---------------------------------------------------------------------------
+def build_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods=("GET",),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+    )
+    session.verify = False
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Collection crawl
+# ---------------------------------------------------------------------------
+def get_all_products(session: requests.Session, logger: logging.Logger) -> List[Dict]:
+    """Return list of product dicts from the shop-all collection products.json."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(COLLECTION_URL)
+    base = urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/") + "/products.json", "", ""))
+
+    all_products: List[Dict] = []
+    page = 1
+    while True:
+        try:
+            resp = session.get(base, params={"limit": 250, "page": page}, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("products.json page %s failed: %s", page, exc)
+            break
+        prods = data.get("products") or []
+        logger.info("products.json page %s → %s products", page, len(prods))
+        if not prods:
+            break
+        all_products.extend(prods)
+        if len(prods) < 250:
+            break
+        page += 1
+        time.sleep(0.3)
+
+    logger.info("Total products collected: %s", len(all_products))
+    return all_products
+
+
+# ---------------------------------------------------------------------------
+# Size-chart image URL detection
+# ---------------------------------------------------------------------------
+_TRIPLE_UNDERSCORE = re.compile(r"https?://[^\"'<> )]*___[^\"'<> )]+", re.IGNORECASE)
+
+
+def find_size_chart_url(html_text: str) -> Optional[str]:
+    """Return the first Shopify CDN image URL that contains '___'."""
+    matches = _TRIPLE_UNDERSCORE.findall(html_text)
+    return matches[0] if matches else None
+
+
+# ---------------------------------------------------------------------------
+# Measurement value normalisation helpers
+# ---------------------------------------------------------------------------
+_FRACTION_MAP = {
+    "½": " 1/2",
+    "¼": " 1/4",
+    "¾": " 3/4",
+    "⅛": " 1/8",
+    "⅜": " 3/8",
+    "⅝": " 5/8",
+    "⅞": " 7/8",
+    "″": '"',  # ″ DOUBLE PRIME
+    "“": '"',
+    "”": '"',
+}
+
+# Single OCR letters that are commonly misread from digit pairs
+_LETTER_TO_NUMBER = {
+    "B": "13",  # "B" often comes from bold "13" in narrow cells
+    "D": "0",
+    "O": "0",
+    "I": "1",
+    "l": "1",
+}
+
+
+def _normalise_measurement(raw: str) -> str:
+    """
+    Converts a raw OCR token like '12/4"', '23"', 'B"', '217/8"' to a
+    human-readable measurement string.
+
+    Strategy
+    --------
+    1. Replace unicode fractions and fancy quotes.
+    2. Replace known single-letter OCR artefacts.
+    3. Interpret patterns like "217/8"" as "21 7/8"" (two-digit whole + fraction).
+    4. Convert fractions to decimal and format as whole or .25/.5/.75/.xx.
+    """
+    s = raw.strip()
+    for uc, rep in _FRACTION_MAP.items():
+        s = s.replace(uc, rep)
+
+    # Strip leading/trailing punctuation except digits, letters, /  "  space  .
+    s = re.sub(r"^[^0-9A-Za-z]+", "", s)
+    s = re.sub(r"[^0-9\"./½¼¾\s]+$", "", s).strip()
+
+    # Replace single-letter artefacts that stand alone before "
+    s = re.sub(
+        r"\b([A-Z])\b(?=\"|$| )",
+        lambda m: _LETTER_TO_NUMBER.get(m.group(1), m.group(1)),
+        s,
+    )
+
+    # Handle patterns like "217/8" → "21 7/8",  "121/2" → "12 1/2"
+    s = re.sub(r"(\d{2,3})(\d)(\/\d)", r"\1 \2\3", s)
+
+    # Remove quotes for numeric parsing, add back at end
+    s_clean = s.replace('"', "").strip()
+
+    # Try to parse as  [whole] [num/denom]
+    m = re.match(
+        r"^(-?\d+(?:\.\d+)?)"
+        r"(?:\s+(\d+)\s*/\s*(\d+))?$",
+        s_clean,
+    )
+    if not m:
+        # Return as-is (with " if it had one) if we can't parse
+        return s if s else raw
+
+    base = float(m.group(1))
+    if m.group(2) and m.group(3):
+        try:
+            base += float(m.group(2)) / float(m.group(3))
+        except ZeroDivisionError:
+            pass
+
+    # Format: drop .0, keep fractions as /  e.g. 12.25 → "12 1/4"
+    frac_part = base - int(base)
+    whole = int(base)
+    frac_str = ""
+    frac_threshold = {0.25: "1/4", 0.5: "1/2", 0.75: "3/4",
+                      0.125: "1/8", 0.375: "3/8", 0.625: "5/8", 0.875: "7/8"}
+    for fval, ftext in frac_threshold.items():
+        if abs(frac_part - fval) < 0.04:
+            frac_str = f" {ftext}"
+            break
+
+    if frac_str:
+        return f'{whole}{frac_str}"'
+    return f'{whole}"'
+
+
+# ---------------------------------------------------------------------------
+# OCR engine
+# ---------------------------------------------------------------------------
+
+def _load_ocr_libs():
+    """Lazy-import OCR libraries so the script is still importable without them."""
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image, ImageEnhance
+        return pytesseract, Output, Image, ImageEnhance
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR libraries not available. "
+            "Install with:  sudo apt-get install -y tesseract-ocr && pip install pytesseract pillow"
+        ) from exc
+
+
+def _cluster_rows(words: list, y_tol: int = 35) -> List[List]:
+    """Group word tuples (text, x_center, y_center, conf) into horizontal rows."""
+    rows: List[List] = []
+    for w in sorted(words, key=lambda x: x[2]):
+        placed = False
+        for row in rows:
+            if abs(row[0][2] - w[2]) <= y_tol:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+    for row in rows:
+        row.sort(key=lambda x: x[1])  # sort by x within each row
+    return rows
+
+
+def _merge_adjacent_fragments(row: list, max_gap: int = 120) -> list:
+    """
+    Merge word fragments that are very close together (split fractions like
+    '22' + '5/8"' → '22 5/8"') to get compound measurement strings.
+    Returns a new list of merged word tuples.
+    """
+    if not row:
+        return row
+    merged: List = []
+    buf = list(row[0])  # [text, x_center, y_center, conf]
+    for w in row[1:]:
+        prev_right = buf[1] + 50  # rough right edge (x_center + half-width estimate)
+        gap = w[1] - buf[1]
+        if gap <= max_gap and re.search(r"\d", w[0]) and (
+            re.search(r"\d", buf[0]) or re.search(r"[\"′]", buf[0])
+        ):
+            # merge: combine text, keep x_center of combined span midpoint
+            new_text = buf[0].rstrip('"') + " " + w[0] if '"' not in w[0] else buf[0] + " " + w[0]
+            new_x = (buf[1] + w[1]) // 2
+            new_conf = min(buf[3], w[3])
+            buf = [new_text, new_x, buf[2], new_conf]
+        else:
+            merged.append(tuple(buf))
+            buf = list(w)
+    merged.append(tuple(buf))
+    return merged
+
+
+def _pick_value_at_column(row: list, col_x: int, x_tol: int = 120) -> Optional[str]:
+    """
+    From a list of word tuples in a row, return the text of the word whose
+    x_center is closest to col_x, within x_tol pixels.  Returns None if
+    no word is close enough.
+    """
+    best_dist = x_tol + 1
+    best_text = None
+    for w in row:
+        dist = abs(w[1] - col_x)
+        if dist < best_dist:
+            best_dist = dist
+            best_text = w[0]
+    return best_text
+
+
+def _row_majority_value(row: list) -> Optional[str]:
+    """
+    Return the most common well-formed measurement string (contains a digit and
+    optionally a quote) from across an entire row, excluding the label words at
+    the far left.  Used as a fallback when the column-aligned value looks incomplete.
+    """
+    from collections import Counter
+
+    # Skip label words (anything not containing a digit or '"')
+    candidates = [
+        w[0] for w in row
+        if re.search(r"\d", w[0]) and '"' in w[0]
+    ]
+    if not candidates:
+        return None
+    most_common = Counter(candidates).most_common(1)
+    return most_common[0][0] if most_common else None
+
+
+def _looks_incomplete(value: Optional[str]) -> bool:
+    """Return True if a normalised measurement value looks truncated or invalid."""
+    if not value:
+        return True
+    # Strip the inch mark and whitespace for digit-count check
+    clean = value.replace('"', "").strip()
+    # Single digit (e.g. "2"") almost certainly a truncated two-digit value
+    if re.fullmatch(r"[0-9]", clean):
+        return True
+    # Single letter — OCR artefact that normalisation didn't resolve
+    if re.fullmatch(r"[A-Za-z]", clean):
+        return True
+    return False
+
+
+def ocr_size_chart(
+    session: requests.Session,
+    img_url: str,
+    target_size: str,
+    logger: logging.Logger,
+) -> Tuple[str, str, str]:
+    """
+    Download img_url, OCR it, and return (rise, inseam, leg_opening) for target_size.
+    Returns ("", "", "") on any failure.
+    """
+    try:
+        pytesseract, Output, Image, ImageEnhance = _load_ocr_libs()
+    except RuntimeError as exc:
+        logger.warning("OCR unavailable: %s", exc)
+        return ("", "", "")
+
+    try:
+        resp = session.get(img_url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("Failed to download size chart %s: %s", img_url, exc)
+        return ("", "", "")
+
+    try:
+        im = Image.open(io.BytesIO(resp.content)).convert("L")  # grayscale
+        # Original image is already high-res (typically 2160×1600).
+        # Avoid upscaling — tesseract handles this resolution well.
+    except Exception as exc:
+        logger.warning("Failed to open image %s: %s", img_url, exc)
+        return ("", "", "")
+
+    # Run OCR with sparse text mode — best for table images
+    try:
+        data = pytesseract.image_to_data(im, config="--psm 11", output_type=Output.DICT)
+    except Exception as exc:
+        logger.warning("Tesseract failed on %s: %s", img_url, exc)
+        return ("", "", "")
+
+    # Build word list with spatial info
+    words = []
+    for i in range(len(data["text"])):
+        txt = data["text"][i].strip()
+        conf = int(data["conf"][i])
+        if conf > 20 and txt:
+            x = data["left"][i] + data["width"][i] // 2
+            y = data["top"][i] + data["height"][i] // 2
+            words.append((txt, x, y, conf))
+
+    if not words:
+        logger.warning("OCR returned no words for %s", img_url)
+        return ("", "", "")
+
+    rows = _cluster_rows(words, y_tol=35)
+
+    # ── Step 1: find the size header row and the x_center of target_size ──────
+    col_x: Optional[int] = None
+    header_row_idx: Optional[int] = None
+    for idx, row in enumerate(rows):
+        for w in row:
+            if w[0] == target_size and w[3] > 50:
+                # Make sure it's the true header (earlier rows are preferred)
+                if header_row_idx is None or idx < header_row_idx:
+                    col_x = w[1]
+                    header_row_idx = idx
+        if header_row_idx is not None:
+            break
+
+    if col_x is None:
+        # Fallback: size "26" might be read with lower confidence
+        for idx, row in enumerate(rows):
+            for w in row:
+                if w[0] == target_size:
+                    col_x = w[1]
+                    break
+            if col_x is not None:
+                break
+
+    if col_x is None:
+        logger.warning("Could not locate size '%s' in OCR output for %s", target_size, img_url)
+        return ("", "", "")
+
+    logger.debug("Size '%s' found at x_center=%s", target_size, col_x)
+
+    # ── Step 2: find and extract measurement rows ────────────────────────────
+    LABELS = {
+        "rise":        ("RISE",),
+        "inseam":      ("INSEAM",),
+        "leg_opening": ("LEG", "OPENNING", "OPENING"),
+    }
+
+    def find_measurement_row(label_words: Tuple[str, ...]) -> Optional[List]:
+        """Return the row that contains the first matching label word."""
+        for row in rows:
+            row_texts_upper = {w[0].upper() for w in row}
+            if row_texts_upper & set(label_words):
+                return row
+        return None
+
+    results: Dict[str, str] = {}
+    for key, labels in LABELS.items():
+        mrow = find_measurement_row(labels)
+        if mrow is None:
+            logger.debug("Label '%s' not found in OCR output for %s", labels[0], img_url)
+            results[key] = ""
+            continue
+
+        # Merge adjacent fragments (split fractions) before picking column
+        merged = _merge_adjacent_fragments(mrow, max_gap=120)
+        raw = _pick_value_at_column(merged, col_x, x_tol=130)
+
+        if raw is None:
+            results[key] = ""
+            logger.debug("No value near x=%s in %s row for %s", col_x, labels[0], img_url)
+            continue
+
+        # Normalise first — this handles known OCR artefacts like "B" → "13"
+        value = _normalise_measurement(raw)
+
+        # If the normalised result still looks incomplete (no digit survived),
+        # fall back to the most common well-formed value in the row.
+        # This handles constant rows like INSEAM where a cell reads "2" instead of "32"".
+        if _looks_incomplete(value):
+            majority = _row_majority_value(merged)
+            if majority:
+                logger.debug(
+                    "%s: normalised %r still looks incomplete; using row majority %r",
+                    labels[0], value, majority,
+                )
+                value = _normalise_measurement(majority)
+
+        logger.debug("%s for size %s → raw=%r  normalised=%r", key, target_size, raw, value)
+        results[key] = value
+
+    return results.get("rise", ""), results.get("inseam", ""), results.get("leg_opening", "")
+
+
+# ---------------------------------------------------------------------------
+# Body-HTML fallback (from rudes_inventory.py)
+# ---------------------------------------------------------------------------
+def _clean_html(h: str) -> str:
+    if not h:
+        return ""
+    txt = _html.unescape(re.sub(r"<br\s*/?>", " ", h, flags=re.I))
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _parse_number_like(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("“", '"').replace("”", '"').replace("″", '"').replace("'", "'")
+    s = s.replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4")
+    s = s.replace('"', "").strip()
+    m = re.search(r"(-?\d+(?:\.\d+)?)(?:\s+(\d+)/(\d+))?", s)
+    if not m:
+        return s.strip()
+    base = float(m.group(1))
+    if m.group(2) and m.group(3):
+        base += float(m.group(2)) / float(m.group(3))
+    frac = base - int(base)
+    whole = int(base)
+    frac_map = {0.25: "1/4", 0.5: "1/2", 0.75: "3/4",
+                0.125: "1/8", 0.375: "3/8", 0.625: "5/8", 0.875: "7/8"}
+    for fval, ftext in frac_map.items():
+        if abs(frac - fval) < 0.04:
+            return f'{whole} {ftext}"'
+    return f'{whole}"'
+
+
+def extract_measures_from_body(body_html: str) -> Tuple[str, str, str]:
+    """Extract Rise / Inseam / Leg Opening from the product description HTML."""
+    txt = _clean_html(body_html or "")
+    if not txt:
+        return ("", "", "")
+
+    def grab(labels: List[str]) -> str:
+        for lab in labels:
+            # Accept colon, dash, or plain whitespace as separator after label
+            m = re.search(
+                rf"{re.escape(lab)}\s*[:\-]?\s*([0-9][^,;|<\n]*)",
+                txt,
+                re.IGNORECASE,
+            )
+            if m:
+                return _parse_number_like(m.group(1).split("|")[0].strip())
+        return ""
+
+    rise    = grab(["Front Rise", "Rise"])
+    inseam  = grab(["Inseam"])
+    leg     = grab(["Leg Opening", "Leg Openning", "Opening"])
+    return rise, inseam, leg
+
+
+# ---------------------------------------------------------------------------
+# Excel writer
+# ---------------------------------------------------------------------------
+COLUMNS = [
+    "product.id",
+    "product.handle",
+    "product.title",
+    "size_chart_url",
+    "rise_26",
+    "inseam_26",
+    "leg_opening_26",
+    "measurement_source",
+    "notes",
+]
+
+
+def _write_excel(rows: List[Dict], logger: logging.Logger) -> Path:
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        logger.warning("openpyxl not installed; skipping Excel output")
+        return Path()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Measurements"
+    ws.append(COLUMNS)
+    for row in rows:
+        ws.append([row.get(c, "") for c in COLUMNS])
+
+    # Auto-width
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+    path = OUTPUT_DIR / f"rudes_sizechart_ocr_{ts}.xlsx"
+    wb.save(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    logger = _configure_logging()
+    logger.info("=== Rudes size-chart OCR  (target size: %s) ===", TARGET_SIZE)
+
+    session = build_session()
+
+    products = get_all_products(session, logger)
+    if not products:
+        logger.error("No products retrieved — aborting")
+        return
+
+    # Build a handle→product_json lookup (we need body_html for fallback)
+    # products.json includes body_html
+    product_map: Dict[str, Dict] = {p["handle"]: p for p in products}
+    handles = list(product_map.keys())
+
+    output_rows: List[Dict] = []
+
+    for n, handle in enumerate(handles, start=1):
+        prod = product_map[handle]
+        prod_id = prod.get("id", "")
+        title   = prod.get("title", "")
+        body_html = prod.get("body_html", "") or ""
+
+        logger.info("[%d/%d] %s — %s", n, len(handles), handle, title)
+
+        # ── Fetch PDP HTML to find size-chart image URL ──────────────────────
+        from urllib.parse import urlsplit
+        parts = urlsplit(COLLECTION_URL)
+        pdp_url = f"{parts.scheme}://{parts.netloc}/products/{handle}"
+        size_chart_url = ""
+        pdp_html = ""
+        try:
+            resp = session.get(pdp_url, timeout=REQUEST_TIMEOUT)
+            if resp.ok:
+                pdp_html = resp.text
+                size_chart_url = find_size_chart_url(pdp_html) or ""
+        except Exception as exc:
+            logger.warning("PDP fetch failed for %s: %s", handle, exc)
+
+        # ── Measurements ─────────────────────────────────────────────────────
+        rise = inseam = leg_opening = ""
+        source = "not_found"
+        notes = ""
+
+        if size_chart_url:
+            logger.info("  Size chart found: %s", size_chart_url)
+            rise, inseam, leg_opening = ocr_size_chart(session, size_chart_url, TARGET_SIZE, logger)
+            if any([rise, inseam, leg_opening]):
+                source = "ocr"
+            else:
+                notes = "ocr_returned_empty"
+
+        if not any([rise, inseam, leg_opening]):
+            # Fallback: parse product description
+            rise, inseam, leg_opening = extract_measures_from_body(body_html)
+            if any([rise, inseam, leg_opening]):
+                source = "body_html"
+                if notes:
+                    notes += ";body_html_fallback"
+                else:
+                    notes = "body_html_fallback" if not size_chart_url else "body_html_fallback_after_ocr"
+            else:
+                source = "not_found"
+                if not notes:
+                    notes = "no_chart_and_no_body_measurements"
+
+        output_rows.append(
+            {
+                "product.id":          prod_id,
+                "product.handle":      handle,
+                "product.title":       title,
+                "size_chart_url":      size_chart_url,
+                "rise_26":             rise,
+                "inseam_26":           inseam,
+                "leg_opening_26":      leg_opening,
+                "measurement_source":  source,
+                "notes":               notes,
+            }
+        )
+
+        time.sleep(0.25)
+
+    # ── Write output ─────────────────────────────────────────────────────────
+    path = _write_excel(output_rows, logger)
+    if path.exists():
+        logger.info("Excel written to %s", path)
+
+    # Summary
+    ocr_count  = sum(1 for r in output_rows if r["measurement_source"] == "ocr")
+    body_count = sum(1 for r in output_rows if r["measurement_source"] == "body_html")
+    miss_count = sum(1 for r in output_rows if r["measurement_source"] == "not_found")
+    logger.info(
+        "Done. %d products: %d via OCR, %d via body_html, %d not found",
+        len(output_rows), ocr_count, body_count, miss_count,
+    )
+
+
+if __name__ == "__main__":
+    main()
