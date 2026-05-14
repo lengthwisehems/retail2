@@ -13,8 +13,9 @@ Output: Output/rudes_sizechart_ocr_<timestamp>.xlsx
 
 Requirements
 ------------
-  sudo apt-get install -y tesseract-ocr
-  pip install pytesseract pillow openpyxl requests
+  pip install easyocr pillow openpyxl requests
+  (No external binary needed — EasyOCR bundles its own models.)
+  First run downloads ~100 MB of model weights to ~/.EasyOCR/model/
 """
 
 from __future__ import annotations
@@ -235,21 +236,24 @@ def _normalise_measurement(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OCR engine
+# OCR engine  (EasyOCR — no external binary required)
 # ---------------------------------------------------------------------------
 
-def _load_ocr_libs():
-    """Lazy-import OCR libraries so the script is still importable without them."""
-    try:
-        import pytesseract
-        from pytesseract import Output
-        from PIL import Image, ImageEnhance
-        return pytesseract, Output, Image, ImageEnhance
-    except ImportError as exc:
-        raise RuntimeError(
-            "OCR libraries not available. "
-            "Install with:  sudo apt-get install -y tesseract-ocr && pip install pytesseract pillow"
-        ) from exc
+_easyocr_reader = None  # cached after first load
+
+
+def _get_easyocr_reader():
+    """Lazy-load EasyOCR reader (downloads models on first call, ~100 MB)."""
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        try:
+            import easyocr
+        except ImportError as exc:
+            raise RuntimeError(
+                "EasyOCR not available. Install with:  pip install easyocr"
+            ) from exc
+        _easyocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _easyocr_reader
 
 
 def _cluster_rows(words: list, y_tol: int = 35) -> List[List]:
@@ -321,10 +325,10 @@ def _row_majority_value(row: list) -> Optional[str]:
     """
     from collections import Counter
 
-    # Skip label words (anything not containing a digit or '"')
+    # Skip label words (only keep words that look like measurements: 2+ digits)
     candidates = [
         w[0] for w in row
-        if re.search(r"\d", w[0]) and '"' in w[0]
+        if re.search(r"\d{2}", w[0])  # at least two consecutive digits → not a single size number
     ]
     if not candidates:
         return None
@@ -358,7 +362,7 @@ def ocr_size_chart(
     Returns ("", "", "") on any failure.
     """
     try:
-        pytesseract, Output, Image, ImageEnhance = _load_ocr_libs()
+        reader = _get_easyocr_reader()
     except RuntimeError as exc:
         logger.warning("OCR unavailable: %s", exc)
         return ("", "", "")
@@ -371,29 +375,30 @@ def ocr_size_chart(
         return ("", "", "")
 
     try:
-        im = Image.open(io.BytesIO(resp.content)).convert("L")  # grayscale
-        # Original image is already high-res (typically 2160×1600).
-        # Avoid upscaling — tesseract handles this resolution well.
+        from PIL import Image
+        import numpy as np
+        im = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        img_array = np.array(im)
     except Exception as exc:
         logger.warning("Failed to open image %s: %s", img_url, exc)
         return ("", "", "")
 
-    # Run OCR with sparse text mode — best for table images
+    # Run EasyOCR — returns [(bbox, text, confidence), ...]
+    # bbox: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]  (top-left, top-right, bottom-right, bottom-left)
     try:
-        data = pytesseract.image_to_data(im, config="--psm 11", output_type=Output.DICT)
+        ocr_results = reader.readtext(img_array)
     except Exception as exc:
-        logger.warning("Tesseract failed on %s: %s", img_url, exc)
+        logger.warning("EasyOCR failed on %s: %s", img_url, exc)
         return ("", "", "")
 
-    # Build word list with spatial info
+    # Build word list with spatial info: (text, x_center, y_center, conf_0_to_100)
     words = []
-    for i in range(len(data["text"])):
-        txt = data["text"][i].strip()
-        conf = int(data["conf"][i])
-        if conf > 20 and txt:
-            x = data["left"][i] + data["width"][i] // 2
-            y = data["top"][i] + data["height"][i] // 2
-            words.append((txt, x, y, conf))
+    for (bbox, text, conf) in ocr_results:
+        txt = text.strip()
+        if conf > 0.2 and txt:
+            x_center = int((bbox[0][0] + bbox[1][0]) / 2)
+            y_center = int((bbox[0][1] + bbox[2][1]) / 2)
+            words.append((txt, x_center, y_center, int(conf * 100)))
 
     if not words:
         logger.warning("OCR returned no words for %s", img_url)
