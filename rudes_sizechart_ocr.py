@@ -136,10 +136,24 @@ def get_all_products(session: requests.Session, logger: logging.Logger) -> List[
 # ---------------------------------------------------------------------------
 _TRIPLE_UNDERSCORE = re.compile(r"https?://[^\"'<> )]*___[^\"'<> )]+", re.IGNORECASE)
 
+# Fallback: any .webp uploaded to the /files/ CDN path (distinct from /products/ product photos)
+_CDN_FILES_WEBP = re.compile(
+    r"https://cdn\.shopify\.com/s/files/1/0792/0563/0243/files/"
+    r"[^\"'<> )]+\.webp(?:\?[^\"'<> )]*)?",
+    re.IGNORECASE,
+)
+
 
 def find_size_chart_url(html_text: str) -> Optional[str]:
-    """Return the first Shopify CDN image URL that contains '___'."""
+    """Return a size-chart image URL from the page HTML.
+
+    Prefers URLs with '___' (naming convention for Rudes size-chart images).
+    Falls back to any .webp in the /files/ CDN path when '___' is absent.
+    """
     matches = _TRIPLE_UNDERSCORE.findall(html_text)
+    if matches:
+        return matches[0]
+    matches = _CDN_FILES_WEBP.findall(html_text)
     return matches[0] if matches else None
 
 
@@ -221,7 +235,7 @@ def _normalise_measurement(raw: str) -> str:
 
     if base == int(base):
         return str(int(base))
-    return f'{base:.3f}'
+    return f'{base:.3f}'.rstrip('0').rstrip('.')
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +510,10 @@ def _parse_number_like(s: str) -> str:
     s = s.replace("“", '"').replace("”", '"').replace("″", '"').replace("'", "'")
     s = s.replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4")
     s = s.replace('"', "").strip()
+    # Range values like "11/12" (two multi-digit numbers, no space) are size ranges,
+    # not fractions — return "" so the field stays blank rather than capturing "11".
+    if re.fullmatch(r'\d{2,}/\d{2,}', s):
+        return ""
     m = re.search(r"(-?\d+(?:\.\d+)?)(?:\s+(\d+)/(\d+))?", s)
     if not m:
         return s.strip()
@@ -504,7 +522,7 @@ def _parse_number_like(s: str) -> str:
         base += float(m.group(2)) / float(m.group(3))
     if base == int(base):
         return str(int(base))
-    return f'{base:.3f}'
+    return f'{base:.3f}'.rstrip('0').rstrip('.')
 
 
 def extract_measures_from_body(body_html: str) -> Tuple[str, str, str]:
@@ -645,8 +663,11 @@ def main() -> None:
                 notes = "ocr_returned_empty"
 
         if not any([rise, inseam, leg_opening]):
-            # Fallback: parse product description
-            rise, inseam, leg_opening = extract_measures_from_body(body_html)
+            # Fallback: parse measurement text from the page.
+            # Prefer pdp_html (full rendered page) over products.json body_html because
+            # measurement text lives in metafields rendered by Liquid, not in body_html.
+            html_for_fallback = pdp_html or body_html
+            rise, inseam, leg_opening = extract_measures_from_body(html_for_fallback)
             if any([rise, inseam, leg_opening]):
                 source = "body_html"
                 if notes:
