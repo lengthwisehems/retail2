@@ -210,6 +210,18 @@ def _normalise_measurement(raw: str) -> str:
         s,
     )
 
+    # Handle OCR artefact: letter between digit and fraction slash (e.g. "11V/2" → "11 1/2")
+    # EasyOCR sometimes reads the "1" numerator as "V", "l", "I", etc.
+    s = re.sub(
+        r'(\d)([A-Za-z])(/\d)',
+        lambda m: '{} {}{}'.format(
+            m.group(1),
+            _LETTER_TO_NUMBER.get(m.group(2).upper(), '1'),
+            m.group(3),
+        ),
+        s,
+    )
+
     # Handle patterns like "217/8" → "21 7/8",  "121/2" → "12 1/2"
     s = re.sub(r"(\d{2,3})(\d)(\/\d)", r"\1 \2\3", s)
 
@@ -510,10 +522,11 @@ def _parse_number_like(s: str) -> str:
     s = s.replace("“", '"').replace("”", '"').replace("″", '"').replace("'", "'")
     s = s.replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4")
     s = s.replace('"', "").strip()
-    # Range values like "11/12" (two multi-digit numbers, no space) are size ranges,
-    # not fractions — return "" so the field stays blank rather than capturing "11".
+    # Range values like "11/12" (two multi-digit numbers, no space) are size ranges;
+    # use the higher value (e.g. 12 from "11/12") since that is the listed measurement.
     if re.fullmatch(r'\d{2,}/\d{2,}', s):
-        return ""
+        parts = s.split('/')
+        return str(max(int(parts[0]), int(parts[1])))
     m = re.search(r"(-?\d+(?:\.\d+)?)(?:\s+(\d+)/(\d+))?", s)
     if not m:
         return s.strip()
@@ -544,8 +557,13 @@ def extract_measures_from_body(body_html: str) -> Tuple[str, str, str]:
         return ""
 
     rise_patterns = [
-        r"(?:Front )?Rise:\s*([0-9][^,;|<\n]*)",   # "Rise: 13""
-        r"\|\s*Rise\s+([0-9][^,;|<\n]*)",           # "| Rise 13""
+        # Try explicit fraction first (e.g. "Rise: 11 1/2"") — the space before the
+        # fraction distinguishes it from range values like "Rise: 11/12"" which appear
+        # earlier in the HTML in a generic size-26 block.
+        r"(?:Front )?Rise:\s*(\d+\s+\d+/\d+[^,;|<\n]*)",   # fractional: "Rise: 11 1/2""
+        r"\|\s*Rise\s+(\d+\s+\d+/\d+[^,;|<\n]*)",           # pipe+fraction
+        r"(?:Front )?Rise:\s*([0-9][^,;|<\n]*)",             # general (catches range "11/12")
+        r"\|\s*Rise\s+([0-9][^,;|<\n]*)",                    # pipe general
     ]
     inseam_patterns = [
         r"Inseam:\s*([0-9][^,;|<\n]*)",             # "Inseam: 32""
