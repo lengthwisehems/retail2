@@ -13,7 +13,7 @@ Output: Output/rudes_sizechart_ocr_<timestamp>.xlsx
 
 Requirements
 ------------
-  pip install easyocr pillow openpyxl requests
+  pip install easyocr pillow openpyxl requests beautifulsoup4
   (No external binary needed — EasyOCR bundles its own models.)
   First run downloads ~100 MB of model weights to ~/.EasyOCR/model/
 """
@@ -155,6 +155,25 @@ def find_size_chart_url(html_text: str) -> Optional[str]:
         return matches[0]
     matches = _CDN_FILES_WEBP.findall(html_text)
     return matches[0] if matches else None
+
+
+def _has_size_chart_link(pdp_html: str) -> bool:
+    """Return True if the PDP contains the 'size chart' link.
+
+    On rudesdenim.com the presence of a size chart is indicated by an
+    <a class="product__info__link"> element with text "size chart".  This link
+    is present for every product that has a size-chart image and absent for
+    products that don't — making it a reliable gate before attempting OCR.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        # BeautifulSoup not installed: fall back to a fast regex check
+        return bool(re.search(r'product__info__link', pdp_html, re.I)
+                    and re.search(r'size\s+chart', pdp_html, re.I))
+    soup = BeautifulSoup(pdp_html, "html.parser")
+    link = soup.find("a", class_="product__info__link")
+    return link is not None and "size chart" in link.get_text(strip=True).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -653,37 +672,45 @@ def main() -> None:
 
         logger.info("[%d/%d] %s — %s", n, len(handles), handle, title)
 
-        # ── Fetch PDP HTML to find size-chart image URL ──────────────────────
+        # ── Fetch PDP HTML ────────────────────────────────────────────────────
         from urllib.parse import urlsplit
         parts = urlsplit(COLLECTION_URL)
         pdp_url = f"{parts.scheme}://{parts.netloc}/products/{handle}"
-        size_chart_url = ""
         pdp_html = ""
         try:
             resp = session.get(pdp_url, timeout=REQUEST_TIMEOUT)
             if resp.ok:
                 pdp_html = resp.text
-                size_chart_url = find_size_chart_url(pdp_html) or ""
         except Exception as exc:
             logger.warning("PDP fetch failed for %s: %s", handle, exc)
 
-        # ── Measurements ─────────────────────────────────────────────────────
+        # ── Measurements — new order of operations ────────────────────────────
+        # 1. Check for a "size chart" link.  If present → find the image URL and OCR it.
+        # 2. If no size chart link → go straight to HTML measurement parsing (skips OCR).
         rise = inseam = leg_opening = ""
+        size_chart_url = ""
         source = "not_found"
         notes = ""
 
-        if size_chart_url:
-            logger.info("  Size chart found: %s", size_chart_url)
-            rise, inseam, leg_opening = ocr_size_chart(session, size_chart_url, TARGET_SIZE, logger)
-            if any([rise, inseam, leg_opening]):
-                source = "ocr"
+        if pdp_html and _has_size_chart_link(pdp_html):
+            # Step 1: locate the image URL (try ___ first, then CDN /files/*.webp)
+            size_chart_url = find_size_chart_url(pdp_html) or ""
+            if size_chart_url:
+                logger.info("  Size chart found: %s", size_chart_url)
+                rise, inseam, leg_opening = ocr_size_chart(session, size_chart_url, TARGET_SIZE, logger)
+                if any([rise, inseam, leg_opening]):
+                    source = "ocr"
+                else:
+                    notes = "ocr_returned_empty"
             else:
-                notes = "ocr_returned_empty"
+                logger.info("  Size chart link present but no image URL found")
+                notes = "size_chart_link_but_no_url"
+        else:
+            logger.debug("  No size chart link — using HTML measurement parsing")
 
         if not any([rise, inseam, leg_opening]):
-            # Fallback: parse measurement text from the page.
-            # Prefer pdp_html (full rendered page) over products.json body_html because
-            # measurement text lives in metafields rendered by Liquid, not in body_html.
+            # Prefer pdp_html over products.json body_html: measurement text is in
+            # Liquid-rendered metafields visible on the PDP but absent from body_html.
             html_for_fallback = pdp_html or body_html
             rise, inseam, leg_opening = extract_measures_from_body(html_for_fallback)
             if any([rise, inseam, leg_opening]):
