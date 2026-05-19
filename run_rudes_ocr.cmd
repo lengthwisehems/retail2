@@ -78,9 +78,33 @@ goto :AfterAzCopy
 
   set "AZCOPY_AUTO_LOGIN_TYPE=MSI"
 
+  REM ---------- Locate or download AzCopy ----------
+  set "AZCOPY_BIN=%HOME%\data\azcopy_bin"
   azcopy --version >nul 2>&1
   if errorlevel 1 (
-    echo([WARN] AzCopy is not available in PATH. Skipping upload.
+    if exist "%AZCOPY_BIN%\azcopy.exe" (
+      set "PATH=%AZCOPY_BIN%;%PATH%"
+    ) else (
+      echo AzCopy not found in PATH; downloading to %AZCOPY_BIN%...
+      if not exist "%AZCOPY_BIN%" mkdir "%AZCOPY_BIN%"
+      powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile '%TEMP%\azcopy.zip' -UseBasicParsing"
+      if errorlevel 1 (
+        echo([WARN] Failed to download AzCopy. Skipping upload.
+        exit /b 0
+      )
+      powershell -NoProfile -Command "Expand-Archive -Path '%TEMP%\azcopy.zip' -DestinationPath '%TEMP%\azcopy_extracted' -Force; Get-ChildItem '%TEMP%\azcopy_extracted' -Recurse -Filter 'azcopy.exe' | Select-Object -First 1 | Copy-Item -Destination '%AZCOPY_BIN%\azcopy.exe' -Force"
+      if errorlevel 1 (
+        echo([WARN] Failed to extract AzCopy. Skipping upload.
+        exit /b 0
+      )
+      set "PATH=%AZCOPY_BIN%;%PATH%"
+      echo AzCopy installed to %AZCOPY_BIN%.
+    )
+  )
+
+  azcopy --version >nul 2>&1
+  if errorlevel 1 (
+    echo([WARN] AzCopy still not available after download attempt. Skipping upload.
     exit /b 0
   )
 
