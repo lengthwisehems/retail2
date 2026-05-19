@@ -83,7 +83,7 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Accent Hardware", "Ankle", "Belted", "Cargo", "Chap", "Coated",
     "Constructed", "Corduroy", "Crop", "Cropped", "Crushed", "Crystal",
     "Cuff", "Cuffed", "Cutoff", "Cut-out", "Darted", "Destroyed",
-    "Drawstring", "Fit", "Flag", "Flap", "Flip", "Frayed Seam",
+    "Drawstring", "Fit", "Flag", "Flap", "Flip", "Frayed Seam", "Mini",
     "Front Yoke", "Frontier", "High Rise", "High-Rise", "Inch", "Inset",
     "Jean", "Krystal", "Leather", "Lightweight", "Lo", "Long", "Low Rise",
     "Low-Rise", "Mid Rise", "Mid-Rise", "Ms.", "Pant", "Pants", "Patch",
@@ -492,16 +492,18 @@ def extract_measures_from_text(text: str) -> Tuple[str, str, str]:
         return ""
 
     rise = grab([
-        r"(?:Front\s+)?Rise\s*:\s*([0-9][^,;|<\n]*)",
-        r"\|\s*Rise\s+([0-9][^,;|<\n]*)",
+        r'(?:Front\s+)?Rise\s*:\s*([0-9][^,;|<\n"]*)',
+        r'\|\s*Rise\s+([0-9][^,;|<\n"]*)',
     ])
     inseam = grab([
-        r"Inseam\s*:\s*([0-9][^,;|<\n]*)",
-        r":\s*Inseam\s+([0-9][^,;|<\n]*)",
+        r'Inseam\s*:\s*([0-9][^,;|<\n"]*)',
+        r':\s*Inseam\s+([0-9][^,;|<\n"]*)',
+        r'Inseam\s+([0-9][^,;|<\n"]*)',
+        r'\|\s*Inseam\s+([0-9][^,;|<\n"]*)',
     ])
     leg = grab([
-        r"Leg\s+Opening\s*:\s*([0-9][^,;|<\n(]*)",
-        r"Leg\s+Openning\s*:\s*([0-9][^,;|<\n(]*)",
+        r'Leg\s+Opening\s*:\s*([0-9][^,;|<\n"(]*)',
+        r'Leg\s+Openning\s*:\s*([0-9][^,;|<\n"(]*)',
     ])
     return rise, inseam, leg
 
