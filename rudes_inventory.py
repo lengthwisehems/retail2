@@ -35,7 +35,7 @@ COLLECTION_HANDLE = "shop-all"
 SLEEP             = 0.3
 # Set True only if EasyOCR is installed and you want size-chart OCR measurements.
 # Leave False (default) to use description-text measurements only (much faster).
-OCR_ENABLED       = False
+OCR_ENABLED       = True
 OCR_TARGET_SIZE   = "26"   # size column to read from the size chart image
 
 BASE_DIR   = Path(__file__).resolve().parent
@@ -651,7 +651,7 @@ def _straight_bucket(leg_opening: str) -> str:
     lo = to_float(leg_opening)
     if lo is None:
         return ""
-    if lo < 15.5:
+    if lo < 15:
         return "Straight from Knee"
     if lo <= 17:
         return "Straight from Knee/Thigh"
@@ -701,7 +701,7 @@ def derive_jean_style(
         return "Barrel"
     if contains_phrase(d, "skinny"):
         return "Skinny"
-    if text_has_any(d, ("baggy", "cargo")):
+    if contains_phrase(d, "baggy"):
         return "Baggy"
     if text_has_any(d, ("flare", "balanced silhouette")):
         return "Flare"
@@ -789,7 +789,7 @@ def derive_inseam_style(jean_style: str, inseam_label: str, inseam: str) -> str:
     if val is None:
         return ""
     is_petite = inseam_label == "Petite"
-    if jean_style in _NON_TAPER:
+    if jean_style in _NON_TAPER or not jean_style:
         if is_petite:
             if val <= 25:  return "Cropped"
             if val < 28:   return "Ankle"
@@ -977,6 +977,17 @@ def derive_color_simplified(color: str, description: str, standardized: str) -> 
                          "medium-to-dark", "dark medium", "medium/dark",
                          "dark/medium", "medium-dark", "dark-medium")):
         return "Medium to Dark"
+    if text_has_any(d, ("mid blue", "mid-blue", "medium stone wash",
+                         "classic stone washed blue", "vintage washed blue",
+                         "classic vintage blue", "medium blue", "medium wash",
+                         "classic blue", "medium-blue wash",
+                         "mid-tone blue wash", "perfectly blended wash")):
+        return "Medium"
+    if text_has_any(d, ("light blue", "pale blue", "light vintage", "soft blue",
+                         "soft pink", "ecru", "white", "acid wash", "acid-wash",
+                         "light", "khaki", "tan", "ivory", "light gray wash",
+                         "light silver-blue", "light wash", "lighter accents")):
+        return "Light"
     if text_has_any(d, ("dark", "deep", "black", "wine", "burgundy",
                          "midnight blue", "forest green", "navy",
                          "complex wash", "darker", "deep yet tranquil hue",
@@ -984,17 +995,6 @@ def derive_color_simplified(color: str, description: str, standardized: str) -> 
                          "rich yet subtle", "rich, deep blue",
                          "urbane grey wash")):
         return "Dark"
-    if text_has_any(d, ("light blue", "pale blue", "light vintage", "soft blue",
-                         "soft pink", "ecru", "white", "acid wash", "acid-wash",
-                         "light", "khaki", "tan", "ivory", "light gray wash",
-                         "light silver-blue", "light wash", "lighter accents")):
-        return "Light"
-    if text_has_any(d, ("mid blue", "mid-blue", "medium stone wash",
-                         "classic stone washed blue", "vintage washed blue",
-                         "classic vintage blue", "medium blue", "medium wash",
-                         "classic blue", "medium-blue wash",
-                         "mid-tone blue wash", "perfectly blended wash")):
-        return "Medium"
     return ""
 
 
@@ -1073,9 +1073,8 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
 
 
 def apply_jean_style_inference(rows: List[List[str]]) -> None:
-    """Step 3: infer Jean Style from siblings with same stripped title + leg opening."""
+    """Step 3: infer Jean Style from siblings sharing the same PRODUCT_TITLE_NO_STYLING."""
     idx_js  = IDX["Jean Style"]
-    idx_leg = IDX["Leg Opening"]
     idx_pro = IDX["Product"]
 
     _cache: Dict[int, str] = {}
@@ -1089,13 +1088,11 @@ def apply_jean_style_inference(rows: List[List[str]]) -> None:
         if row[idx_js]:
             continue
         my = stripped(i)
-        leg = row[idx_leg]
         matches = [
             rows[j][idx_js] for j in range(len(rows))
             if j != i
             and rows[j][idx_js]
             and stripped(j) == my
-            and rows[j][idx_leg] == leg
         ]
         if matches:
             row[idx_js] = max(set(matches), key=matches.count)
@@ -1359,10 +1356,10 @@ class RudesScraper:
                 log("Progress: %s/%s products (%s rows)",
                     idx, len(products), len(rows))
 
-        log("Post-processing: Style Name rules...")
-        apply_style_name_rules(rows)
         log("Post-processing: Jean Style inference...")
         apply_jean_style_inference(rows)
+        log("Post-processing: Style Name rules...")
+        apply_style_name_rules(rows)
         log("Post-processing: Inseam Label refresh...")
         apply_inseam_label_refresh(rows)
         log("Post-processing: Inseam Style refresh...")
