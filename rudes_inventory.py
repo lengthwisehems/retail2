@@ -36,6 +36,7 @@ SLEEP             = 0.3
 # Set True only if EasyOCR is installed and you want size-chart OCR measurements.
 # Leave False (default) to use description-text measurements only (much faster).
 OCR_ENABLED       = False
+OCR_TARGET_SIZE   = "26"   # size column to read from the size chart image
 
 BASE_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
@@ -519,9 +520,11 @@ def get_measurements(
     pdp_html: str,
     description: str,
     unique_sizes: List[str],
-    ocr_cache: Dict[Tuple[str, str], Tuple[str, str, str]],
+    ocr_cache: Dict[str, Tuple[str, str, str]],   # keyed by url only
 ) -> Tuple[Dict[str, Tuple[str, str, str]], str]:
-    """Return ({size: (rise, inseam, leg)}, size_chart_url)."""
+    """Return ({size: (rise, inseam, leg)}, size_chart_url).
+    OCR runs at most once per unique image URL (for OCR_TARGET_SIZE='26').
+    """
     desc_meas = extract_measures_from_text(description)
     size_chart_url = ""
 
@@ -531,17 +534,19 @@ def get_measurements(
     if not size_chart_url or not _OCR_AVAILABLE or not OCR_ENABLED:
         return {s: desc_meas for s in unique_sizes}, size_chart_url
 
-    result: Dict[str, Tuple[str, str, str]] = {}
-    for size in unique_sizes:
-        cache_key = (size_chart_url, size)
-        if cache_key in ocr_cache:
-            result[size] = ocr_cache[cache_key]
-        else:
-            r, i, lo = _ocr_size_chart(session, size_chart_url, size, LOGGER)
-            merged = (r or desc_meas[0], i or desc_meas[1], lo or desc_meas[2])
-            ocr_cache[cache_key] = merged
-            result[size] = merged
-    return result, size_chart_url
+    # OCR once per image URL
+    if size_chart_url not in ocr_cache:
+        log("OCR: reading size chart for target size %s — %s",
+            OCR_TARGET_SIZE, size_chart_url[-70:])
+        r, i, lo = _ocr_size_chart(
+            session, size_chart_url, OCR_TARGET_SIZE, LOGGER)
+        ocr_cache[size_chart_url] = (
+            r or desc_meas[0],
+            i or desc_meas[1],
+            lo or desc_meas[2],
+        )
+    meas = ocr_cache[size_chart_url]
+    return {s: meas for s in unique_sizes}, size_chart_url
 
 
 # ===========================================================================
@@ -1155,7 +1160,7 @@ class RudesScraper:
     def __init__(self) -> None:
         self.session   = make_session()
         self._pdp_cache: Dict[str, str] = {}
-        self._ocr_cache: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
+        self._ocr_cache: Dict[str, Tuple[str, str, str]] = {}
 
     def _get_pdp_html(self, handle: str) -> str:
         if handle not in self._pdp_cache:
