@@ -50,7 +50,7 @@ CSV_HEADERS = [
     "Style Id", "Handle", "Published At", "Created At",
     "Product", "Style Name", "Product Type", "Tags", "Vendor",
     "Description", "Variant Title", "Color", "Size",
-    "Front Rise", "Inseam", "Leg Opening", "Size Chart",
+    "Rise", "Inseam", "Leg Opening", "Size Chart",
     "Price", "Compare at Price", "Available for Sale",
     "Quantity Available", "Quantity of Style",
     "SKU - Shopify", "SKU - Brand", "Barcode",
@@ -67,7 +67,7 @@ EXCLUDE_TITLE_WORDS: List[str] = [
     "Bodysuits", "Button Up", "Capri", "Cardigans", "Clothing Tops", "Coat",
     "Coats & Jackets", "Core Handbags", "Crop Tops", "Denim Shorts", "Dress",
     "Dresses", "Fashion Core Handbags", "Fashion Handbags", "Handbag",
-    "Hoodies", "Jacket", "Jackets", "Jogger Shorts", "Jort", "Jumpsuits",
+    "Hoodies", "Jacket", "Jackets", "Jogger Shorts", "Jort", "Jumpsuit", "Jumpsuits",
     "Long Sleeve", "Neck", "One-Pieces", "Outerwear", "Pant Suits", "Purse",
     "Romper", "Rompers", "Shacket", "Shipping Protection", "Shirt", "Shirts",
     "Shirts & Tops", "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Suits",
@@ -224,7 +224,12 @@ def parse_mixed_fraction(raw: str) -> Optional[float]:
     m = re.fullmatch(r"(\d+)/(\d+)", s)
     if m:
         n, d = int(m.group(1)), int(m.group(2))
-        return n / d if d else None
+        if not d:
+            return None
+        # "11/12" in descriptions means a measurement range; take the higher value
+        if n >= 5:
+            return float(d)
+        return n / d
     try:
         return float(s)
     except ValueError:
@@ -487,8 +492,6 @@ def extract_measures_from_text(text: str) -> Tuple[str, str, str]:
         return ""
 
     rise = grab([
-        r"(?:Front\s+)?Rise\s*:\s*(\d+\s+\d+/\d+[^,;|<\n]*)",
-        r"\|\s*Rise\s+(\d+\s+\d+/\d+[^,;|<\n]*)",
         r"(?:Front\s+)?Rise\s*:\s*([0-9][^,;|<\n]*)",
         r"\|\s*Rise\s+([0-9][^,;|<\n]*)",
     ])
@@ -1013,11 +1016,13 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
     idx_pro = IDX["Product"]
     idx_sn  = IDX["Style Name"]
     idx_leg = IDX["Leg Opening"]
+    idx_js  = IDX["Jean Style"]
 
-    # Rule 1: same first word + same leg opening → most-frequent style name
+    # Rule 1: products with the same first word of their style-name base but
+    # different rest → if same leg opening, fill with the most-frequent name.
     by_first: Dict[str, List[List[str]]] = {}
     for row in rows:
-        fw = (row[idx_pro].split(" ", 1)[0]).strip().lower()
+        fw = (row[idx_sn].split(" ", 1)[0] if row[idx_sn] else "").strip().lower()
         if fw:
             by_first.setdefault(fw, []).append(row)
 
@@ -1033,34 +1038,35 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
             if not non_mat:
                 continue
             snames = [r[idx_sn] for r in non_mat if r[idx_sn]]
-            if not snames or len(set(snames)) <= 1:
+            if len(set(snames)) <= 1:
                 continue
             most_common = max(set(snames), key=snames.count)
             for r in non_mat:
                 r[idx_sn] = most_common
 
     # Rule 2: one-word style names
-    idx_js = IDX["Jean Style"]
     for row in rows:
         sn = row[idx_sn].strip()
         if not sn or len(sn.split()) != 1:
             continue
-        fw = (row[idx_pro].split(" ", 1)[0]).strip().lower()
         leg = row[idx_leg]
-        # 2a: siblings with same first word + leg opening that are multi-word
+        # 2a: siblings whose style name starts with the same first word and
+        # already has multiple words → take the most frequent
         candidates = [
             r[idx_sn] for r in rows
-            if (r[idx_pro].split(" ", 1)[0]).strip().lower() == fw
+            if (r[idx_sn].split(" ", 1)[0] if r[idx_sn] else "").strip().lower()
+               == sn.lower()
             and r[idx_leg] == leg
             and len(r[idx_sn].split()) > 1
         ]
         if candidates:
             row[idx_sn] = max(set(candidates), key=candidates.count)
             continue
-        # 2b: prepend first word of Jean Style
+        # 2b: append Jean Style label (strip "from ..." bucket suffix)
         js = row[idx_js]
         if js:
-            row[idx_sn] = f"{sn} {js.split()[0]}".strip()
+            js_label = js.split(" from ")[0].strip()
+            row[idx_sn] = f"{sn} {js_label}".strip()
         # 2c: keep single word as-is
 
 
@@ -1119,11 +1125,11 @@ def apply_rise_label_inference(rows: List[List[str]]) -> None:
                     if _col(r, "Style Name") == sn and _col(r, "Rise Label")]
         if not siblings:
             continue
-        rv = to_float(_col(row, "Front Rise"))
+        rv = to_float(_col(row, "Rise"))
         if rv is not None:
             best = min(
                 siblings,
-                key=lambda r: abs((to_float(_col(r, "Front Rise")) or 999) - rv),
+                key=lambda r: abs((to_float(_col(r, "Rise")) or 999) - rv),
             )
             _set(row, "Rise Label", _col(best, "Rise Label"))
         else:
@@ -1224,6 +1230,10 @@ class RudesScraper:
             if not description:
                 description = strip_html(product.get("description") or "")
 
+            if contains_phrase(description.lower(), "jumpsuit"):
+                log("Skip (jumpsuit in description): %s", handle)
+                continue
+
             product_type = derive_product_type(title, description)
 
             unique_sizes = list({
@@ -1321,7 +1331,7 @@ class RudesScraper:
                 _set(row, "Variant Title",        variant_title)
                 _set(row, "Color",                color)
                 _set(row, "Size",                 size)
-                _set(row, "Front Rise",           raw_rise)
+                _set(row, "Rise",           raw_rise)
                 _set(row, "Inseam",               raw_inseam)
                 _set(row, "Leg Opening",          leg_opening)
                 _set(row, "Size Chart",           size_chart_url)
