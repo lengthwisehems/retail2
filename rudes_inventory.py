@@ -33,6 +33,9 @@ HOST_ROTATION = [
 PDP_HOST          = "https://rudesdenim.com"
 COLLECTION_HANDLE = "shop-all"
 SLEEP             = 0.3
+# Set True only if EasyOCR is installed and you want size-chart OCR measurements.
+# Leave False (default) to use description-text measurements only (much faster).
+OCR_ENABLED       = False
 
 BASE_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
@@ -525,7 +528,7 @@ def get_measurements(
     if pdp_html and has_size_chart_link(pdp_html):
         size_chart_url = find_size_chart_url(pdp_html) or ""
 
-    if not size_chart_url or not _OCR_AVAILABLE:
+    if not size_chart_url or not _OCR_AVAILABLE or not OCR_ENABLED:
         return {s: desc_meas for s in unique_sizes}, size_chart_url
 
     result: Dict[str, Tuple[str, str, str]] = {}
