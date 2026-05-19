@@ -511,6 +511,9 @@ def extract_measures_from_text(text: str) -> Tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # OCR integration (from rudes_sizechart_ocr)
 # ---------------------------------------------------------------------------
+import sys as _sys
+if str(BASE_DIR) not in _sys.path:
+    _sys.path.insert(0, str(BASE_DIR))
 try:
     from rudes_sizechart_ocr import ocr_size_chart as _ocr_size_chart  # type: ignore
     _OCR_AVAILABLE = True

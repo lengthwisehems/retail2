@@ -59,7 +59,7 @@ if errorlevel 1 (
 "%PY%" -V
 
 REM ---------- Run Rudes scraper (OCR_ENABLED = True in rudes_inventory.py) ----------
-call :RunScraper "Rudes" "%ROOT%Rudes\rudes_inventory.py" "%OUT%\Rudes\Output" "%LOGS%\Rudes\rudes_ocr_run.log"
+call :RunScraper "Rudes" "%ROOT%Rudes\rudes_inventory_ocr.py" "%OUT%\Rudes\Output" "%LOGS%\Rudes\rudes_ocr_run.log"
 call :UpdateFinalExit %ERRORLEVEL%
 
 REM ===== Upload output to Blob Storage via Managed Identity =====
@@ -87,12 +87,12 @@ goto :AfterAzCopy
     ) else (
       echo AzCopy not found in PATH; downloading to %AZCOPY_BIN%...
       if not exist "%AZCOPY_BIN%" mkdir "%AZCOPY_BIN%"
-      powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile '%TEMP%\azcopy.zip' -UseBasicParsing"
+      powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile '%TEMP%\azcopy.zip' -UseBasicParsing"
       if errorlevel 1 (
         echo([WARN] Failed to download AzCopy. Skipping upload.
         exit /b 0
       )
-      powershell -NoProfile -Command "Expand-Archive -Path '%TEMP%\azcopy.zip' -DestinationPath '%TEMP%\azcopy_extracted' -Force; Get-ChildItem '%TEMP%\azcopy_extracted' -Recurse -Filter 'azcopy.exe' | Select-Object -First 1 | Copy-Item -Destination '%AZCOPY_BIN%\azcopy.exe' -Force"
+      powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Expand-Archive -Path '%TEMP%\azcopy.zip' -DestinationPath '%TEMP%\azcopy_extracted' -Force; Get-ChildItem '%TEMP%\azcopy_extracted' -Recurse -Filter 'azcopy.exe' | Select-Object -First 1 | Copy-Item -Destination '%AZCOPY_BIN%\azcopy.exe' -Force"
       if errorlevel 1 (
         echo([WARN] Failed to extract AzCopy. Skipping upload.
         exit /b 0
