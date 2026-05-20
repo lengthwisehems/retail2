@@ -1,0 +1,168 @@
+[05/20/2026 20:36:39 > 3b0ec1: SYS INFO] Status changed to Initializing
+[05/20/2026 20:36:39 > 3b0ec1: SYS INFO] Job directory change detected: Job file 'run.cmd' timestamp differs between source and working directories.
+[05/20/2026 20:36:49 > 3b0ec1: SYS INFO] Run script 'run.cmd' with script host - 'WindowsScriptHost'
+[05/20/2026 20:36:49 > 3b0ec1: SYS INFO] Status changed to Running
+[05/20/2026 20:36:50 > 3b0ec1: INFO] Ensuring required Python packages...
+[05/20/2026 20:37:05 > 3b0ec1: INFO] Packages verified.
+[05/20/2026 20:37:05 > 3b0ec1: INFO] Python 3.11.1
+[05/20/2026 20:37:12 > 3b0ec1: INFO] [OK] ABrand generated 83 CSVs under C:\home\data\outputs\ABrand\Output; largest 2660178 bytes; sample ABRAND_2026-02-19_16-17-34.csv.
+[05/20/2026 20:44:07 > 3b0ec1: INFO] [OK] AGJeans generated 75 CSVs under C:\home\data\outputs\AGJeans\Output; largest 4012293 bytes; sample AGJEANS_2026-04-15_17-27-32.csv.
+[05/20/2026 20:45:12 > 3b0ec1: INFO] [OK] AMO generated 76 CSVs under C:\home\data\outputs\AMO\Output; largest 604510 bytes; sample AMO_2026-02-19_16-17-55.csv.
+[05/20/2026 20:45:29 > 3b0ec1: INFO] [OK] AnineBing generated 43 CSVs under C:\home\data\outputs\AnineBing\Output; largest 362909 bytes; sample ANINEBING_2026-04-15_17-21-06.csv.
+[05/20/2026 20:46:12 > 3b0ec1: INFO] [OK] AYR generated 75 CSVs under C:\home\data\outputs\AYR\Output; largest 1959307 bytes; sample AYR_2026-02-19_16-19-03.csv.
+[05/20/2026 20:46:26 > 3b0ec1: INFO] [OK] BetroSimone generated 76 CSVs under C:\home\data\outputs\BetroSimone\Output; largest 151047 bytes; sample BETROSIMONE_2026-02-19_16-19-13.csv.
+[05/20/2026 20:56:32 > 3b0ec1: INFO] [OK] CitizensofHumanity generated 73 CSVs under C:\home\data\outputs\CitizensofHumanity\Output; largest 4905677 bytes; sample CITIZENSOFHUMANITY_2026-02-19_16-28-02.csv.
+[05/20/2026 20:56:52 > 3b0ec1: INFO] [OK] DL1961 generated 72 CSVs under C:\home\data\outputs\DL1961\Output; largest 3894684 bytes; sample DL1961_2026-04-15_22-46-50.csv.
+[05/20/2026 20:57:39 > 3b0ec1: INFO] [OK] EBdenim generated 72 CSVs under C:\home\data\outputs\EBdenim\Output; largest 778825 bytes; sample EBdenim_2026-04-15_17-47-38.csv.
+[05/20/2026 20:59:46 > 3b0ec1: INFO] [OK] Edyson generated 73 CSVs under C:\home\data\outputs\Edyson\Output; largest 692650 bytes; sample EDYSON_2025-11-04_18-52-50.csv.
+[05/20/2026 21:00:00 > 3b0ec1: INFO] [OK] FavoriteDaughter generated 72 CSVs under C:\home\data\outputs\FavoriteDaughter\Output; largest 1390080 bytes; sample FAVORITEDAUGHTER_2026-04-15_17-51-07.csv.
+[05/20/2026 21:00:07 > 3b0ec1: INFO] [OK] Fidelity generated 72 CSVs under C:\home\data\outputs\Fidelity\Output; largest 393561 bytes; sample FIDELITY_2026-04-15_17-51-29.csv.
+[05/20/2026 21:00:24 > 3b0ec1: INFO] [OK] Frame generated 72 CSVs under C:\home\data\outputs\Frame\Output; largest 3199970 bytes; sample FRAME_2026-04-15_17-52-15.csv.
+[05/20/2026 21:01:06 > 3b0ec1: INFO] [OK] GoodAmerican generated 70 CSVs under C:\home\data\outputs\GoodAmerican\Output; largest 14798999 bytes; sample GOODAMERICAN_2026-04-15_17-53-17.csv.
+[05/20/2026 21:03:09 > 3b0ec1: INFO] [OK] Hudson generated 40 CSVs under C:\home\data\outputs\Hudson\Output; largest 3253532 bytes; sample HUDSON_2026-04-15_18-02-50.csv.
+[05/20/2026 21:03:34 > 3b0ec1: INFO] [OK] IconDenim generated 71 CSVs under C:\home\data\outputs\IconDenim\Output; largest 991593 bytes; sample ICON_2026-04-15_17-56-06.csv.
+[05/20/2026 21:08:31 > 3b0ec1: INFO] [OK] Ksubi generated 40 CSVs under C:\home\data\outputs\Ksubi\Output; largest 2417820 bytes; sample KSUBI_2026-04-15_18-08-24.csv.
+[05/20/2026 21:08:51 > 3b0ec1: INFO] [OK] LAgence generated 70 CSVs under C:\home\data\outputs\LAgence\Output; largest 2989656 bytes; sample LAGENCE_2026-04-15_17-58-29.csv.
+[05/20/2026 21:11:19 > 3b0ec1: INFO] [OK] MotherDenim generated 69 CSVs under C:\home\data\outputs\MotherDenim\Output; largest 5416182 bytes; sample MOTHER_2026-04-15_18-00-06.csv.
+[05/20/2026 21:11:24 > 3b0ec1: INFO] [OK] Neuw generated 70 CSVs under C:\home\data\outputs\Neuw\Output; largest 1099166 bytes; sample NEUW_2026-04-15_18-00-24.csv.
+[05/20/2026 21:14:37 > 3b0ec1: INFO] [OK] Paige generated 61 CSVs under C:\home\data\outputs\Paige\Output; largest 28279768 bytes; sample PAIGE_2026-04-20_19-11-51.csv.
+[05/20/2026 21:18:44 > 3b0ec1: INFO] [OK] Pistola generated 29 CSVs under C:\home\data\outputs\Pistola\Output; largest 2094357 bytes; sample PISTOLA_2026-05-06_12-41-00.csv.
+[05/20/2026 21:19:58 > 3b0ec1: INFO] [OK] RamyBrook generated 68 CSVs under C:\home\data\outputs\RamyBrook\Output; largest 633660 bytes; sample RAMY_2026-04-15_18-00-56.csv.
+[05/20/2026 21:20:37 > 3b0ec1: INFO] [OK] ReDone generated 69 CSVs under C:\home\data\outputs\ReDone\Output; largest 1943257 bytes; sample REDONE_2026-04-15_18-02-41.csv.
+[05/20/2026 21:20:44 > 3b0ec1: INFO] [OK] Rollas generated 69 CSVs under C:\home\data\outputs\Rollas\Output; largest 1770613 bytes; sample ROLLAS_2026-04-15_18-02-55.csv.
+[05/20/2026 21:22:08 > 3b0ec1: INFO] [OK] Rudes generated 74 CSVs under C:\home\data\outputs\Rudes\Output; largest 935599 bytes; sample RUDES_2025-11-04_18-59-56.csv.
+[05/20/2026 21:24:07 > 3b0ec1: INFO] [OK] Staud generated 67 CSVs under C:\home\data\outputs\Staud\Output; largest 883772 bytes; sample STAUD_2026-04-15_18-14-06.csv.
+[05/20/2026 21:24:36 > 3b0ec1: INFO] [OK] Triarchy generated 69 CSVs under C:\home\data\outputs\Triarchy\Output; largest 291439 bytes; sample TRIARCHY_2025-11-04_19-01-28.csv.
+[05/20/2026 21:24:45 > 3b0ec1: INFO] [OK] Warpweft generated 68 CSVs under C:\home\data\outputs\Warpweft\Output; largest 1389181 bytes; sample WARPWEFT_2026-04-15_18-07-10.csv.
+[05/20/2026 21:24:45 > 3b0ec1: INFO] Copying files to Azure Storage (Managed Identity)...
+[05/20/2026 21:24:46 > 3b0ec1: INFO] azcopy version 10.31.0
+[05/20/2026 21:24:47 > 3b0ec1: INFO] AZCOPY_LOG_LOCATION=C:\home\data\azcopy\logs
+[05/20/2026 21:24:47 > 3b0ec1: INFO] AZCOPY_JOB_PLAN_LOCATION=C:\home\data\azcopy\plans
+[05/20/2026 21:24:47 > 3b0ec1: INFO] AZCOPY_AUTO_LOGIN_TYPE=MSI
+[05/20/2026 21:24:47 > 3b0ec1: INFO] INFO: Scanning...
+[05/20/2026 21:24:48 > 3b0ec1: INFO] INFO: Authenticating to destination using Azure AD
+[05/20/2026 21:24:50 > 3b0ec1: INFO] INFO: Any empty folders will not be processed, because source and/or destination doesn't have full folder support
+[05/20/2026 21:24:52 > 3b0ec1: INFO] 
+[05/20/2026 21:24:52 > 3b0ec1: INFO] Job a63abfc2-2072-6649-72a0-46fc61356eba has started
+[05/20/2026 21:24:52 > 3b0ec1: INFO] Log file is located at: C:\home\data\azcopy\logs\a63abfc2-2072-6649-72a0-46fc61356eba.log
+[05/20/2026 21:24:52 > 3b0ec1: INFO] 
+[05/20/2026 21:24:54 > 3b0ec1: INFO] 
+[05/20/2026 21:24:56 > 3b0ec1: INFO] 0.1 %, 2 Done, 0 Failed, 1915 Pending, 126 Skipped, 2043 Total, 
+[05/20/2026 21:24:59 > 3b0ec1: INFO] 0.2 %, 4 Done, 0 Failed, 1665 Pending, 374 Skipped, 2043 Total, 
+[05/20/2026 21:25:01 > 3b0ec1: INFO] 0.4 %, 10 Done, 0 Failed, 1419 Pending, 614 Skipped, 2043 Total, 
+[05/20/2026 21:25:04 > 3b0ec1: INFO] 0.5 %, 14 Done, 0 Failed, 1212 Pending, 817 Skipped, 2043 Total, 
+[05/20/2026 21:25:06 > 3b0ec1: INFO] 0.8 %, 16 Done, 0 Failed, 1035 Pending, 992 Skipped, 2043 Total, 
+[05/20/2026 21:25:09 > 3b0ec1: INFO] 1.4 %, 23 Done, 0 Failed, 769 Pending, 1251 Skipped, 2043 Total, 
+[05/20/2026 21:25:11 > 3b0ec1: INFO] 1.5 %, 25 Done, 0 Failed, 521 Pending, 1497 Skipped, 2043 Total, 
+[05/20/2026 21:25:13 > 3b0ec1: INFO] 1.5 %, 27 Done, 0 Failed, 378 Pending, 1638 Skipped, 2043 Total, 
+[05/20/2026 21:25:15 > 3b0ec1: INFO] 1.6 %, 29 Done, 0 Failed, 189 Pending, 1825 Skipped, 2043 Total, 
+[05/20/2026 21:25:15 > 3b0ec1: INFO] 1.6 %, 31 Done, 0 Failed, 0 Pending, 2012 Skipped, 2043 Total,   
+[05/20/2026 21:25:15 > 3b0ec1: INFO] 
+[05/20/2026 21:25:15 > 3b0ec1: INFO] 
+[05/20/2026 21:25:15 > 3b0ec1: INFO] Job a63abfc2-2072-6649-72a0-46fc61356eba summary
+[05/20/2026 21:25:15 > 3b0ec1: INFO] Elapsed Time (Minutes): 0.398
+[05/20/2026 21:25:15 > 3b0ec1: INFO] Number of File Transfers: 2043
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Folder Property Transfers: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Symlink Transfers: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Total Number of Transfers: 2043
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of File Transfers Completed: 31
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Folder Transfers Completed: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of File Transfers Failed: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Folder Transfers Failed: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of File Transfers Skipped: 2012
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Folder Transfers Skipped: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Symbolic Links Skipped: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Hardlinks Converted: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Hardlinks Skipped: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Number of Special Files Skipped: 0
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Total Number of Bytes Transferred: 91975737
+[05/20/2026 21:25:16 > 3b0ec1: INFO] Final Job Status: CompletedWithSkipped
+[05/20/2026 21:25:16 > 3b0ec1: INFO] 
+[05/20/2026 21:25:16 > 3b0ec1: INFO] AzCopy completed.
+[05/20/2026 21:25:16 > 3b0ec1: INFO] [INFO] Output directory snapshot:
+[05/20/2026 21:25:16 > 3b0ec1: INFO]    C:\home\data\outputs\ABrand
+[05/20/2026 21:25:16 > 3b0ec1: INFO]       ABRAND_2026-02-19_16-17-34.csv
+(all the file dates in between, removed for ease of reading)
+[05/20/2026 21:25:17 > 3b0ec1: INFO]       ABRAND_2026-05-20_12-00-39.csv
+[05/20/2026 21:25:17 > 3b0ec1: INFO]       ABRAND_2026-05-20_15-37-10.csv
+(Removed all the brands between for easy of reading)
+[05/20/2026 21:25:26 > 3b0ec1: INFO]    C:\home\data\outputs\Rudes
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2025-11-04_18-59-56.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-15_18-03-04.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-15_18-11-07.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-15_18-12-55.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-20_15-05-26.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-21_00-10-29.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-21_15-21-18.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-21_20-16-22.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-22_00-31-03.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-22_03-16-24.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-22_14-48-37.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-22_20-20-21.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-23_00-11-09.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-23_03-00-26.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-23_15-07-14.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-23_23-42-39.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-24_00-12-19.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-24_14-57-13.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-24_17-47-54.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-27_15-06-04.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-27_17-37-22.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-28_00-16-56.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-28_12-40-46.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-28_15-35-06.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-28_15-42-49.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-29_00-18-34.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-29_12-40-41.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-30_00-18-23.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-04-30_12-36-33.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-01_00-18-02.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-01_12-37-58.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-02_00-18-49.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-02_12-38-04.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-03_00-19-32.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-03_12-37-09.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-04_00-19-45.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-04_12-39-20.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-05_00-20-03.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-05_12-38-41.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-06_00-18-01.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-06_12-43-12.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-07_00-26-58.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-07_12-41-56.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-08_00-24-34.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-08_12-41-54.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-09_00-22-24.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-09_12-43-11.csv
+[05/20/2026 21:25:26 > 3b0ec1: INFO]       RUDES_2026-05-10_00-21-45.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-10_12-38-31.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-11_00-18-49.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-11_12-42-07.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-12_00-21-43.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-12_12-42-43.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-13_12-40-28.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-14_00-19-52.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-14_12-42-37.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-15_00-18-54.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-15_12-41-38.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-16_00-20-17.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-16_12-53-03.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-17_00-47-42.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-17_12-40-14.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-18_00-19-00.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-18_12-41-48.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-19_00-19-17.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-19_12-40-16.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-19_17-44-19.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-19_18-05-38.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-19_21-43-39.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-20_00-19-21.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-20_12-42-11.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-20_14-28-38.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-20_14-37-28.csv
+[05/20/2026 21:25:27 > 3b0ec1: INFO]       RUDES_2026-05-20_16-22-06.csv
+(Removed all the brands between for easy of reading)
+[05/20/2026 21:25:28 > 3b0ec1: INFO] [INFO] Overall status: SUCCESS (soft per-brand issues, if any, do not fail job
+[05/20/2026 21:25:28 > 3b0ec1: INFO] [INFO] Overall status: HARD FAILURE code 0
+[05/20/2026 21:25:28 > 3b0ec1: INFO] [WARN] RunScraper called with no arguments. Skipping.
+[05/20/2026 21:25:28 > 3b0ec1: SYS INFO] Status changed to Success
