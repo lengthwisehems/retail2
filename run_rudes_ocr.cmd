@@ -78,35 +78,15 @@ goto :AfterAzCopy
 
   set "AZCOPY_AUTO_LOGIN_TYPE=MSI"
 
-  REM ---------- Locate or download AzCopy ----------
-  set "AZCOPY_BIN=%HOME%\data\azcopy_bin"
+  azcopy --version
   azcopy --version >nul 2>&1
   if errorlevel 1 (
-    if exist "%AZCOPY_BIN%\azcopy.exe" (
-      set "PATH=%AZCOPY_BIN%;%PATH%"
-    ) else (
-      echo AzCopy not found in PATH; downloading to %AZCOPY_BIN%...
-      if not exist "%AZCOPY_BIN%" mkdir "%AZCOPY_BIN%"
-      powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://aka.ms/downloadazcopy-v10-windows' -OutFile '%TEMP%\azcopy.zip' -UseBasicParsing"
-      if errorlevel 1 (
-        echo([WARN] Failed to download AzCopy. Skipping upload.
-        exit /b 0
-      )
-      powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Expand-Archive -Path '%TEMP%\azcopy.zip' -DestinationPath '%TEMP%\azcopy_extracted' -Force; Get-ChildItem '%TEMP%\azcopy_extracted' -Recurse -Filter 'azcopy.exe' | Select-Object -First 1 | Copy-Item -Destination '%AZCOPY_BIN%\azcopy.exe' -Force"
-      if errorlevel 1 (
-        echo([WARN] Failed to extract AzCopy. Skipping upload.
-        exit /b 0
-      )
-      set "PATH=%AZCOPY_BIN%;%PATH%"
-      echo AzCopy installed to %AZCOPY_BIN%.
-    )
-  )
-
-  azcopy --version >nul 2>&1
-  if errorlevel 1 (
-    echo([WARN] AzCopy still not available after download attempt. Skipping upload.
+    echo([WARN] AzCopy is not available in PATH. Ensure the App Service image includes AzCopy or add it via Site Extensions.
     exit /b 0
   )
+  echo(AZCOPY_LOG_LOCATION=%AZCOPY_LOG_LOCATION%
+  echo(AZCOPY_JOB_PLAN_LOCATION=%AZCOPY_JOB_PLAN_LOCATION%
+  echo(AZCOPY_AUTO_LOGIN_TYPE=%AZCOPY_AUTO_LOGIN_TYPE%
 
   dir /b /s "%OUT%\Rudes\*.csv" >nul 2>&1
   if errorlevel 1 (
