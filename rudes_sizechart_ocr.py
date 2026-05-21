@@ -417,10 +417,21 @@ def ocr_size_chart(
         logger.warning("Failed to open image %s: %s", img_url, exc)
         return ("", "", "")
 
-    # Run EasyOCR — returns [(bbox, text, confidence), ...]
+    # Run EasyOCR with a hard timeout so a slow image can't stall the whole job.
     # bbox: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]  (top-left, top-right, bottom-right, bottom-left)
+    import concurrent.futures
+    OCR_TIMEOUT_SECS = 90
     try:
-        ocr_results = reader.readtext(img_array)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(reader.readtext, img_array)
+            try:
+                ocr_results = _fut.result(timeout=OCR_TIMEOUT_SECS)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "EasyOCR timed out after %ss for %s — using HTML fallback",
+                    OCR_TIMEOUT_SECS, img_url,
+                )
+                return ("", "", "")
     except Exception as exc:
         logger.warning("EasyOCR failed on %s: %s", img_url, exc)
         return ("", "", "")
