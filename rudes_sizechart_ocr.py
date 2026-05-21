@@ -412,6 +412,10 @@ def ocr_size_chart(
         from PIL import Image
         import numpy as np
         im = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        MAX_OCR_WIDTH = 1000
+        if im.width > MAX_OCR_WIDTH:
+            scale = MAX_OCR_WIDTH / im.width
+            im = im.resize((MAX_OCR_WIDTH, int(im.height * scale)), Image.LANCZOS)
         img_array = np.array(im)
     except Exception as exc:
         logger.warning("Failed to open image %s: %s", img_url, exc)
@@ -423,7 +427,12 @@ def ocr_size_chart(
     OCR_TIMEOUT_SECS = 90
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-            _fut = _ex.submit(reader.readtext, img_array)
+            _fut = _ex.submit(
+                reader.readtext, img_array,
+                beamWidth=1,   # default 5 — 5x slower with no benefit for table text
+                workers=0,     # inline DataLoader; eliminates Windows process-spawn overhead + pin_memory warning
+                batch_size=1,
+            )
             try:
                 ocr_results = _fut.result(timeout=OCR_TIMEOUT_SECS)
             except concurrent.futures.TimeoutError:
