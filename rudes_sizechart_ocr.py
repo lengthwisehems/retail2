@@ -412,10 +412,11 @@ def ocr_size_chart(
         from PIL import Image
         import numpy as np
         im = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        MAX_OCR_WIDTH = 1000
-        if im.width > MAX_OCR_WIDTH:
-            scale = MAX_OCR_WIDTH / im.width
-            im = im.resize((MAX_OCR_WIDTH, int(im.height * scale)), Image.LANCZOS)
+        # Crop to top-left 1200×600: keeps the header row and size-26 column at
+        # full resolution while dropping ~80% of the image area (larger sizes + lower rows).
+        crop_w = min(1200, im.width)
+        crop_h = min(600, im.height)
+        im = im.crop((0, 0, crop_w, crop_h))
         img_array = np.array(im)
     except Exception as exc:
         logger.warning("Failed to open image %s: %s", img_url, exc)
