@@ -293,6 +293,9 @@ query RudesShopAll($cursor: String) {
         onlineStoreUrl
         description
         featuredImage { url }
+        images(first: 20) {
+          nodes { url }
+        }
         variants(first: 250) {
           nodes {
             id
@@ -529,6 +532,7 @@ def get_measurements(
     description: str,
     unique_sizes: List[str],
     ocr_cache: Dict[str, Tuple[str, str, str]],   # keyed by url only
+    gql_chart_url: str = "",                       # size chart URL from GraphQL images
 ) -> Tuple[Dict[str, Tuple[str, str, str]], str]:
     """Return ({size: (rise, inseam, leg)}, size_chart_url).
     OCR runs at most once per unique image URL (for OCR_TARGET_SIZE='26').
@@ -538,6 +542,8 @@ def get_measurements(
 
     if pdp_html and has_size_chart_link(pdp_html):
         size_chart_url = find_size_chart_url(pdp_html) or ""
+    if not size_chart_url:
+        size_chart_url = gql_chart_url  # fallback: URL found directly in product images
 
     if not size_chart_url or not _OCR_AVAILABLE or not OCR_ENABLED:
         return {s: desc_meas for s in unique_sizes}, size_chart_url
@@ -1221,6 +1227,19 @@ class RudesScraper:
                              or f"{PDP_HOST}/products/{handle}")
             image_url    = ((product.get("featuredImage") or {}).get("url") or "")
 
+            # Find size chart URL from GraphQL images (avoids PDP dependency for OCR
+            # — scheduled triggers may receive bot-protection pages from the PDP).
+            _gql_images = [
+                (n.get("url") or "")
+                for n in ((product.get("images") or {}).get("nodes") or [])
+            ]
+            gql_chart_url = (
+                next((u for u in _gql_images if "___" in u), None)
+                or next((u for u in _gql_images
+                         if re.search(r"/files/[^/]+\.webp", u)), None)
+                or ""
+            )
+
             variants = ((product.get("variants") or {}).get("nodes") or [])
             if not variants:
                 log("No variants for %s, skipping", handle)
@@ -1246,6 +1265,7 @@ class RudesScraper:
             meas_by_size, size_chart_url = get_measurements(
                 self.session, pdp_html, description,
                 unique_sizes, self._ocr_cache,
+                gql_chart_url=gql_chart_url,
             )
 
             laying_flat = check_leg_opening_laying_flat(pdp_html)
