@@ -535,13 +535,14 @@ def _map_jean_from_description(desc: str, leg_opening: str) -> str:
         return "Bootcut"
     if text_has_any(d, ("taper", "tapering", "tapered")):
         return "Tapered"
-    if text_has_any(d, ("baggy", "cargo")):
-        return "Baggy"
+    # Straight before Baggy — matches title priority
     has_straight = contains_phrase(d, "straight")
     if has_straight:
         if text_has_any(d, ("relaxed straight-leg", "relaxed straight", "wide straight")):
             return "Straight from Thigh"
         return _straight_bucket(leg_opening)
+    if text_has_any(d, ("baggy", "cargo")):
+        return "Baggy"
     return ""
 
 
