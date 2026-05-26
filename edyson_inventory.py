@@ -1097,6 +1097,25 @@ def apply_jean_style_inference(rows: List[List[str]]) -> None:
             _set(row, "Jean Style", max(set(matches), key=matches.count))
 
 
+def apply_jean_style_from_style_name(rows: List[List[str]]) -> None:
+    """Re-derive Jean Style from the finalized Style Name.
+
+    Runs immediately after apply_style_name_rules so that products whose style
+    name was updated (e.g. 'Charles' → 'Charles Wide Leg') get a matching Jean
+    Style ('Wide Leg') even if the per-product description pass set a different
+    value ('Baggy' from a 'baggy fit suggestion' false-positive).
+    Only updates when _map_jean_from_style_name returns a non-empty result.
+    """
+    for row in rows:
+        sn = _col(row, "Style Name")
+        leg = _col(row, "Leg Opening")
+        if not sn:
+            continue
+        result = _map_jean_from_style_name(sn, leg)
+        if result:
+            _set(row, "Jean Style", result)
+
+
 def apply_jean_style_from_tags(rows: List[List[str]]) -> None:
     """Fill blank Jean Style from tags (post-processing step between the two sibling passes)."""
     for row in rows:
@@ -1340,6 +1359,8 @@ class EdysonScraper:
         apply_petite_inseam_rule(rows)
         log("Post-processing: style name rules...")
         apply_style_name_rules(rows)
+        log("Post-processing: Jean Style from style name (after style name update)...")
+        apply_jean_style_from_style_name(rows)
         log("Post-processing: Jean Style inference (pass 1: siblings)...")
         apply_jean_style_inference(rows)
         log("Post-processing: Jean Style from tags...")
