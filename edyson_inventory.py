@@ -319,10 +319,13 @@ def fetch_pdp(session: requests.Session, handle: str) -> Dict[str, str]:
             rise = _extract_measurement(page_text, "Rise")
             leg = _extract_measurement(page_text, "Leg Opening")
 
-            # Inseam: "roll up" number takes priority; fall back to Inseam/Inleg label
+            # Inseam: "Before Roll Up" gives the full-length (pre-cuff) inseam.
+            # Must be checked before the generic "Inseam" label because the label
+            # text reads "Inseam After Roll Up XX Before Roll Up YY" and we want YY.
             inseam = ""
-            m = re.search(r'roll\s*up\s*(?:to\s*)?([\d]+(?:\s+\d+/\d+)?)\s*[""″]',
-                          page_text, re.I)
+            m = re.search(
+                r'before\s+roll\s*[-\s]*up\s+([\d]+(?:\s+\d+/\d+)?(?:\.\d+)?)\s*[""″]?',
+                page_text, re.I)
             if m:
                 val = parse_mixed_fraction(m.group(1))
                 if val is not None:
@@ -541,7 +544,7 @@ def _map_jean_from_description(desc: str, leg_opening: str) -> str:
         if text_has_any(d, ("relaxed straight-leg", "relaxed straight", "wide straight")):
             return "Straight from Thigh"
         return _straight_bucket(leg_opening)
-    if text_has_any(d, ("baggy", "cargo")):
+    if text_has_any(d, ("baggy",)):
         return "Baggy"
     return ""
 
@@ -694,13 +697,13 @@ def derive_hem_style(description: str) -> str:
     if text_has_any(d, ("raw hem", "raw-edge hem", "raw edge hem", "raw-hem",
                          "raw-cut", "raw cut")):
         return "Raw Hem"
+    if text_has_any(d, ("wide hem", "wide-hem", "trouser hem")):
+        return "Wide Hem"
     if text_has_any(d, ("clean hem", "finished hem", "clean-edge hem",
                          "tacking detail at bottom hem", "3/8\" hem",
                          "clean finished hem", "clean-finished hem",
                          "hem: clean", "hem : clean")):
         return "Clean Hem"
-    if text_has_any(d, ("wide hem", "wide-hem", "trouser hem")):
-        return "Wide Hem"
     if text_has_any(d, ("distressed hem", "distressed-hem", "destroyed hem",
                          "destructed hem", "hem: destroyed", "hem : destroyed",
                          "hem : distressed", "hem: distressed")):
