@@ -34,6 +34,8 @@ HOST_ROTATION = [
 PDP_HOST = "https://edyson.com"
 COLLECTION_HANDLE = "all-products"
 SLEEP = 0.3
+PDP_RETRIES = 3       # attempts per host before moving to the next
+PDP_RETRY_DELAY = 2.0  # base seconds between retries (multiplied by attempt index)
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
@@ -307,40 +309,46 @@ def fetch_pdp(session: requests.Session, handle: str) -> Dict[str, str]:
     """Fetch Rise, Inseam, Leg Opening measurements and description from the PDP."""
     for host in [PDP_HOST, "https://www.edyson.com", "https://edysonsdenim.myshopify.com"]:
         url = f"{host}/products/{handle}"
-        try:
-            resp = session.get(url, timeout=30, verify=False)
-            if resp.status_code != 200:
-                continue
-            text = normalize_text(resp.text)
-            soup = BeautifulSoup(text, "html.parser")
-            page_text = soup.get_text(" ", strip=True)
-            page_text = normalize_text(page_text)
+        for attempt in range(PDP_RETRIES):
+            try:
+                resp = session.get(url, timeout=30, verify=False)
+                if resp.status_code != 200:
+                    if attempt < PDP_RETRIES - 1:
+                        time.sleep(PDP_RETRY_DELAY * (attempt + 1))
+                    continue
+                text = normalize_text(resp.text)
+                soup = BeautifulSoup(text, "html.parser")
+                page_text = soup.get_text(" ", strip=True)
+                page_text = normalize_text(page_text)
 
-            rise = _extract_measurement(page_text, "Rise")
-            leg = _extract_measurement(page_text, "Leg Opening")
+                rise = _extract_measurement(page_text, "Rise")
+                leg = _extract_measurement(page_text, "Leg Opening")
 
-            # Inseam: "Before Roll Up" gives the full-length (pre-cuff) inseam.
-            # Must be checked before the generic "Inseam" label because the label
-            # text reads "Inseam After Roll Up XX Before Roll Up YY" and we want YY.
-            inseam = ""
-            m = re.search(
-                r'before\s+roll\s*[-\s]*up\s+([\d]+(?:\s+\d+/\d+)?(?:\.\d+)?)\s*[""″]?',
-                page_text, re.I)
-            if m:
-                val = parse_mixed_fraction(m.group(1))
-                if val is not None:
-                    inseam = format_decimal(val)
-            if not inseam:
-                inseam = _extract_measurement(page_text, "Inseam")
-            if not inseam:
-                inseam = _extract_measurement(page_text, "Inleg")
+                # Inseam: "Before Roll Up" gives the full-length (pre-cuff) inseam.
+                # Must be checked before the generic "Inseam" label because the label
+                # text reads "Inseam After Roll Up XX Before Roll Up YY" and we want YY.
+                inseam = ""
+                m = re.search(
+                    r'before\s+roll\s*[-\s]*up\s+([\d]+(?:\s+\d+/\d+)?(?:\.\d+)?)\s*[""″]?',
+                    page_text, re.I)
+                if m:
+                    val = parse_mixed_fraction(m.group(1))
+                    if val is not None:
+                        inseam = format_decimal(val)
+                if not inseam:
+                    inseam = _extract_measurement(page_text, "Inseam")
+                if not inseam:
+                    inseam = _extract_measurement(page_text, "Inleg")
 
-            description = _extract_description_from_pdp(soup)
+                description = _extract_description_from_pdp(soup)
 
-            return {"rise": rise, "inseam": inseam, "leg_opening": leg,
-                    "description": description}
-        except Exception as exc:
-            LOGGER.warning("PDP fetch failed for %s from %s: %s", handle, host, exc)
+                return {"rise": rise, "inseam": inseam, "leg_opening": leg,
+                        "description": description}
+            except Exception as exc:
+                LOGGER.warning("PDP fetch failed for %s from %s (attempt %s): %s",
+                               handle, host, attempt + 1, exc)
+                if attempt < PDP_RETRIES - 1:
+                    time.sleep(PDP_RETRY_DELAY * (attempt + 1))
     return {"rise": "", "inseam": "", "leg_opening": "", "description": ""}
 
 
@@ -1263,13 +1271,27 @@ class EdysonScraper:
             image_url = ((product.get("featuredImage") or {}).get("url") or "")
             total_inventory = product.get("totalInventory")
 
+            # Save raw GraphQL description before PDP may override it
+            graphql_desc = (product.get("description") or "").strip()
+
             # Fetch PDP for measurements and description
             pdp = self._pdp(handle)
             rise = pdp.get("rise", "")
             inseam = pdp.get("inseam", "")
             leg_opening = pdp.get("leg_opening", "")
             # Use PDP description (CSS selector concat); fall back to GraphQL plain text
-            description = pdp.get("description", "") or (product.get("description") or "").strip()
+            description = pdp.get("description", "") or graphql_desc
+
+            # Fallback: PDP gave no inseam — check GraphQL description for "## Inseam" spec
+            # e.g. '30" Inseam', '28 Inseam'
+            if not inseam and graphql_desc:
+                _m = re.search(
+                    r'(\d+(?:\s+\d+/\d+)?(?:\.\d+)?)\s*["“”″]?\s*inseam',
+                    graphql_desc, re.I)
+                if _m:
+                    _val = parse_mixed_fraction(_m.group(1))
+                    if _val is not None:
+                        inseam = format_decimal(_val)
 
             # Variants
             variants = (product.get("variants") or {}).get("nodes") or []
