@@ -1018,6 +1018,12 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
             if lo_i is None:
                 assignments.append(None)
                 continue
+            # Only fill in one-word style names. Multi-word names are already
+            # determined from the product title and must not be overwritten.
+            current_sn = non_mat[i][idx_sn]
+            if len(current_sn.split()) > 1:
+                assignments.append(None)
+                continue
             compatible_snames = [
                 non_mat[j][idx_sn]
                 for j, lo_j in enumerate(leg_floats)
@@ -1043,13 +1049,19 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
         title = row[idx_product]
         fw = (title.split(" ", 1)[0] if title else "").strip().lower()
         leg = row[idx_leg]
-        # 2a: siblings with same first word + leg opening that have multi-word style name
+        lo_val = to_float(leg)
+        # 2a: siblings with same first word that have multi-word style name,
+        # within 1.5" tolerance (or any sibling when leg opening is blank)
         candidates = [
             r[idx_sn]
             for r in rows
             if (r[idx_product].split(" ", 1)[0] if r[idx_product] else "").strip().lower() == fw
-            and r[idx_leg] == leg
             and len(r[idx_sn].split()) > 1
+            and (
+                lo_val is None  # blank leg: consider all same-first-word siblings
+                or (to_float(r[idx_leg]) is not None
+                    and abs(to_float(r[idx_leg]) - lo_val) <= 1.5)
+            )
         ]
         if candidates:
             _set(row, "Style Name", max(set(candidates), key=candidates.count))
