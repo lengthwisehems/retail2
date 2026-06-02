@@ -9,9 +9,10 @@ Counts are product-level (all variants combined). Per-variant BIS breakdown
 requires the Swym admin API key (Swym Dashboard → Settings → API).
 
 Usage:
-  python swym_engagement.py                  # all jeans, export CSV
+  python swym_engagement.py                  # all jeans, export Excel
   python swym_engagement.py --empi 7097674367040  # single product lookup
   python swym_engagement.py --handle cindy-high-rise-wide-leg-jean
+  python swym_engagement.py --collection tops    # different collection
 
 Notes:
   - "Added to cart" and "Recently Viewed" in Swym's relayfilters are UI tab IDs
@@ -21,14 +22,14 @@ Notes:
 """
 
 import argparse
-import csv
-import json
 import logging
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import openpyxl
 import requests
 import urllib3
 
@@ -36,18 +37,37 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-PID       = "JYxW0bO//HIl29BRB2i1vARfPY5YSr+7Xdr/iqq8FgE="
-API_BASE  = "https://swymstore-v3premium-01.swymrelay.com"
-STORE_URL = "https://www.ramybrook.com"
-OUTPUT_CSV = "swym_engagement.csv"
+BRAND      = "Ramybrook"
+PID        = "JYxW0bO//HIl29BRB2i1vARfPY5YSr+7Xdr/iqq8FgE="
+API_BASE   = "https://swymstore-v3premium-01.swymrelay.com"
+STORE_URL  = "https://www.ramybrook.com"
+COLLECTION = "jeans"
 REQUEST_TIMEOUT = 15
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+BASE_DIR   = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "Output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+BRAND_SLUG = BRAND.lower().replace(" ", "_") or "brand"
+LOG_PATH          = BASE_DIR / f"{BRAND_SLUG}_probe_run.log"
+FALLBACK_LOG_PATH = OUTPUT_DIR / f"{BRAND_SLUG}_probe_run.log"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+def _setup_logging() -> logging.Logger:
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    log = logging.getLogger(__name__)
+    log.setLevel(logging.INFO)
+    log.addHandler(logging.StreamHandler())
+    try:
+        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    except OSError:
+        fh = logging.FileHandler(FALLBACK_LOG_PATH, encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    return log
+
+logger = _setup_logging()
 
 # Swym event type constants (from SDK source)
 ET_ADD_TO_CART = 3
@@ -123,7 +143,7 @@ def event_count(
 
 def fetch_collection_products(
     session: requests.Session,
-    collection_handle: str = "jeans",
+    collection_handle: str = COLLECTION,
 ) -> List[Dict[str, Any]]:
     """
     Fetch all products from a Shopify collection via the store's products.json API.
@@ -202,17 +222,35 @@ def fetch_engagement(
     return rows
 
 
-# ── CSV export ─────────────────────────────────────────────────────────────────
+# ── Excel export ───────────────────────────────────────────────────────────────
 
-def export_csv(rows: List[Dict[str, Any]], path: str) -> None:
-    fieldnames = [
-        "empi", "handle", "product_title", "product_url",
-        "bis_signups", "wishlist_count", "variant_count",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+COLUMNS = [
+    ("empi",          "EMPI"),
+    ("handle",        "Handle"),
+    ("product_title", "Product Title"),
+    ("product_url",   "Product URL"),
+    ("bis_signups",   "BIS Signups"),
+    ("wishlist_count","Wishlist Count"),
+    ("variant_count", "Variant Count"),
+]
+
+def export_excel(rows: List[Dict[str, Any]], path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Swym Engagement"
+
+    # Header row
+    ws.append([label for _, label in COLUMNS])
+
+    for row in rows:
+        ws.append([row.get(key) for key, _ in COLUMNS])
+
+    # Auto-size columns
+    for col_cells in ws.columns:
+        width = max(len(str(cell.value or "")) for cell in col_cells)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(width + 2, 60)
+
+    wb.save(path)
     logger.info("Exported %d rows → %s", len(rows), path)
 
 
@@ -236,8 +274,8 @@ def print_table(rows: List[Dict[str, Any]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch Swym BIS + wishlist counts (no admin key)")
-    parser.add_argument("--collection", default="jeans",
-                        help="Shopify collection handle (default: jeans)")
+    parser.add_argument("--collection", default=COLLECTION,
+                        help=f"Shopify collection handle (default: {COLLECTION})")
     parser.add_argument("--empi", type=int, default=None,
                         help="Look up a single product by Shopify product ID")
     parser.add_argument("--handle", default=None,
@@ -271,7 +309,9 @@ def main() -> None:
 
     rows = fetch_engagement(session, products)
     print_table(rows)
-    export_csv(rows, OUTPUT_CSV)
+
+    output_path = OUTPUT_DIR / f"{BRAND_SLUG}_swym_{args.collection}_engagement.xlsx"
+    export_excel(rows, output_path)
 
 
 if __name__ == "__main__":
