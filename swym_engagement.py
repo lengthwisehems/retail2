@@ -1,20 +1,30 @@
 """
 Swym engagement data fetcher for ramybrook.com.
 
-Pulls per-variant counts for:
-  - Back-in-stock (BIS) notification signups
-  - Wishlist social counts (per product/empi)
+No admin API key required. Pulls product-level counts from public Swym endpoints:
+  - Back-in-stock (BIS) notification signups  (topic=backinstock)
+  - Wishlist additions                          (topic=addToWishlist)
+
+Counts are product-level (all variants combined). Per-variant BIS breakdown
+requires the Swym admin API key (Swym Dashboard → Settings → API).
 
 Usage:
-  python swym_engagement.py               # fetch all, export CSV
-  python swym_engagement.py --epi 40522216964160  # single variant lookup
+  python swym_engagement.py                  # all jeans, export CSV
+  python swym_engagement.py --empi 7097674367040  # single product lookup
+  python swym_engagement.py --handle cindy-high-rise-wide-leg-jean
+
+Notes:
+  - "Added to cart" and "Recently Viewed" in Swym's relayfilters are UI tab IDs
+    (3 and 1), not per-product analytics — no public API exists for these counts.
+  - "Added to cart" events (et=3) do exist in the eventcount API but return 0
+    for this store, likely because Swym's cart tracking is not enabled.
 """
 
 import argparse
-import base64
 import csv
 import json
 import logging
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,23 +36,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-PID = "JYxW0bO//HIl29BRB2i1vARfPY5YSr+7Xdr/iqq8FgE="
-API_BASE = "https://swymstore-v3premium-01.swymrelay.com"
-
-# Candidate API keys extracted from network traffic (tested in order)
-CANDIDATE_KEYS: List[str] = [
-    "1784dfa5ea23575f610283cb6f728bba",   # checkAndGet response
-    "sqGIZvaiYpLHmh32F1oIS1CMyLCK38He",   # collect + checkAndGet responses
-    "1Iqla4FsBbAuVJhWugvpQNIYAGIgTAMZ",   # storefront-layout-components.js
-    "D41Go086i5RsNouuri4UCgXpKHS4Dyml",   # storefront-layout-components.js
-    "SkdJBa017rjjDmzcuBGvfvWrsWDBAulI",   # storefront-layout-components.js
-    "kNr7pmIJ4DdbPrAWph6vOa9JZWgXlvoq",   # storefront-layout-components.js
-    "um4D8HEA3ykWi2GT4qUKC0ACuK57fL1e",   # storefront-layout-components.js
-    "vls5hOq4CSIaqg48A0jSwALSA53mf58x",   # storefront-layout-components.js
-]
-
-REQUEST_TIMEOUT = 20
+PID       = "JYxW0bO//HIl29BRB2i1vARfPY5YSr+7Xdr/iqq8FgE="
+API_BASE  = "https://swymstore-v3premium-01.swymrelay.com"
+STORE_URL = "https://www.ramybrook.com"
 OUTPUT_CSV = "swym_engagement.csv"
+REQUEST_TIMEOUT = 15
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,343 +49,229 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ── Auth helpers ───────────────────────────────────────────────────────────────
-
-def _make_admin_headers(api_key: str) -> Dict[str, str]:
-    token = base64.b64encode(f"{PID}:{api_key}".encode()).decode()
-    return {
-        "Authorization": f"Basic {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+# Swym event type constants (from SDK source)
+ET_ADD_TO_CART = 3
+ET_WISHLIST    = 4
+ET_BIS         = 8
 
 
-def probe_admin_key(session: requests.Session, key: str) -> bool:
-    """Return True if key authenticates against the storeadmin BIS endpoint."""
-    url = f"{API_BASE}/storeadmin/bispa/subscriptions/fetch"
-    headers = _make_admin_headers(key)
-    try:
-        resp = session.post(
-            url,
-            json={"pid": PID, "limit": 1, "offset": 0},
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            verify=False,
-        )
-        masked = f"...{key[-4:]}"
-        logger.info("Key probe [%s]: HTTP %s", masked, resp.status_code)
-        return resp.status_code == 200
-    except requests.RequestException as exc:
-        logger.warning("Key probe failed: %s", exc)
-        return False
+# ── Session setup ──────────────────────────────────────────────────────────────
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, */*",
+        "Origin": STORE_URL,
+        "Referer": STORE_URL + "/",
+    })
+    return s
 
 
-def find_working_key(session: requests.Session) -> Optional[str]:
-    """Test each candidate key and return the first that works, or None."""
-    logger.info("Testing %d candidate API keys…", len(CANDIDATE_KEYS))
-    for key in CANDIDATE_KEYS:
-        if probe_admin_key(session, key):
-            logger.info("Found working key: ...%s", key[-4:])
-            return key
-    return None
+# ── Public Swym API (no admin key needed) ─────────────────────────────────────
 
-
-# ── Back-in-Stock ──────────────────────────────────────────────────────────────
-
-_BIS_ENDPOINTS = [
-    ("POST", "/storeadmin/bispa/subscriptions/fetch"),
-    ("GET",  "/storeadmin/bispa/subscriptions"),
-    ("POST", "/storeadmin/v3/bispa/subscriptions/fetch"),
-]
-
-
-def _paginate_bis(
+def social_count(
     session: requests.Session,
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-) -> Optional[List[Dict[str, Any]]]:
-    """Paginate a BIS endpoint; return records or None if endpoint is unusable."""
-    collected: List[Dict[str, Any]] = []
-    offset = 0
-    limit = 100
-    while True:
-        payload = {"pid": PID, "limit": limit, "offset": offset}
-        try:
-            if method == "POST":
-                resp = session.post(url, json=payload, headers=headers,
-                                    timeout=REQUEST_TIMEOUT, verify=False)
-            else:
-                resp = session.get(url, params=payload, headers=headers,
-                                   timeout=REQUEST_TIMEOUT, verify=False)
-        except requests.RequestException as exc:
-            logger.warning("BIS request error [%s %s]: %s", method, url, exc)
-            return None
-
-        if resp.status_code == 404:
-            return None
-        if not resp.ok:
-            logger.warning("BIS endpoint [%s %s]: HTTP %s", method, url, resp.status_code)
-            return None
-
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.warning("BIS endpoint [%s]: non-JSON response", url)
-            return None
-
-        results: List[Any] = (
-            data.get("subscriptions")
-            or data.get("results")
-            or (data if isinstance(data, list) else [])
-        )
-        if not isinstance(results, list):
-            return collected if collected else None
-
-        collected.extend(results)
-        logger.info("BIS [%s]: fetched %d records (offset=%d)", url, len(collected), offset)
-
-        if len(results) < limit:
-            break
-        offset += limit
-        time.sleep(0.3)
-
-    return collected
+    empi: int,
+    du: str,
+    topic: str,
+) -> int:
+    """
+    Return the social count for a product via the public social-count endpoint.
+    topic: 'backinstock' | 'addToWishlist'
+    Returns product-level count (all variants combined).
+    """
+    r = session.get(
+        f"{API_BASE}/api/v3/product/social-count",
+        params={"pid": PID, "du": du, "empi": empi, "topic": topic},
+        verify=False,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.ok:
+        return int((r.json().get("data") or {}).get("count") or 0)
+    logger.warning("social-count [empi=%s topic=%s]: HTTP %s", empi, topic, r.status_code)
+    return 0
 
 
-def fetch_all_bis_subscriptions(
-    session: requests.Session, api_key: str
+def event_count(
+    session: requests.Session,
+    empi: int,
+    du: str,
+    et: int,
+) -> int:
+    """
+    Return the event count via the public eventcount endpoint (v2).
+    et=4 → wishlist, et=3 → add-to-cart, et=8 → watchlist/BIS
+    Returns product-level count.
+    """
+    r = session.get(
+        f"{API_BASE}/api/v2/provider/eventcount",
+        params={"pid": PID, "du": du, "et": et, "empi": empi},
+        verify=False,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if r.ok:
+        return int(r.json().get("count") or 0)
+    logger.warning("eventcount [empi=%s et=%s]: HTTP %s", empi, et, r.status_code)
+    return 0
+
+
+# ── Store product discovery ────────────────────────────────────────────────────
+
+def fetch_collection_products(
+    session: requests.Session,
+    collection_handle: str = "jeans",
 ) -> List[Dict[str, Any]]:
-    """Fetch all BIS subscriptions across all pages, trying fallback endpoints."""
-    headers = _make_admin_headers(api_key)
-    for method, path in _BIS_ENDPOINTS:
-        url = f"{API_BASE}{path}"
-        logger.info("Trying BIS endpoint: %s %s", method, url)
-        records = _paginate_bis(session, method, url, headers)
-        if records is not None:
-            logger.info("BIS: collected %d total subscriptions", len(records))
-            return records
-        logger.info("BIS endpoint unavailable, trying next…")
-
-    logger.warning("All BIS endpoints failed — no subscription data retrieved")
-    return []
-
-
-# ── Wishlist ───────────────────────────────────────────────────────────────────
-
-def generate_regid(
-    session: requests.Session, api_key: str
-) -> Tuple[Optional[str], Optional[str]]:
-    """Generate a temporary regid+sessionid via the storeadmin API."""
-    url = f"{API_BASE}/storeadmin/v3/user/generate-regid"
-    headers = _make_admin_headers(api_key)
-    try:
-        resp = session.post(
-            url,
-            json={"pid": PID},
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            verify=False,
-        )
-        if not resp.ok:
-            logger.warning("generate-regid: HTTP %s", resp.status_code)
-            return None, None
-        data = resp.json()
-        regid = data.get("regid")
-        sessionid = data.get("sessionid") or data.get("session_id")
-        if regid:
-            logger.info("Generated regid: %s…", str(regid)[:12])
-        return regid, sessionid
-    except requests.RequestException as exc:
-        logger.warning("generate-regid failed: %s", exc)
-        return None, None
+    """
+    Fetch all products from a Shopify collection via the store's products.json API.
+    Returns list of {id, title, handle, variants: [{id, title}]}.
+    """
+    products: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        url = f"{STORE_URL}/collections/{collection_handle}/products.json"
+        r = session.get(url, params={"limit": 250, "page": page},
+                        verify=False, timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            logger.warning("products.json [page=%d]: HTTP %s", page, r.status_code)
+            break
+        batch = r.json().get("products", [])
+        if not batch:
+            break
+        products.extend(batch)
+        logger.info("Collection '%s': fetched %d products (page %d)", collection_handle, len(products), page)
+        if len(batch) < 250:
+            break
+        page += 1
+        time.sleep(0.3)
+    return products
 
 
-def fetch_wishlist_counts(
+def parse_empi_from_page(session: requests.Session, handle: str) -> Optional[int]:
+    """Fetch a product page and extract its Shopify product ID (empi)."""
+    r = session.get(f"{STORE_URL}/products/{handle}", verify=False, timeout=REQUEST_TIMEOUT)
+    if not r.ok:
+        return None
+    m = re.search(r'SwymProductInfo\.product\s*=\s*\{"id"\s*:\s*(\d+)', r.text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'"product_id"\s*:\s*(\d+)', r.text)
+    return int(m.group(1)) if m else None
+
+
+# ── Fetch engagement counts ────────────────────────────────────────────────────
+
+def fetch_engagement(
     session: requests.Session,
-    regid: str,
-    sessionid: str,
-    empis: List[int],
-) -> Dict[int, int]:
-    """Return {empi: wishlist_count} for the given product IDs."""
-    url = f"{API_BASE}/api/v3/product/wishlist/social-count"
-    counts: Dict[int, int] = {}
-    batch_size = 10
+    products: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    For each product, fetch BIS and wishlist counts.
+    Returns list of rows sorted by bis_count descending.
+    """
+    rows = []
+    total = len(products)
+    for i, prod in enumerate(products):
+        empi = prod["id"]
+        handle = prod["handle"]
+        title = prod["title"]
+        du = f"{STORE_URL}/products/{handle}"
 
-    for i in range(0, len(empis), batch_size):
-        batch = empis[i : i + batch_size]
-        for empi in batch:
-            payload = {
-                "pid": PID,
-                "regid": regid,
-                "sessionid": sessionid,
-                "empi": empi,
-            }
-            try:
-                resp = session.post(
-                    url,
-                    data=payload,
-                    timeout=REQUEST_TIMEOUT,
-                    verify=False,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    count = (data.get("data") or {}).get("count", 0)
-                    counts[empi] = int(count or 0)
-                else:
-                    logger.warning("Wishlist count [empi=%s]: HTTP %s", empi, resp.status_code)
-                    counts[empi] = 0
-            except requests.RequestException as exc:
-                logger.warning("Wishlist count [empi=%s] failed: %s", empi, exc)
-                counts[empi] = 0
-            time.sleep(0.15)
+        logger.info("[%d/%d] %s (empi=%s)", i + 1, total, title, empi)
 
-    return counts
+        bis   = social_count(session, empi, du, "backinstock")
+        wl    = social_count(session, empi, du, "addToWishlist")
+        # eventcount wishlist as a cross-check (et=4)
+        wl_ev = event_count(session, empi, du, ET_WISHLIST)
 
+        rows.append({
+            "empi": empi,
+            "handle": handle,
+            "product_title": title,
+            "product_url": du,
+            "bis_signups": bis,
+            "wishlist_count": wl or wl_ev,
+            "variant_count": len(prod.get("variants", [])),
+        })
+        time.sleep(0.15)
 
-# ── Aggregation ────────────────────────────────────────────────────────────────
-
-def aggregate_bis(
-    subscriptions: List[Dict[str, Any]]
-) -> Dict[str, Dict[str, Any]]:
-    """Group BIS subscription records by epi (variant ID); count per variant."""
-    by_epi: Dict[str, Dict[str, Any]] = {}
-    for sub in subscriptions:
-        epi = str(sub.get("epi") or sub.get("variant_id") or "")
-        if not epi:
-            continue
-        if epi not in by_epi:
-            by_epi[epi] = {
-                "epi": epi,
-                "empi": sub.get("empi") or sub.get("product_id") or "",
-                "product_title": sub.get("dt") or sub.get("product_title") or "",
-                "variant_url": sub.get("du") or sub.get("product_url") or "",
-                "bis_signup_count": 0,
-            }
-        by_epi[epi]["bis_signup_count"] += 1
-    return by_epi
+    rows.sort(key=lambda r: r["bis_signups"], reverse=True)
+    return rows
 
 
 # ── CSV export ─────────────────────────────────────────────────────────────────
 
-def export_csv(
-    bis_data: Dict[str, Dict[str, Any]],
-    wishlist_counts: Dict[int, int],
-    path: str,
-) -> None:
-    rows = sorted(
-        bis_data.values(),
-        key=lambda r: r["bis_signup_count"],
-        reverse=True,
-    )
+def export_csv(rows: List[Dict[str, Any]], path: str) -> None:
     fieldnames = [
-        "epi", "empi", "product_title", "variant_url",
-        "bis_signup_count", "wishlist_count",
+        "empi", "handle", "product_title", "product_url",
+        "bis_signups", "wishlist_count", "variant_count",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in rows:
-            empi_int = int(row["empi"]) if str(row["empi"]).isdigit() else 0
-            writer.writerow({
-                "epi": row["epi"],
-                "empi": row["empi"],
-                "product_title": row["product_title"],
-                "variant_url": row["variant_url"],
-                "bis_signup_count": row["bis_signup_count"],
-                "wishlist_count": wishlist_counts.get(empi_int, ""),
-            })
+        writer.writerows(rows)
     logger.info("Exported %d rows → %s", len(rows), path)
 
 
 # ── Pretty print ───────────────────────────────────────────────────────────────
 
-def print_table(
-    bis_data: Dict[str, Dict[str, Any]],
-    wishlist_counts: Dict[int, int],
-    epi_filter: Optional[str] = None,
-) -> None:
-    rows = sorted(
-        bis_data.values(),
-        key=lambda r: r["bis_signup_count"],
-        reverse=True,
-    )
-    if epi_filter:
-        rows = [r for r in rows if r["epi"] == epi_filter]
-        if not rows:
-            print(f"\nNo BIS subscription data found for epi={epi_filter}")
-            return
-
-    print(f"\n{'EPI':<20} {'EMPI':<14} {'BIS Signups':>11} {'Wishlist':>9}  Product")
-    print("-" * 90)
-    for row in rows:
-        empi_int = int(row["empi"]) if str(row["empi"]).isdigit() else 0
-        wl = wishlist_counts.get(empi_int, "—")
-        title = (row["product_title"] or row["variant_url"] or "")[:45]
-        print(
-            f"{row['epi']:<20} {str(row['empi']):<14} "
-            f"{row['bis_signup_count']:>11} {str(wl):>9}  {title}"
-        )
-
+def print_table(rows: List[Dict[str, Any]]) -> None:
+    print(f"\n{'EMPI':<14} {'BIS':>5} {'WL':>5}  Product")
+    print("-" * 75)
+    for r in rows:
+        print(f"{r['empi']:<14} {r['bis_signups']:>5} {r['wishlist_count']:>5}  {r['product_title'][:50]}")
     print(
-        "\nNote: 'Added to cart' and 'Recently Viewed' values in Swym's "
-        "relayfilters (3 and 1) are UI tab IDs, not per-variant analytics — "
-        "no per-variant count API exists for these."
+        "\nCounts are product-level (all variants combined).\n"
+        "Per-variant BIS breakdown requires the Swym admin API key\n"
+        "(Swym Dashboard → Settings → API).\n"
+        "\n'Added to cart' / 'Recently Viewed' from relayfilters are Swym UI tab IDs,\n"
+        "not per-product analytics — no public count API exists for these."
     )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch Swym engagement data")
-    parser.add_argument(
-        "--epi",
-        help="Show counts for a single variant ID (epi) only",
-        default=None,
-    )
+    parser = argparse.ArgumentParser(description="Fetch Swym BIS + wishlist counts (no admin key)")
+    parser.add_argument("--collection", default="jeans",
+                        help="Shopify collection handle (default: jeans)")
+    parser.add_argument("--empi", type=int, default=None,
+                        help="Look up a single product by Shopify product ID")
+    parser.add_argument("--handle", default=None,
+                        help="Look up a single product by handle")
     args = parser.parse_args()
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "SwymEngagementFetcher/1.0"})
+    session = make_session()
 
-    # 1. Find a working API key
-    api_key = find_working_key(session)
-    if not api_key:
-        print(
-            "\nNo working API key found among candidates.\n"
-            "To get the real Swym API key:\n"
-            "  Swym Admin Dashboard → Settings → API → copy the API key\n"
-            "Then add it to CANDIDATE_KEYS at the top of this script."
-        )
+    if args.empi or args.handle:
+        # Single product lookup
+        if args.handle and not args.empi:
+            args.empi = parse_empi_from_page(session, args.handle)
+            if not args.empi:
+                print(f"Could not resolve empi for handle '{args.handle}'")
+                sys.exit(1)
+        handle = args.handle or str(args.empi)
+        du = f"{STORE_URL}/products/{handle}"
+        bis = social_count(session, args.empi, du, "backinstock")
+        wl  = social_count(session, args.empi, du, "addToWishlist")
+        print(f"\nProduct empi={args.empi}  ({handle})")
+        print(f"  Back-in-stock signups : {bis}  (product level, all variants)")
+        print(f"  Wishlist additions    : {wl}")
+        return
+
+    # Full collection run
+    logger.info("Fetching collection '%s'…", args.collection)
+    products = fetch_collection_products(session, args.collection)
+    if not products:
+        print(f"No products found in collection '{args.collection}'")
         sys.exit(1)
 
-    print(f"\nUsing API key: ...{api_key[-4:]}")
-
-    # 2. Fetch BIS subscriptions
-    subscriptions = fetch_all_bis_subscriptions(session, api_key)
-    bis_data = aggregate_bis(subscriptions)
-    print(f"Back-in-stock: {len(subscriptions)} subscriptions across {len(bis_data)} variants")
-
-    # 3. Generate regid for wishlist calls
-    wishlist_counts: Dict[int, int] = {}
-    regid, sessionid = generate_regid(session, api_key)
-    if regid and sessionid:
-        empis = list({
-            int(v["empi"]) for v in bis_data.values()
-            if str(v.get("empi", "")).isdigit()
-        })
-        if empis:
-            logger.info("Fetching wishlist counts for %d products…", len(empis))
-            wishlist_counts = fetch_wishlist_counts(session, regid, sessionid, empis)
-    else:
-        logger.warning("Could not generate regid; skipping wishlist counts")
-
-    # 4. Display and export
-    print_table(bis_data, wishlist_counts, epi_filter=args.epi)
-
-    if not args.epi:
-        export_csv(bis_data, wishlist_counts, OUTPUT_CSV)
+    rows = fetch_engagement(session, products)
+    print_table(rows)
+    export_csv(rows, OUTPUT_CSV)
 
 
 if __name__ == "__main__":
