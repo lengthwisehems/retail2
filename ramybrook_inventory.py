@@ -1292,7 +1292,7 @@ class RamyBrookScraper:
                 _set(row, "Handle",              handle)
                 _set(row, "Published At",        published_at)
                 _set(row, "Created At",          created_at)
-                _set(row, "Product",             title)
+                _set(row, "Product",             f"{title} - {color}" if color else title)
                 _set(row, "Style Name",          derive_style_name_base(title))
                 _set(row, "Product Type",        product_type)
                 _set(row, "Tags",                tags_str)
