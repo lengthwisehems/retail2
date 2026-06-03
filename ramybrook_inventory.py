@@ -776,7 +776,7 @@ query RamyBrookProducts($cursor: String) {
 
 
 def fetch_graphql_products(session: requests.Session) -> List[Dict]:
-    products: Dict[str, Dict] = {}
+    products: List[Dict] = []
     cursor = None
     page = 0
     while True:
@@ -809,17 +809,15 @@ def fetch_graphql_products(session: requests.Session) -> List[Dict]:
             break
         block = data.get("products", {})
         for node in block.get("nodes", []):
-            handle = node.get("handle", "")
-            if handle and handle not in products:
-                products[handle] = node
+            products.append(node)
         page_info = block.get("pageInfo", {})
         if not page_info.get("hasNextPage"):
             break
         cursor = page_info.get("endCursor")
         log("GraphQL page %s: %s products so far", page, len(products))
         time.sleep(SLEEP)
-    log("GraphQL fetch complete: %s unique products", len(products))
-    return list(products.values())
+    log("GraphQL fetch complete: %s product nodes", len(products))
+    return products
 
 # ---------------------------------------------------------------------------
 # Algolia — fetch all variants (distinct=false) for the jeans collection
@@ -1198,6 +1196,7 @@ class RamyBrookScraper:
         wishlist_map = fetch_swym_wishlist_map(self.session, products)
 
         log("Building rows and fetching Next Shipment from PDPs...")
+        seen_skus: Set[str] = set()
         for idx, product in enumerate(products, start=1):
             handle = product.get("handle") or ""
             if not handle:
@@ -1240,6 +1239,9 @@ class RamyBrookScraper:
             for v in variants:
                 v_id_full   = v.get("id") or ""
                 sku_shopify = v_id_full.replace("gid://shopify/ProductVariant/", "")
+                if sku_shopify in seen_skus:
+                    continue
+                seen_skus.add(sku_shopify)
                 sku_brand   = v.get("title") or ""
                 barcode     = v.get("barcode") or ""
                 available   = "TRUE" if v.get("availableForSale") else "FALSE"
