@@ -144,7 +144,7 @@ VALID_SIZES: Set[str] = {
 }
 
 NON_TAPER = {"Straight from Knee/Thigh", "Bootcut", "Barrel", "Wide Leg",
-             "Boyfriend", "Baggy", "Flare", "Straight from Thigh"}
+             "Boyfriend", "Baggy", "Flare", "Straight from Thigh", "Straight Leg"}
 TAPER     = {"Tapered", "Skinny", "Straight from Knee"}
 
 # ---------------------------------------------------------------------------
@@ -313,14 +313,34 @@ def _extract_measurement(fit_text: str, labels: List[str]) -> str:
 
 
 def extract_rise(description: str) -> str:
-    return _extract_measurement(_fit_section(description), ["Rise", "Front Rise"])
+    fit = _fit_section(description)
+    result = _extract_measurement(fit, ["Rise", "Front Rise"])
+    if not result:
+        result = _extract_measurement(fit, ["Rise Length"])
+    return result
 
 
 def extract_inseam(description: str) -> str:
-    return _extract_measurement(
-        _fit_section(description),
-        ["Inseam", "Length", "Inleg"],
-    )
+    fit = _fit_section(description)
+    result = _extract_measurement(fit, ["Inseam", "Length", "Inleg"])
+    # If the result is ≤16" it likely captured a leg-opening; search for a
+    # longer-form label followed by a number >16 instead.
+    if result:
+        try:
+            if float(result) <= 16:
+                norm = normalize_text(fit)
+                for label in ("Inseam Length", "Length"):
+                    m = re.search(
+                        rf'\b{re.escape(label)}\s*:?\s*([\d]+(?:\s+\d+/\d+)?(?:\.\d+)?)',
+                        norm, re.IGNORECASE)
+                    if m:
+                        v = parse_mixed_fraction(m.group(1))
+                        if v is not None and v > 16:
+                            result = format_decimal(v)
+                            break
+        except ValueError:
+            pass
+    return result
 
 
 def extract_leg_opening(description: str) -> str:
