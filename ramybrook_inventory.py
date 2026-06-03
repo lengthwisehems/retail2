@@ -33,10 +33,15 @@ COLLECTION_HANDLE = "jeans"
 ALGOLIA_APP_ID    = "A3H9DJFT2H"
 ALGOLIA_API_KEY   = "0ab3695a0f8a0d0dc29a11561629b41b"
 ALGOLIA_INDEX     = "shopify_products"
-ALGOLIA_SEARCH_URL = (
-    f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net"
-    f"/1/indexes/{ALGOLIA_INDEX}/query"
-)
+ALGOLIA_COLLECTION_FILTER = "collections:jeans"
+_alg = ALGOLIA_APP_ID.lower()
+ALGOLIA_HOSTS = [
+    f"https://{_alg}-dsn.algolia.net/1/indexes/{ALGOLIA_INDEX}/query",
+    f"https://{_alg}-1.algolia.net/1/indexes/{ALGOLIA_INDEX}/query",
+    f"https://{_alg}-2.algolia.net/1/indexes/{ALGOLIA_INDEX}/query",
+    f"https://{_alg}-3.algolia.net/1/indexes/{ALGOLIA_INDEX}/query",
+    f"https://{_alg}.algolia.net/1/indexes/{ALGOLIA_INDEX}/query",
+]
 
 SWYM_PID      = "JYxW0bO//HIl29BRB2i1vARfPY5YSr+7Xdr/iqq8FgE="
 SWYM_API_BASE = "https://swymstore-v3premium-01.swymrelay.com"
@@ -844,7 +849,12 @@ def fetch_graphql_products(session: requests.Session) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 def fetch_algolia_variant_map(session: requests.Session) -> Dict[str, Dict]:
-    """Return map: variant Shopify ID (str) → Algolia hit."""
+    """Return map: variant Shopify ID (str) → Algolia hit.
+
+    Queries all pages of the jeans collection (distinct=false so every
+    variant record is returned).  Rotates through ALGOLIA_HOSTS for each
+    page request.
+    """
     by_id: Dict[str, Dict] = {}
     page = 0
     headers = {
@@ -852,23 +862,36 @@ def fetch_algolia_variant_map(session: requests.Session) -> Dict[str, Dict]:
         "X-Algolia-API-Key": ALGOLIA_API_KEY,
         "Content-Type": "application/json",
     }
+    import urllib.parse
     while True:
         params = "&".join([
             "distinct=false",
-            f"hitsPerPage=1000",
+            "hitsPerPage=200",
             f"page={page}",
+            f"filters={urllib.parse.quote(ALGOLIA_COLLECTION_FILTER)}",
         ])
+        url = ALGOLIA_HOSTS[page % len(ALGOLIA_HOSTS)]
         try:
-            resp = session.post(
-                ALGOLIA_SEARCH_URL,
-                headers=headers,
-                json={"params": params},
-                timeout=30,
-            )
+            resp = session.post(url, headers=headers,
+                                json={"params": params}, timeout=30)
             resp.raise_for_status()
         except Exception as exc:
-            LOGGER.warning("Algolia page %s failed: %s", page, exc)
-            break
+            LOGGER.warning("Algolia page %s (%s) failed: %s", page, url, exc)
+            # Try remaining hosts before giving up on this page
+            succeeded = False
+            for fallback in ALGOLIA_HOSTS:
+                if fallback == url:
+                    continue
+                try:
+                    resp = session.post(fallback, headers=headers,
+                                        json={"params": params}, timeout=30)
+                    resp.raise_for_status()
+                    succeeded = True
+                    break
+                except Exception:
+                    pass
+            if not succeeded:
+                break
         data = resp.json()
         hits = data.get("hits", [])
         if not hits:
@@ -886,7 +909,7 @@ def fetch_algolia_variant_map(session: requests.Session) -> Dict[str, Dict]:
         if page >= nb_pages:
             break
         time.sleep(SLEEP)
-    log("Algolia variant map: %s entries", len(by_id))
+    log("Algolia variant map: %s entries across %s page(s)", len(by_id), page)
     return by_id
 
 
@@ -1289,7 +1312,9 @@ class RamyBrookScraper:
                            or algolia_map.get(v.get("sku") or "")
                            or {})
                 instore_qty, online_qty, incoming_qty = algolia_inventory(alg_hit)
-                ga_purchases = str(alg_hit.get("recently_ordered_count") or "")
+                qty_str = str(int(instore_qty) + int(online_qty) + int(incoming_qty))
+                roc = alg_hit.get("recently_ordered_count")
+                ga_purchases = str(roc) if roc is not None else ""
 
                 # Collect Algolia categories for step-4 Jean Style (use first hit found)
                 if not algolia_cats and alg_hit:
