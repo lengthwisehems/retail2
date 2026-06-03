@@ -1312,7 +1312,6 @@ class RamyBrookScraper:
                            or algolia_map.get(v.get("sku") or "")
                            or {})
                 instore_qty, online_qty, incoming_qty = algolia_inventory(alg_hit)
-                qty_str = str(int(instore_qty) + int(online_qty) + int(incoming_qty))
                 roc = alg_hit.get("recently_ordered_count")
                 ga_purchases = str(roc) if roc is not None else ""
 
