@@ -75,6 +75,7 @@ CSV_HEADERS = [
     "Quantity Available (Incoming Inventory)",
     "Quantity of style",
     "Google Analytics Purchases",
+    "Purchase Reset Date",
     "Wishlist count",
     "Next Shipment",
     "SKU - Shopify", "SKU - Brand", "Barcode",
@@ -1360,6 +1361,15 @@ class RamyBrookScraper:
                 _set(row, "Quantity of style",
                      str(total_inv) if total_inv is not None else "")
                 _set(row, "Google Analytics Purchases", ga_purchases)
+                alg_updated = alg_hit.get("updated_at") or ""
+                if alg_updated:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(alg_updated.replace("Z", "+00:00"))
+                        alg_updated = dt.strftime("%m/%d/%Y %H:%M:%S")
+                    except ValueError:
+                        pass
+                _set(row, "Purchase Reset Date", alg_updated)
                 _set(row, "Wishlist count",      wishlist)
                 _set(row, "Next Shipment",       next_shipment)
                 _set(row, "SKU - Shopify",       sku_shopify)
