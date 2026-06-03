@@ -74,7 +74,7 @@ CSV_HEADERS = [
     "Quantity Available (Online Inventory)",
     "Quantity Available (Incoming Inventory)",
     "Quantity of style",
-    "Google Analytics Purchases",
+    "Daily Purchases",
     "Purchase Reset Date",
     "Wishlist count",
     "Next Shipment",
@@ -1360,7 +1360,7 @@ class RamyBrookScraper:
                 _set(row, "Quantity Available (Incoming Inventory)", incoming_qty)
                 _set(row, "Quantity of style",
                      str(total_inv) if total_inv is not None else "")
-                _set(row, "Google Analytics Purchases", ga_purchases)
+                _set(row, "Daily Purchases", ga_purchases)
                 alg_updated = alg_hit.get("updated_at") or ""
                 if alg_updated:
                     try:
