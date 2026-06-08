@@ -73,7 +73,8 @@ CSV_HEADERS = [
     "Returns",
     "Quantity Available (Instore Inventory)",
     "Quantity Available (Online Inventory)",
-    "Google Analytics Purchases",
+    "Daily Sales",
+    "Purchase Reset Date",
     "Quantity of style",
     "SKU - Shopify",
     "SKU - Brand",
@@ -1018,6 +1019,13 @@ class PaigeScraper:
                 online_qty = int(locations_inventory.get("82416435483") or 0)
                 instore_qty = inventory_quantity - (online_qty + returns_qty)
                 ga_purchases = safe_string(variant_ref.get("recently_ordered_count") or variant.get("recently_ordered_count"))
+                alg_updated = variant_ref.get("updated_at") or ""
+                if alg_updated:
+                    try:
+                        dt = datetime.fromisoformat(alg_updated.replace("Z", "+00:00"))
+                        alg_updated = dt.strftime("%m/%d/%Y %H:%M:%S")
+                    except ValueError:
+                        pass
 
                 sku_shopify_value = sku_shopify.replace("gid://shopify/ProductVariant/", "")
                 product_line_value = "Maternity" if "maternity" in title.lower() else ""
@@ -1062,6 +1070,7 @@ class PaigeScraper:
                     safe_string(instore_qty),
                     safe_string(online_qty),
                     ga_purchases,
+                    alg_updated,
                     safe_string(style.get("totalInventory") or style.get("variants_inventory_count")),
                     sku_shopify_value,
                     sku_brand,
