@@ -271,6 +271,8 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
           id
           handle
           title
+          description
+          descriptionHtml
           productType
           tags
           vendor
@@ -291,6 +293,10 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
                 sku
                 availableForSale
                 price {
+                  amount
+                  currencyCode
+                }
+                compareAtPrice {
                   amount
                   currencyCode
                 }
@@ -2891,6 +2897,8 @@ class GraphQLQueryBuilder:
         return f"variants{args} {{\n{self._indent(body)}\n}}"
 
     def _build_store_availability_selection(self) -> str:
+        if "storeAvailability" in self.forbidden_fields.get("ProductVariant", set()):
+            return ""
         variant_type = self.schema.get_type("ProductVariant") or {}
         fields = variant_type.get("fields", [])
         store_field = next(
@@ -3664,10 +3672,15 @@ def fallback_collect_from_collections(
     session: requests.Session,
     endpoints: Sequence[str],
     logger: logging.Logger,
+    *,
+    token: Optional[str] = None,
+    token_source: str = "fallback_unauthenticated",
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     for endpoint in endpoints:
         logger.info(
-            "Attempting unauthenticated Storefront fallback via %s", endpoint
+            "Attempting Storefront simple-query fallback via %s (token_source=%s)",
+            endpoint,
+            token_source,
         )
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
@@ -3682,7 +3695,7 @@ def fallback_collect_from_collections(
         for handle in STOREFRONT_COLLECTION_HANDLES:
             if handle not in filters_cache:
                 filters_cache[handle] = probe_collection_filters(
-                    session, endpoint, None, handle, logger
+                    session, endpoint, token, handle, logger
                 )
             handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
@@ -3696,7 +3709,7 @@ def fallback_collect_from_collections(
                     },
                 }
                 response, data = perform_graphql_request(
-                    session, endpoint, payload, token=None
+                    session, endpoint, payload, token=token
                 )
                 if first_status is None and response is not None:
                     first_status = response.status_code
@@ -3777,8 +3790,8 @@ def fallback_collect_from_collections(
         if rows and success:
             accealgolia_entry = {
                 "endpoint": endpoint,
-                "token": "",
-                "token_source": "fallback_unauthenticated",
+                "token": token or "",
+                "token_source": token_source,
                 "status_code": first_status or "",
                 "ok": True,
                 "note": "fallback_success",
@@ -4063,6 +4076,31 @@ def gather_storefront_data(
             "description/tags available, inventory counts unavailable"
         )
         return best_no_inv, access_rows
+
+    # ── Phase 3.5: simple fallback query WITH provided/discovered tokens ──────
+    # The complex introspection query may return no rows for some tokens even
+    # though those tokens are valid; try the simpler FALLBACK_COLLECTION_QUERY
+    # with an authenticated token so we get description/tags in the output.
+    all_tried_tokens = list(dict.fromkeys(
+        [(t, s) for t, s in provided_tokens + discovered_tokens if t is not None]
+    ))
+    for token, source in all_tried_tokens:
+        simple_rows, simple_entry = fallback_collect_from_collections(
+            session,
+            endpoints_to_use,
+            logger,
+            token=token,
+            token_source=f"{source}_simple_fallback",
+        )
+        if simple_entry:
+            access_rows.append(simple_entry)
+        if simple_rows:
+            logger.info(
+                "Storefront: authenticated simple-query fallback succeeded via %s — "
+                "description available, inventory counts unavailable",
+                source,
+            )
+            return simple_rows, access_rows
 
     # ── Phase 4: unauthenticated fallback ────────────────────────────────────
     fallback_rows, fallback_entry = fallback_collect_storefront(
