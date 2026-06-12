@@ -31,7 +31,7 @@ COLLECTION_URL = [
 ]
 MYSHOPIFY = "askk-ny.myshopify.com"
 GRAPHQL = "https://askk-ny.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = []
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["5edd9000b933a8fa88c152d1e498531f","b0c0b5807ac487a691f82a3e9d65f7a6"]
 GRAPHQL_FILTER_TAG = ""
 STOREFRONT_COLLECTION_HANDLES: List[str] = ["jeans"]
 RESTOCK_API_BASE = "https://api.notify-me.app"
@@ -80,15 +80,7 @@ MAX_SCRIPT_FETCHES = 25
 TOKEN_REGEX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 DEFAULT_GRAPHQL_VERSIONS = [
-    "api/2025-10/graphql.json",
-    "api/2024-01/graphql.json",
-    "api/2025-01/graphql.json",
-    "api/2025-07/graphql.json",
-    "api/2025-04/graphql.json",
     "api/unstable/graphql.json",
-    "api/2024-04/graphql.json",
-    "api/2023-01/graphql.json",
-    "api/2023-04/graphql.json",
 ]
 
 COLUMN_ORDER_BASE: Tuple[str, ...] = (
