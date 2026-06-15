@@ -1603,15 +1603,26 @@ def _discover_boost_collection_scope(session: requests.Session, logger: logging.
     return ""
 
 
-def _parse_boost_jsonp(text: str) -> Optional[Dict[str, Any]]:
+def _parse_boost_response(text: str, logger: logging.Logger) -> Optional[Dict[str, Any]]:
     text = text.strip()
-    m = re.match(r'^BoostPFSFilterCallback\((.*)\);?$', text, re.DOTALL)
-    if not m:
-        return None
+    # Try plain JSON first (API returns this when no callback param is set)
     try:
-        return json.loads(m.group(1))
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except ValueError:
-        return None
+        pass
+    # Flexible JSONP: any callback name wrapping a JSON object
+    m = re.search(r'\w+\s*\(\s*(\{.*\})\s*\)\s*;?\s*$', text, re.DOTALL)
+    if m:
+        try:
+            result = json.loads(m.group(1))
+            if isinstance(result, dict):
+                return result
+        except ValueError:
+            pass
+    logger.debug("Boost response preview (first 300 chars): %s", text[:300])
+    return None
 
 
 def fetch_boost_data(
@@ -1644,7 +1655,6 @@ def fetch_boost_data(
             "build_filter_tree": "true",
             "check_cache": "false",
             "locale": "en",
-            "callback": "BoostPFSFilterCallback",
             "event_type": "init",
         }
 
@@ -1668,9 +1678,9 @@ def fetch_boost_data(
             )
             break
 
-        payload = _parse_boost_jsonp(response.text)
+        payload = _parse_boost_response(response.text, logger)
         if payload is None:
-            logger.warning("Boost response on page %s was not valid JSONP", page)
+            logger.warning("Boost response on page %s could not be parsed", page)
             break
 
         products = extract_boost_products(payload)
