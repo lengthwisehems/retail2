@@ -1638,6 +1638,7 @@ def fetch_boost_data(
     rows: List[Dict[str, Any]] = []
     tag_group_counts: Counter[str] = Counter()
     page = 1
+    fetched_so_far = 0
 
     while True:
         params: Dict[str, Any] = {
@@ -1791,10 +1792,12 @@ def fetch_boost_data(
                 rows.append(row)
 
         total = payload.get("total_product", 0)
+        fetched_so_far += len(products)
         logger.info(
-            "Boost page %s: fetched %s products (total=%s)", page, len(products), total
+            "Boost page %s: fetched %s products (total=%s, so_far=%s)",
+            page, len(products), total, fetched_so_far,
         )
-        if page * BOOST_PAGE_SIZE >= total:
+        if fetched_so_far >= total or len(products) == 0:
             break
 
         page += 1
