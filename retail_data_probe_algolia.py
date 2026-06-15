@@ -295,6 +295,8 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
           id
           handle
           title
+          description
+          descriptionHtml
           productType
           tags
           vendor
@@ -315,6 +317,10 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
                 sku
                 availableForSale
                 price {
+                  amount
+                  currencyCode
+                }
+                compareAtPrice {
                   amount
                   currencyCode
                 }
@@ -2716,6 +2722,8 @@ class GraphQLQueryBuilder:
         return f"variants{args} {{\n{self._indent(body)}\n}}"
 
     def _build_store_availability_selection(self) -> str:
+        if "storeAvailability" in self.forbidden_fields.get("ProductVariant", set()):
+            return ""
         variant_type = self.schema.get_type("ProductVariant") or {}
         fields = variant_type.get("fields", [])
         store_field = next(
@@ -3107,6 +3115,7 @@ def collect_storefront_from_collections(
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
+    ever_blocked: Dict[str, Set[str]] = defaultdict(set)
 
     first_status: Optional[int] = None
     view_json_state = ViewJSONEnrichmentState(
@@ -3274,6 +3283,8 @@ def collect_storefront_from_collections(
                     "Retrying collection query without restricted fields: %s",
                     blocked_summary,
                 )
+                for parent, fields in newly_blocked.items():
+                    ever_blocked[parent].update(fields)
             else:
                 logger.debug(
                     "Encountered errors but no removable fields; aborting with failure"
@@ -3281,7 +3292,14 @@ def collect_storefront_from_collections(
                 return [], first_status, "errors"
             continue
 
-        note = "success" if rows else "no_rows"
+        _inventory_fields = {"totalInventory", "quantityAvailable"}
+        _all_blocked: Set[str] = set()
+        for _f in ever_blocked.values():
+            _all_blocked.update(_f)
+        if rows:
+            note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
+        else:
+            note = "no_rows"
         return rows, first_status, note
 
 
@@ -3424,10 +3442,15 @@ def fallback_collect_from_collections(
     session: requests.Session,
     endpoints: Sequence[str],
     logger: logging.Logger,
+    *,
+    token: Optional[str] = None,
+    token_source: str = "fallback_unauthenticated",
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     for endpoint in endpoints:
         logger.info(
-            "Attempting unauthenticated Storefront fallback via %s", endpoint
+            "Attempting Storefront simple-query fallback via %s (token_source=%s)",
+            endpoint,
+            token_source,
         )
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
@@ -3442,7 +3465,7 @@ def fallback_collect_from_collections(
         for handle in STOREFRONT_COLLECTION_HANDLES:
             if handle not in filters_cache:
                 filters_cache[handle] = probe_collection_filters(
-                    session, endpoint, None, handle, logger
+                    session, endpoint, token, handle, logger
                 )
             handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
@@ -3456,7 +3479,7 @@ def fallback_collect_from_collections(
                     },
                 }
                 response, data = perform_graphql_request(
-                    session, endpoint, payload, token=None
+                    session, endpoint, payload, token=token
                 )
                 if first_status is None and response is not None:
                     first_status = response.status_code
@@ -3537,8 +3560,8 @@ def fallback_collect_from_collections(
         if rows and success:
             accealgolia_entry = {
                 "endpoint": endpoint,
-                "token": "",
-                "token_source": "fallback_unauthenticated",
+                "token": token or "",
+                "token_source": token_source,
                 "status_code": first_status or "",
                 "ok": True,
                 "note": "fallback_success",
@@ -3681,7 +3704,7 @@ def gather_storefront_data(
 
     def attempt_with_token(
         token: Optional[str], source: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         global METAFIELD_IDENTIFIERS
         endpoints_iterable = endpoints_to_use
         if token is not None:
@@ -3695,7 +3718,7 @@ def gather_storefront_data(
                     "Skipping token %s entirely; no endpoints reported a successful probe",
                     token,
                 )
-                return None
+                return None, "skipped"
             endpoints_iterable = eligible
 
         for endpoint in endpoints_iterable:
@@ -3743,24 +3766,30 @@ def gather_storefront_data(
 
             if rows:
                 logger.info(
-                    "Storefront extraction succeeded with endpoint %s using token source %s",
+                    "Storefront extraction via %s using token source %s: note=%s",
                     endpoint,
                     source,
+                    note,
                 )
-                return rows
-        return None
+                return rows, note
+        return None, "no_rows"
 
     attempted_sources: set = set()
+    best_partial: Optional[Tuple[List[Dict[str, Any]], Optional[str], str]] = None
 
+    # Phase 1: try provided tokens — return immediately on full inventory success
     if provided_tokens:
         for provided_token, source in provided_tokens:
             if (provided_token, source) in attempted_sources:
                 continue
-            result = attempt_with_token(provided_token, source)
+            result, result_note = attempt_with_token(provided_token, source)
             attempted_sources.add((provided_token, source))
-            if result:
+            if result and result_note == "success":
                 return result, access_rows
+            if result and best_partial is None:
+                best_partial = (result, provided_token, source)
 
+    # Phase 1b: discover new tokens from HTML; Phase 2: try discovered tokens
     discovered_tokens: List[Tuple[Optional[str], str]] = []
     if html_blobs:
         new_tokens = discover_tokens(session, html_blobs, logger)
@@ -3781,17 +3810,46 @@ def gather_storefront_data(
     for token, source in discovered_tokens:
         if (token, source) in attempted_sources:
             continue
-        result = attempt_with_token(token, source)
+        result, result_note = attempt_with_token(token, source)
         attempted_sources.add((token, source))
-        if result:
+        if result and result_note == "success":
             return result, access_rows
+        if result and best_partial is None:
+            best_partial = (result, token, source)
 
+    # Phase 3.5: use the best partial-access token for an authenticated fallback query
+    if best_partial:
+        partial_rows, partial_token, partial_source = best_partial
+        if STOREFRONT_COLLECTION_HANDLES and partial_token is not None:
+            fallback_rows, fallback_entry = fallback_collect_from_collections(
+                session,
+                endpoints_to_use,
+                logger,
+                token=partial_token,
+                token_source=partial_source,
+            )
+            if fallback_rows:
+                logger.info(
+                    "Storefront Phase 3.5 fallback succeeded using token source %s",
+                    partial_source,
+                )
+                if fallback_entry:
+                    access_rows.append(fallback_entry)
+                return fallback_rows, access_rows
+        logger.info(
+            "Storefront returning partial-access rows from token source %s",
+            partial_source,
+        )
+        return partial_rows, access_rows
+
+    # Phase 4: try unauthenticated inline
     if (None, "no_token") not in attempted_sources:
-        result = attempt_with_token(None, "no_token")
+        result, result_note = attempt_with_token(None, "no_token")
         attempted_sources.add((None, "no_token"))
         if result:
             return result, access_rows
 
+    # Phase 4.5: true unauthenticated fallback query
     fallback_rows, fallback_entry = fallback_collect_storefront(
         session, endpoints_to_use, logger
     )
