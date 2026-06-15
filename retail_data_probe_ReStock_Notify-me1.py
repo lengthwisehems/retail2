@@ -3398,6 +3398,7 @@ def collect_storefront_from_collections(
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
+    ever_blocked: Dict[str, Set[str]] = defaultdict(set)
 
     first_status: Optional[int] = None
     view_json_state = ViewJSONEnrichmentState(
@@ -3565,6 +3566,8 @@ def collect_storefront_from_collections(
                     "Retrying collection query without restricted fields: %s",
                     blocked_summary,
                 )
+                for parent, fields in newly_blocked.items():
+                    ever_blocked[parent].update(fields)
             else:
                 logger.debug(
                     "Encountered errors but no removable fields; aborting with failure"
@@ -3574,7 +3577,7 @@ def collect_storefront_from_collections(
 
         _inventory_fields = {"totalInventory", "quantityAvailable"}
         _all_blocked: Set[str] = set()
-        for _f in newly_blocked.values():
+        for _f in ever_blocked.values():
             _all_blocked.update(_f)
         if rows:
             note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
@@ -3613,6 +3616,7 @@ def collect_storefront_from_products(
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
     newly_blocked: Dict[str, Set[str]] = defaultdict(set)
+    ever_blocked_products: Dict[str, Set[str]] = defaultdict(set)
 
     while True:
         try:
@@ -3747,6 +3751,8 @@ def collect_storefront_from_products(
                         "Retrying products query without restricted fields: %s",
                         blocked_summary,
                     )
+                    for parent, fields in newly_blocked.items():
+                        ever_blocked_products[parent].update(fields)
                 else:
                     return [], first_status, "errors"
                 need_retry = False
@@ -3754,7 +3760,7 @@ def collect_storefront_from_products(
 
             _inventory_fields = {"totalInventory", "quantityAvailable"}
             _all_blocked: Set[str] = set()
-            for _f in newly_blocked.values():
+            for _f in ever_blocked_products.values():
                 _all_blocked.update(_f)
             if rows:
                 note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
