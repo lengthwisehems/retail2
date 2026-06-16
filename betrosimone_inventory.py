@@ -202,7 +202,7 @@ def fetch_collection_products() -> List[Dict]:
     while True:
         page += 1
         logger.info("Fetching collection page %s", page)
-        data = graphql_request({"handle": "denim", "cursor": cursor})
+        data = graphql_request({"handle": "denim-collections", "cursor": cursor})
         collection = data.get("data", {}).get("collection")
         if not collection:
             break
