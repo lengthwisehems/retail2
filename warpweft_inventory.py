@@ -394,7 +394,8 @@ def fetch_products() -> List[Dict[str, Any]]:
         )
         for edge in product_edges:
             node = edge.get("node") or {}
-            if not should_include_product(node.get("title")):
+            title = (node.get("title") or "").lower()
+            if any(keyword in title for keyword in EXCLUDED_TITLE_KEYWORDS):
                 continue
             products.append(node)
         page_info = (
@@ -410,14 +411,6 @@ def fetch_products() -> List[Dict[str, Any]]:
     LOGGER.info("Fetched %s qualifying products", len(products))
     return products
 
-
-def should_include_product(title: Optional[str]) -> bool:
-    if not title:
-        return False
-    lowered = title.lower()
-    if any(keyword in lowered for keyword in EXCLUDED_TITLE_KEYWORDS):
-        return False
-    return True
 
 
 def fetch_searchspring_results() -> Dict[str, Dict[str, Any]]:
