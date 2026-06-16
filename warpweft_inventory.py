@@ -45,7 +45,7 @@ GRAPHQL_PATH = "/api/2024-04/graphql.json"
 STOREFRONT_TOKEN = "8473dc07111af05dd96ecf3f061a64ac"
 GRAPHQL_PAGE_SIZE = 100
 
-SEARCHSPRING_URL = "https://dkc5xr.a.searchspring.io/api/search/autocomplete.json"
+SEARCHSPRING_URL = "https://dkc5xr.a.searchspring.io/api/search/search.json"
 SEARCHSPRING_PARAMS = {
     "siteId": "dkc5xr",
     "resultsFormat": "json",
@@ -92,13 +92,108 @@ CSV_HEADERS = [
     "Stretch",
 ]
 
-TARGET_PRODUCT_TYPES = {
-    "Women's Jeans",
-    "Women's Plus Size Jeans",
-    "Women's Regular Size Jeans",
+EXCLUDED_TITLE_KEYWORDS = {
+    "accessories",
+    "accessory",
+    "bermuda",
+    "bermudas",
+    "blazer",
+    "blazers",
+    "blouse",
+    "blouses",
+    "bodysuit",
+    "bodysuits",
+    "capri",
+    "cardigan",
+    "cardigans",
+    "clothing top",
+    "clothing tops",
+    "coat",
+    "coats",
+    "coats & jackets",
+    "core handbags",
+    "corset",
+    "corsets",
+    "crop top",
+    "crop tops",
+    "denim short",
+    "denim shorts",
+    "dress",
+    "dresses",
+    "fashion core handbag",
+    "fashion core handbags",
+    "fashion handbag",
+    "fashion handbags",
+    "goodies accessories",
+    "goodies accessory",
+    "handbag",
+    "heel",
+    "heels",
+    "hoodie",
+    "hoodies",
+    "jacket",
+    "jackets",
+    "jogger short",
+    "jogger shorts",
+    "jumpsuit",
+    "jumpsuits",
+    "long sleeve",
+    "long sleeves",
+    "neck",
+    "one piece",
+    "one pieces",
+    "one-piece",
+    "one-pieces",
+    "outerwear",
+    "pant",
+    "pant suit",
+    "pant suits",
+    "pants",
+    "purse",
+    "romper",
+    "rompers",
+    "sandel",
+    "sandle",
+    "shacket",
+    "shipping protection",
+    "shirt",
+    "shirts",
+    "shirts & tops",
+    "shoe",
+    "shoes",
+    "short",
+    "shorts",
+    "skirt",
+    "skirts",
+    "suit",
+    "suits",
+    "sweat",
+    "sweater",
+    "sweaters",
+    "sweatpant",
+    "sweatpants",
+    "sweats",
+    "sweatshirt",
+    "sweatshirts",
+    "swim",
+    "t shirt",
+    "t shirts",
+    "t-shirt",
+    "t-shirts",
+    "tank",
+    "tank tops",
+    "tee",
+    "tees",
+    "top",
+    "tops",
+    "tote",
+    "trench",
+    "vest",
+    "vests",
+    "zip up",
 }
-
-EXCLUDED_TITLE_KEYWORDS = {"dress", "short", "skirt", "jacket", "shirt", "vest", "tee"}
+EXCLUDE_TAG_KEYWORDS = {"Men's", "MEN", "mens-jeans", "men"}
+EXCLUDE_PRODUCT_TYPES = {"Men", "Man", "Boy"}
 ALLOWED_INSEAMS = {
     "25",
     "25.25",
@@ -286,6 +381,8 @@ def post_graphql(payload: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_products() -> List[Dict[str, Any]]:
     products: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
+    tag_excludes = {k.lower() for k in EXCLUDE_TAG_KEYWORDS}
+    type_excludes = {k.lower() for k in EXCLUDE_PRODUCT_TYPES}
     while True:
         payload = {
             "query": GRAPHQL_QUERY,
@@ -301,7 +398,14 @@ def fetch_products() -> List[Dict[str, Any]]:
         )
         for edge in product_edges:
             node = edge.get("node") or {}
-            if not should_include_product(node.get("title"), node.get("productType")):
+            title = (node.get("title") or "").lower()
+            if any(keyword in title for keyword in EXCLUDED_TITLE_KEYWORDS):
+                continue
+            tags_lower = {t.lower() for t in (node.get("tags") or [])}
+            if tags_lower & tag_excludes:
+                continue
+            product_type = (node.get("productType") or "").lower()
+            if any(product_type.startswith(k) for k in type_excludes):
                 continue
             products.append(node)
         page_info = (
@@ -317,16 +421,6 @@ def fetch_products() -> List[Dict[str, Any]]:
     LOGGER.info("Fetched %s qualifying products", len(products))
     return products
 
-
-def should_include_product(title: Optional[str], product_type: Optional[str]) -> bool:
-    if not title or not product_type:
-        return False
-    if product_type not in TARGET_PRODUCT_TYPES:
-        return False
-    lowered = title.lower()
-    if any(keyword in lowered for keyword in EXCLUDED_TITLE_KEYWORDS):
-        return False
-    return True
 
 
 def fetch_searchspring_results() -> Dict[str, Dict[str, Any]]:
