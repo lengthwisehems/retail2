@@ -513,7 +513,8 @@ def main() -> None:
         notify_me = abs(qty) if isinstance(qty, int) and qty < 0 else 0
         style_id = var.product_id
 
-        product_field = f"{var.product_title} / {var.color.upper()}" if var.color else var.product_title
+        clean_title = var.product_title.replace("(Final Sale) ", "")
+        product_field = f"{clean_title} / {var.color.upper()}" if var.color else clean_title
         style_total = 0
         if product_field not in style_totals_by_product:
             color_lower = var.color.lower().strip()
@@ -583,7 +584,7 @@ def main() -> None:
             to_mmddyy(published_at),
             to_mmddyy(created_at),
             product_field,
-            var.product_title,
+            clean_title,
             var.product_type,
             ", ".join(var.tags),
             var.vendor,
