@@ -6,6 +6,7 @@ import argparse
 import html
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -24,46 +25,96 @@ from requests.adapters import HTTPAdapter, Retry
 # ---------------------------------------------------------------------------
 # Brand-specific configuration
 # ---------------------------------------------------------------------------
-BRAND = "rudes"
+BRAND = "askkny"
 COLLECTION_URL = [
-    "https://rudesdenim.com/collections/shop-all",
+    "https://askkny.com/collections/jeans",
 ]
-MYSHOPIFY = "rudes-jeans.myshopify.com"
-GRAPHQL = "https://rudes-jeans.myshopify.com/api/unstable/graphql.json"
-X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["58ea06b1762dd2cd2daa40fa0ec73fc7", "613495450fdb8311dc884a818be104cc"]
+MYSHOPIFY = "askk-ny.myshopify.com"
+GRAPHQL = "https://askk-ny.myshopify.com/api/unstable/graphql.json"
+X_SHOPIFY_STOREFRONT_ACCESS_TOKEN: List[str] = ["5edd9000b933a8fa88c152d1e498531f","b0c0b5807ac487a691f82a3e9d65f7a6"]
 GRAPHQL_FILTER_TAG = ""
-STOREFRONT_COLLECTION_HANDLES: List[str] = ["shop-all"]
+STOREFRONT_COLLECTION_HANDLES: List[str] = ["jeans"]
 RESTOCK_API_BASE = "https://api.notify-me.app"
 RESTOCK_API_KEY = ""  # From notify-me Admin Panel → API Keys
-METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = [
-    ("attributes", "colorVariants"),
-    ("attributes", "inseamVariants"),
-    ("attributes", "fitVariants"),
-    ("attributes", "fabricationVariants"),
-    ("attributes", "shopTheLook"),
-    ("attributes", "specs"),
-    ("attributes", "fit"),
-    ("attributes", "rise"),
-    ("attributes", "denimFabric"),
-    ("attributes", "gender"),
-    ("attributes", "categoryPrimary"),
-    ("attributes", "sizeType"),
-    ("attributes", "sku"),
-    ("attributes", "stretch"),
-    ("attributes", "styleContent"),
-    ("attributes", "color"),
-    ("attributes", "colorCategory"),
-    ("attributes", "colorCategory2"),
-    ("attributes", "dressLength"),
-    ("attributes", "wash"),
-    ("attributes", "closure"),
-    ("attributes", "sleeveLength"),
-    ("attributes", "length"),
-    ("attributes", "clothingType"),
-    ("attributes", "clothingFamily"),
-    ("attributes", "category"),
-    ("attributes", "productType"),
+
+# RestockRocket + STOQ demand config (ASKKNY uses RestockRocket, not notify-me.app)
+RESTOCKROCKET_SHOP_DOMAIN = "askk-ny.myshopify.com"
+RESTOCKROCKET_MARKET_ID = "2005008642"
+RESTOCKROCKET_API_BASE = "https://app.restockrocket.io"
+ONLINE_STORE_BASE = "https://askkny.com"
+STOQ_DEMAND_API_BASE = "https://app.stoqapp.com/api/v1/external"
+STOQ_DEMAND_API_TOKEN: List[str] = [
+    "01b0e14dfba934be30bc7319ba7b574ccb619a4c","0c4ec5b7cc0fe10b58953ebe31382abb357a3552",
+    "0d60871b1457ab0a3a9f9f73f33fb5d7fa20bb2b","17279dafe3de0250b6e197dffb57aae14937af2d",
+    "2019d890f07b1852f56ce63ba45b2db45d852cba","21565f67bf43b79521491de12d5af3c870d330f1",
+    "250b91b7cd74bf7ff4cf91704c5dac0b43123985","250d51708d76acbac296b0e21ede8f81de4e37aa",
+    "26caedc0c0f332f957d0fb6b24adee050844cce5","26d58acded10f05e5a6e64350e625f29fc998fb7",
+    "2d51df19fc241598fa315d308c353621017a1ad0","370ef8ffef154dc56bb5a814fea4666724353464",
+    "378cfcfdf81fc283cfe6d351ad427d198bb50d3b","3a3e565094bdcce320e8daba9f0977375ae8d310",
+    "409c1b145edcaa994345418c7d6493a2449fc3ab","43bb7e5872e385c7292af8c173643c8bbb93c5e2",
+    "43f28b304c058503374e25edfb214b7eed123afc","463c7a821973a3c5a0f25522db8ffef776e28567",
+    "4c3596addb26e2727cd6f344c2eb27590c6934f6","50ae3e156aed9a794db7e94c4d00984c7b66616c",
+    "5937a8d2026e0cd8ad34f65eeea5f2e1bf715c8b","59c6445835a09bbe3a4b29dcb6f6cd6b0badb8b1",
+    "5dced1e1f897f561a8304b6ef1c533d81fd1c6e0","65fd8f24b452c1f8a3112ed7056cebb9d2990a84",
+    "6c17fabdef8f8d1808aafff6115bf384c07f7045","6e9875ce64e0fefcd3f4446b7ec9036b3ddd2985",
+    "76422eafd6389e646d05774bc60900ad6ec5eeac","7b7b6c281d8735c650fe74b2645f326e6dc00ca7",
+    "7c3c7232e4d426b133fb7a1458ee5a6faa371eaf","810a806fe9ab3d05f9e2bfc701aba0774b1866b5",
+    "84bada07fb06c8b960cfa745cbb94cde8e5dc650","9120912a469cad1cc292572851508ca49d12e768",
+    "92eccbb57f92ee7c9c287a0bcf76428716056d3f","941e77e7da7100043c9368bf8e9d92c733a27ea9",
+    "948d7e184fee6871cd19ed1aaf82584a483aa44c","9dabdc36496bb1750646eff86b219175d023a054",
+    "9de21910b9048ec6cb4ef0826d2a072d0cb02af0","9de872434eff586606086bb8c397f295f7d9080e",
+    "9ead99ec2e670b1abd1e921ae8e9276661c9415a","a553ed5d0b053105250721edae5e205bc8d6c2ea",
+    "ad33ffe07719ed164c79f5c1f6c39e48b5e7bed6","ad44973b5d1c4fff4b3f62d3044a69abee834195",
+    "ad9fd50711bfef8f6a6ab33d0bccca3683df4dae","ae936bd6b977ede47a47817389f3f4c88af83bf3",
+    "b2cbcfa81550fc99b5d970d0ef582eebcbac24e0","b4d6053f6880876d4cf86ad42eb7cbb5ee59cdae",
+    "b77c20e29c78203ef11522995da78e9c5d6c841d","b87de4a880d98305d4accb411a7b56974bc28805",
+    "bac2e57e931ee0cc84b7c8e92782505b1ccf42db","baeb51700705ac37ed422f09fff04a0bf9900422",
+    "bca01f80a8d112684fae7009f639fc69794554c6","becf89c65d14c1cd6eadf48235bff90730c421b4",
+    "bfb9cabb910d07a5270ad0a73e1e3218ad840b9b","c1830bf4389ca5490d90273929e90e9e51c05d93",
+    "c1f2ec5f1192f6a3b389105ef8398a47a3f59a5c","c55e238fa2ec499b6b210fa91c4b57bd86ad4e74",
+    "c6cefc5d15cf2a9612a66b50122d6b2ebbeb1f40","cbe11091b91c8f140bf47b6656218b19b0bd9fac",
+    "cd339af72d007033d09178ed5eb6427cb8e3626f","cdbfc001bf7647698fff34a09dc1c625e4008e01",
+    "ce5b07ba71d2f4ad7dda0ced439c6b20c954e263","d09f0488bf8aadd48534c94ac3f185fbc9ddb168",
+    "d4abc6d1a17bf67d841eebbce4037e3318fe028b","db59112d478d869a18e18c46f32dd02527fdaeeb",
+    "ea768d11e4f2286d9ce6ea227f18adab1594464c","ea92879e13620ad4c849c1d0322334fb409ed111",
+    "ebac5b0bbbfad81c1d7784c51c525832e7700a38","ef8e45518f25e8ef6cb273301be3cb3d733a7627",
+    "f00a8f424d89335422674eb836916c2a19816c17","fcbfac652f9e5da6f9e4ac7f44d8727a475d3d4d",
+    "1gfpSe78z9bOUYXR6Vi04eTrLKLhCsl8mQrDd0Of","53JZRPVUIdSUf4Va2dSkf4oTuPrTuXcEfPVnpTbb",
+    "80lkLFQEKBTtRuLyHpuS8kziuVnfHIFut4nHwtNi","Bxj5GA8AuRwMYGkAPywL13jaY2BkYGA88P8Agx4j",
+    "EQAAAAARAAAAAAkSAAAAAAASAAASAAAaAAAAGhoa","GC3zejYAJN7ZbjcFrJffCORFSU4g5u6lODsFCaNj",
+    "J500ogrhCO1YXLa7Mf0GaioaLVFRbLmmrSEUQ1Gh","JBg9coBtWBFHBexluEqp8KUDungGK8xWgMKthvtO",
+    "JDEsssRQ4BffOom84X9GIBs7PNSXyVtakLzD8WTI","K0ccwBrCqIhbWHQe9PIXboCNf78NRyuaTxhRw1tl",
+    "Um0xVuKd32NmaORL3kGIpLqZZsveQ6O2iZW0CmRS","XzTdQMM9D37JGOcmc4ArpEO12UQYECa36puTFDSR",
+    "ZBfXCOQPcDv53SU6uv1z6OoZJTmeQrEb2FiuiJzT","g5URnvJ2W9kkr1OfzGH4QXboPpjJh7Gg2GaJE6kQ",
+    "kpY2hd9LR0vEahLnIAEDtOIb9ST5vcW0IGbnkL0D","yDTCjK9chs4dxJ0LhovceTuO4AaNihZnlEHoO6TA",
+    "yGWwrZuvUtx64myYsCUJV5tnlh5lmo6KnEF7H8rL","yxopYshQiEvnvu0dURgDt8QeC8PDw7Fpji3fEA4z",
+    "e35d7136cee78d344ccffdbd5ca710fa","e6b446c1ebe782e2b2fc7eb8ef0dc791",
+    "e74ee5ae97d1c189b777660247de8060","e_53fd82dc1f9722eff524544be73e81c5",
+    "ec2492d144aa9e984e2e2c7ad5919066","ee7ba25f-d96d-4ee2-a8ea-eb50c89c0416",
+    "f6230da5b245e33af75911438d1b7b03","f63e4eb97bf1048032c58ff11ebad73d",
+    "f9a4a9d34d1622738f51122441e538d6","0f2a5a5dc601edd15afb14df4e1da31d",
+    "22791d21adae15895005fd4d30e97323","281b8829b4a4fa0b5823dd892016f174",
+    "3984fa1e6e840e26b4b633004c65a259","53b350424ad3befd06d6dfa904658f4f",
+    "58bafb0cf50e1c5b7d24534c1f262f5f","5d8bd40edd6c9292421cffb07d4411b2",
+    "6837fb59b443bf6ff75f4cd2c4d7e98c","6f683e3ebd66557dc22070312a22f86c",
+    "703c5a45-4ba1-4cf9-b829-5f08d6e3274a","731f9a5940fb79ed022ea422ec694316",
+    "75a4dcd0bcce08f7ba94e1097634f869","76d4f10ada8ba24ed94a3ee68cb81219",
+    "7af284a1246bfda4117988ca4931d52b","7e04a402d3940146b566f4cb7616c3c8",
+    "8540e04c51deb932b3512a658ee91c4a","8563b4336aeff9eb7dd56ecd4eb25a64",
+    "9052fcee29b193a750ffdd52ed7eb2d9","9b31c47506307c6ccb0e1d87bf992963",
+    "AUcmHiu1Z7B62sxa133jrppmV70","AdTLPvHPKlgOqwJyDGDcXHVcyA4",
+    "a4235c67024eca39e8c3fe4056913759","b0fd0fdc8bb502fbe050eab3315cf081",
+    "b34bebf41fff295b489082da37646238","bcbc9f6762da195561967577c2d74ff8",
+    "d8d5b434f44fd252bc17eab6111d6962",
 ]
+STOQ_TOKEN_ENV_VARS = [
+    "RR_DEMAND_API_TOKEN", "RESTOCK_ROCKET_DEMAND_TOKEN", "STOQ_API_TOKEN",
+    "accessToken", "access_token", "access-token", "apiKey", "api_key", "api-key",
+    "ApiKeyAuth", "client_secret", "token", "authToken", "AUTH-TOKEN",
+    "storeFrontApi", "x-auth-token", "YOUR_API_KEY",
+]
+STOQ_DEMAND_PAGE_SIZE = 500
+METAFIELD_IDENTIFIERS: List[Tuple[str, str]] = []
 COLLECTION_TITLE_MAP: Dict[str, str] = {}
 VIEW_JSON_ENRICHMENT_ENABLED = False
 VIEW_JSON_FIELDS = [
@@ -97,15 +148,7 @@ MAX_SCRIPT_FETCHES = 25
 TOKEN_REGEX = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
 
 DEFAULT_GRAPHQL_VERSIONS = [
-    "api/2025-10/graphql.json",
-    "api/2024-01/graphql.json",
-    "api/2025-01/graphql.json",
-    "api/2025-07/graphql.json",
-    "api/2025-04/graphql.json",
     "api/unstable/graphql.json",
-    "api/2024-04/graphql.json",
-    "api/2023-01/graphql.json",
-    "api/2023-04/graphql.json",
 ]
 
 COLUMN_ORDER_BASE: Tuple[str, ...] = (
@@ -288,6 +331,8 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
           id
           handle
           title
+          description
+          descriptionHtml
           productType
           tags
           vendor
@@ -308,6 +353,10 @@ query CollectionFallback($handle: String!, $cursor: String, $pageSize: Int!) {
                 sku
                 availableForSale
                 price {
+                  amount
+                  currencyCode
+                }
+                compareAtPrice {
                   amount
                   currencyCode
                 }
@@ -1665,11 +1714,397 @@ def _restock_clean_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# RestockRocket + STOQ demand helpers
+# ---------------------------------------------------------------------------
+
+def _rr_get(
+    session: requests.Session, path: str, logger: logging.Logger, **kwargs: Any
+) -> requests.Response:
+    url = f"{RESTOCKROCKET_API_BASE}{path}"
+    resp = session.get(url, timeout=REQUEST_TIMEOUT, verify=False, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
+def _fetch_rr_settings(session: requests.Session, logger: logging.Logger) -> Dict[str, Any]:
+    params = {"shop": RESTOCKROCKET_SHOP_DOMAIN, "translation_locale": "en_us"}
+    resp = _rr_get(session, "/api/v1/setting.json", logger, params=params)
+    data = resp.json()
+    logger.info("RR settings fetched: id=%s shop_id=%s", data.get("id"), data.get("shop_id"))
+    return data if isinstance(data, dict) else {}
+
+
+def _fetch_rr_preorder_ids(session: requests.Session, logger: logging.Logger) -> List[int]:
+    params = {"shop": RESTOCKROCKET_SHOP_DOMAIN, "shopify_market_id": RESTOCKROCKET_MARKET_ID}
+    resp = _rr_get(session, "/api/v1/embed/preorder_variant_ids.json", logger, params=params)
+    data = resp.json()
+    logger.info("RR preorder variant IDs: %s", len(data) if isinstance(data, list) else 0)
+    return data if isinstance(data, list) else []
+
+
+def _fetch_rr_shipping_texts(session: requests.Session, logger: logging.Logger) -> Dict[str, Any]:
+    params = {"shop": RESTOCKROCKET_SHOP_DOMAIN, "shopify_market_id": RESTOCKROCKET_MARKET_ID}
+    resp = _rr_get(session, "/api/v1/embed/preorder_variant_shipping_texts.json", logger, params=params)
+    data = resp.json()
+    logger.info("RR shipping texts: %s variants", len(data) if isinstance(data, dict) else 0)
+    return data if isinstance(data, dict) else {}
+
+
+def _fetch_rr_variant_preorder_limits(session: requests.Session, logger: logging.Logger) -> Dict[str, Any]:
+    params = {"shop": RESTOCKROCKET_SHOP_DOMAIN, "shopify_market_id": RESTOCKROCKET_MARKET_ID}
+    resp = _rr_get(session, "/api/v1/embed/variant_preorder_limits.json", logger, params=params)
+    data = resp.json()
+    logger.info("RR preorder limits: %s", list(data.keys()) if isinstance(data, dict) else [])
+    return data if isinstance(data, dict) else {}
+
+
+def _fetch_rr_variant_data(
+    session: requests.Session, logger: logging.Logger, product_id: str
+) -> Dict[str, Dict[str, Any]]:
+    params = {
+        "product_id": product_id,
+        "shopify_market_id": RESTOCKROCKET_MARKET_ID,
+        "shop": RESTOCKROCKET_SHOP_DOMAIN,
+        "include_all_variants": "true",
+    }
+    resp = _rr_get(session, "/api/v1/embed/variant_data.json", logger, params=params)
+    data = resp.json()
+    if isinstance(data, dict):
+        logger.info("RR variant data for product %s: %s variants", product_id, len(data))
+        return data
+    return {}
+
+
+def _probe_stoq_token(
+    session: requests.Session, token: str, logger: logging.Logger
+) -> bool:
+    """Return True if `token` is accepted by the STOQ demand API (non-401/403 response)."""
+    try:
+        resp = session.get(
+            f"{STOQ_DEMAND_API_BASE}/intents/products_in_demand",
+            headers={"X-Auth-Token": token},
+            params={"per_page": 1, "page": 1},
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+        )
+        if resp.status_code in (401, 403):
+            return False
+        return resp.ok
+    except requests.RequestException:
+        return False
+
+
+def _resolve_stoq_token(
+    session: requests.Session,
+    settings: Optional[Dict[str, Any]],
+    logger: logging.Logger,
+) -> Optional[str]:
+    """Collect all candidate STOQ tokens and return the first one that the API accepts."""
+    candidates: List[str] = []
+
+    # 1. From RR settings response
+    if settings:
+        for key in ["external_api_key", "demand_api_key", "api_token", "apiKey"]:
+            val = settings.get(key)
+            if val and str(val) not in candidates:
+                candidates.append(str(val))
+
+    # 2. From STOQ_DEMAND_API_TOKEN (may be a list or a single string)
+    if isinstance(STOQ_DEMAND_API_TOKEN, list):
+        for t in STOQ_DEMAND_API_TOKEN:
+            if t and t not in candidates:
+                candidates.append(t)
+    elif STOQ_DEMAND_API_TOKEN:
+        if STOQ_DEMAND_API_TOKEN not in candidates:
+            candidates.append(STOQ_DEMAND_API_TOKEN)
+
+    # 3. From env vars
+    for env_key in STOQ_TOKEN_ENV_VARS:
+        val = os.environ.get(env_key)
+        if val and val not in candidates:
+            candidates.append(val)
+
+    if not candidates:
+        logger.warning("No STOQ demand API token candidates found; demand data will be skipped")
+        return None
+
+    logger.info("STOQ: probing %s token candidate(s) against demand API", len(candidates))
+    for token in candidates:
+        if _probe_stoq_token(session, token, logger):
+            logger.info("STOQ: working token found (...%s)", token[-6:])
+            return token
+
+    logger.warning(
+        "STOQ: none of %s candidate token(s) were accepted; demand data will be skipped",
+        len(candidates),
+    )
+    return None
+
+
+def _fetch_stoq_demand(
+    session: requests.Session, logger: logging.Logger, api_token: Optional[str]
+) -> List[Dict[str, Any]]:
+    if not api_token:
+        return []
+    headers = {"X-Auth-Token": api_token}
+    params: Dict[str, Any] = {"per_page": STOQ_DEMAND_PAGE_SIZE, "page": 1}
+    results: List[Dict[str, Any]] = []
+    while True:
+        try:
+            resp = session.get(
+                f"{STOQ_DEMAND_API_BASE}/intents/products_in_demand",
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+                verify=False,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("STOQ demand page %s failed: %s", params.get("page"), exc)
+            break
+        payload = resp.json()
+        batch = payload.get("product_variants_in_demand", []) if isinstance(payload, dict) else []
+        results.extend(batch)
+        logger.info(
+            "STOQ demand page %s: %s variants (total %s)",
+            params.get("page"), len(batch), len(results),
+        )
+        if not payload.get("has_next_page"):
+            break
+        params["page"] = params.get("page", 1) + 1
+    return results
+
+
+def _build_rr_cached_sets(
+    variant_data_map: Dict[str, Dict[str, Any]], preorder_ids: List[int]
+) -> Dict[str, Any]:
+    preorder_id_set = {str(v) for v in preorder_ids}
+    in_stock: List[str] = []
+    out_stock: List[str] = []
+    for vid, payload in variant_data_map.items():
+        if payload.get("available") is True:
+            in_stock.append(vid)
+        elif payload.get("available") is False:
+            out_stock.append(vid)
+    return {
+        "cachedPreorderVariantIds": sorted(preorder_id_set),
+        "cachedInStockVariantIds": in_stock,
+        "cachedOutOfStockVariantIds": out_stock,
+    }
+
+
+def fetch_restockrocket_rows(
+    session: requests.Session, logger: logging.Logger
+) -> List[Dict[str, Any]]:
+    """Call RestockRocket + STOQ demand APIs and return normalized rows for the ReStock tab."""
+    logger.info("RestockRocket: fetching data for %s", RESTOCKROCKET_SHOP_DOMAIN)
+
+    try:
+        settings = _fetch_rr_settings(session, logger)
+    except Exception as exc:
+        logger.warning("RR settings fetch failed: %s", exc)
+        settings = {}
+    try:
+        preorder_ids = _fetch_rr_preorder_ids(session, logger)
+    except Exception as exc:
+        logger.warning("RR preorder IDs fetch failed: %s", exc)
+        preorder_ids = []
+    try:
+        shipping_texts = _fetch_rr_shipping_texts(session, logger)
+    except Exception as exc:
+        logger.warning("RR shipping texts fetch failed: %s", exc)
+        shipping_texts = {}
+    try:
+        preorder_limits = _fetch_rr_variant_preorder_limits(session, logger)
+    except Exception as exc:
+        logger.warning("RR preorder limits fetch failed: %s", exc)
+        preorder_limits = {}
+
+    stoq_token = _resolve_stoq_token(session, settings, logger)
+    demand_entries = _fetch_stoq_demand(session, logger, stoq_token)
+    demand_map: Dict[str, Dict[str, Any]] = {}
+    for entry in demand_entries:
+        vid = entry.get("shopify_variant_id")
+        if vid is not None:
+            demand_map[str(vid)] = entry
+
+    # Paginate collection products.json
+    products: List[Dict[str, Any]] = []
+    products_url = (COLLECTION_URL[0].rstrip("/") + "/products.json") if COLLECTION_URL else None
+    if products_url:
+        page = 1
+        while True:
+            try:
+                resp = session.get(
+                    products_url,
+                    params={"limit": 250, "page": page},
+                    timeout=REQUEST_TIMEOUT,
+                    verify=False,
+                )
+                resp.raise_for_status()
+                batch = resp.json().get("products", [])
+            except Exception as exc:
+                logger.warning("RR: collection JSON page %s failed: %s", page, exc)
+                break
+            if not batch:
+                break
+            products.extend(batch)
+            logger.info(
+                "RR: collection page %s → %s products (total %s)", page, len(batch), len(products)
+            )
+            if len(batch) < 250:
+                break
+            page += 1
+            time.sleep(0.25)
+
+    if not products:
+        logger.warning("RestockRocket: no products found in collection")
+        return []
+
+    # Fetch per-product variant data from RR API
+    variant_data_map: Dict[str, Dict[str, Any]] = {}
+    for product in products:
+        pid = str(product.get("id") or "")
+        if not pid:
+            continue
+        try:
+            data = _fetch_rr_variant_data(session, logger, pid)
+            for vid, payload in data.items():
+                variant_data_map[str(vid)] = payload
+        except Exception as exc:
+            logger.warning("RR variant data for product %s failed: %s", pid, exc)
+
+    preorder_id_set = {str(v) for v in preorder_ids}
+    shipping_text_map = {str(k): v for k, v in (shipping_texts or {}).items()}
+    variant_limit_map: Dict[str, Any] = {}
+    if isinstance(preorder_limits, dict):
+        raw_limits = preorder_limits.get("variant_preorder_limits") or {}
+        variant_limit_map = {str(k): v for k, v in raw_limits.items()}
+
+    cached_sets = _build_rr_cached_sets(variant_data_map, preorder_ids)
+    settings_json = json.dumps(settings) if settings else None
+    preorder_ids_json = json.dumps(preorder_ids)
+    preorder_limits_json = json.dumps(preorder_limits) if preorder_limits else None
+    shipping_texts_json = json.dumps(shipping_texts) if shipping_texts else None
+
+    rows: List[Dict[str, Any]] = []
+    for product in products:
+        for variant in product.get("variants") or []:
+            vid = str(variant.get("id"))
+            rr_variant = variant_data_map.get(vid, {})
+            preorder_limit_entry = variant_limit_map.get(vid) or {}
+            demand_entry = demand_map.get(vid, {})
+
+            demand_product_data = demand_entry.get("product_data") if demand_entry else None
+            demand_variant_data = demand_entry.get("variant_data") if demand_entry else None
+
+            rows.append({
+                "product.id": str(product.get("id")),
+                "product.handle": product.get("handle"),
+                "product.published_at": product.get("published_at"),
+                "product.created_at": product.get("created_at"),
+                "product.title": product.get("title"),
+                "product.productType": product.get("product_type"),
+                "product.tags_all": (
+                    ",".join(product.get("tags", []))
+                    if isinstance(product.get("tags"), list)
+                    else product.get("tags")
+                ),
+                "product.vendor": product.get("vendor"),
+                "product.descriptionHtml": product.get("body_html"),
+                "variant.title": variant.get("title"),
+                "variant.option1": variant.get("option1"),
+                "variant.option2": variant.get("option2"),
+                "variant.option3": variant.get("option3"),
+                "variant.price": variant.get("price"),
+                "variant.compare_at_price": variant.get("compare_at_price"),
+                "variant.available": variant.get("available"),
+                "variant.quantityAvailable": rr_variant.get("inventory_quantity"),
+                "variant.id": vid,
+                "variant.sku": variant.get("sku"),
+                "variant.barcode": variant.get("barcode"),
+                "product.images[0].src": (
+                    product["images"][0].get("src") if product.get("images") else None
+                ),
+                "product.onlineStoreUrl": f"{ONLINE_STORE_BASE}/products/{product.get('handle')}",
+                "rr.inventory_policy": rr_variant.get("inventory_policy"),
+                "rr.variant_available": rr_variant.get("available"),
+                "rr.variant_price": rr_variant.get("price"),
+                "rr.preorder_flag": vid in preorder_id_set,
+                "rr.shipping_text": shipping_text_map.get(vid),
+                "rr.preorder_count": (
+                    preorder_limit_entry.get("preorder_count")
+                    if isinstance(preorder_limit_entry, dict) else None
+                ),
+                "rr.preorder_max_count": (
+                    preorder_limit_entry.get("preorder_max_count")
+                    if isinstance(preorder_limit_entry, dict) else None
+                ),
+                "rr.preorder_count_market": (
+                    preorder_limit_entry.get("preorder_count_market")
+                    if isinstance(preorder_limit_entry, dict) else None
+                ),
+                "rr.preorder_max_count_market": (
+                    preorder_limit_entry.get("preorder_max_count_market")
+                    if isinstance(preorder_limit_entry, dict) else None
+                ),
+                "rr.preorder_limit": (
+                    json.dumps(variant_limit_map[vid])
+                    if variant_limit_map.get(vid) is not None else None
+                ),
+                "rr.settings": settings_json,
+                "rr.cachedSettings": settings_json,
+                "rr.cachedPreorderVariantIds": preorder_ids_json,
+                "rr.cachedVariantPreorderLimits": preorder_limits_json,
+                "rr.cachedVariantShippingTexts": shipping_texts_json,
+                "rr.cachedInStockVariantIds": json.dumps(
+                    cached_sets.get("cachedInStockVariantIds")
+                ),
+                "rr.cachedOutOfStockVariantIds": json.dumps(
+                    cached_sets.get("cachedOutOfStockVariantIds")
+                ),
+                "rr.variant_payload_raw": json.dumps(rr_variant) if rr_variant else None,
+                "demand.total": demand_entry.get("total") if demand_entry else None,
+                "demand.pending": demand_entry.get("pending") if demand_entry else None,
+                "demand.last_requested_at": (
+                    demand_entry.get("last_requested_at") if demand_entry else None
+                ),
+                "demand.shopify_product_id": (
+                    demand_entry.get("shopify_product_id") if demand_entry else None
+                ),
+                "demand.shopify_inventory_item_id": (
+                    demand_entry.get("shopify_inventory_item_id") if demand_entry else None
+                ),
+                "demand.product_data": (
+                    json.dumps(demand_product_data) if demand_product_data is not None else None
+                ),
+                "demand.variant_data": (
+                    json.dumps(demand_variant_data) if demand_variant_data is not None else None
+                ),
+                "demand.source": "demand_report_api" if demand_entry else None,
+            })
+
+    logger.info("RestockRocket: built %s rows", len(rows))
+    return rows
+
+
 def fetch_restock_data(
     session: requests.Session, logger: logging.Logger
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Fetch ReStock data: API (subscriptions + pre-orders) when RESTOCK_API_KEY is
-    set; otherwise fall back to scraping _ReStockConfig from each product PDP page."""
+    """Fetch ReStock data: RestockRocket API when RESTOCKROCKET_SHOP_DOMAIN is set,
+    notify-me.app API when RESTOCK_API_KEY is set, otherwise scrape _ReStockConfig."""
+
+    # ── RestockRocket path (ASKKNY and other RR-enabled shops) ───────────────
+    if RESTOCKROCKET_SHOP_DOMAIN:
+        try:
+            rr_rows = fetch_restockrocket_rows(session, logger)
+        except Exception as exc:
+            logger.error("RestockRocket data fetch failed: %s", exc)
+            rr_rows = []
+        if rr_rows:
+            return rr_rows, []
+        logger.warning("RestockRocket returned no rows; falling through to notify-me path")
 
     # ── API path ─────────────────────────────────────────────────────────────
     if RESTOCK_API_KEY:
@@ -2570,6 +3005,8 @@ class GraphQLQueryBuilder:
         return f"variants{args} {{\n{self._indent(body)}\n}}"
 
     def _build_store_availability_selection(self) -> str:
+        if "storeAvailability" in self.forbidden_fields.get("ProductVariant", set()):
+            return ""
         variant_type = self.schema.get_type("ProductVariant") or {}
         fields = variant_type.get("fields", [])
         store_field = next(
@@ -2961,6 +3398,7 @@ def collect_storefront_from_collections(
     forbidden: Dict[str, Set[str]] = defaultdict(set)
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
+    ever_blocked: Dict[str, Set[str]] = defaultdict(set)
 
     first_status: Optional[int] = None
     view_json_state = ViewJSONEnrichmentState(
@@ -3128,6 +3566,8 @@ def collect_storefront_from_collections(
                     "Retrying collection query without restricted fields: %s",
                     blocked_summary,
                 )
+                for parent, fields in newly_blocked.items():
+                    ever_blocked[parent].update(fields)
             else:
                 logger.debug(
                     "Encountered errors but no removable fields; aborting with failure"
@@ -3137,7 +3577,7 @@ def collect_storefront_from_collections(
 
         _inventory_fields = {"totalInventory", "quantityAvailable"}
         _all_blocked: Set[str] = set()
-        for _f in newly_blocked.values():
+        for _f in ever_blocked.values():
             _all_blocked.update(_f)
         if rows:
             note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
@@ -3176,6 +3616,7 @@ def collect_storefront_from_products(
     for parent, names in DEFAULT_FORBIDDEN_FIELDS.items():
         forbidden[parent].update(names)
     newly_blocked: Dict[str, Set[str]] = defaultdict(set)
+    ever_blocked_products: Dict[str, Set[str]] = defaultdict(set)
 
     while True:
         try:
@@ -3310,6 +3751,8 @@ def collect_storefront_from_products(
                         "Retrying products query without restricted fields: %s",
                         blocked_summary,
                     )
+                    for parent, fields in newly_blocked.items():
+                        ever_blocked_products[parent].update(fields)
                 else:
                     return [], first_status, "errors"
                 need_retry = False
@@ -3317,7 +3760,7 @@ def collect_storefront_from_products(
 
             _inventory_fields = {"totalInventory", "quantityAvailable"}
             _all_blocked: Set[str] = set()
-            for _f in newly_blocked.values():
+            for _f in ever_blocked_products.values():
                 _all_blocked.update(_f)
             if rows:
                 note = "success_no_inventory" if _all_blocked & _inventory_fields else "success"
@@ -3343,10 +3786,15 @@ def fallback_collect_from_collections(
     session: requests.Session,
     endpoints: Sequence[str],
     logger: logging.Logger,
+    *,
+    token: Optional[str] = None,
+    token_source: str = "fallback_unauthenticated",
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     for endpoint in endpoints:
         logger.info(
-            "Attempting unauthenticated Storefront fallback via %s", endpoint
+            "Attempting Storefront simple-query fallback via %s (token_source=%s)",
+            endpoint,
+            token_source,
         )
         rows: List[Dict[str, Any]] = []
         first_status: Optional[int] = None
@@ -3361,7 +3809,7 @@ def fallback_collect_from_collections(
         for handle in STOREFRONT_COLLECTION_HANDLES:
             if handle not in filters_cache:
                 filters_cache[handle] = probe_collection_filters(
-                    session, endpoint, None, handle, logger
+                    session, endpoint, token, handle, logger
                 )
             handle_filters = filters_cache.get(handle) or {}
             cursor: Optional[str] = None
@@ -3375,7 +3823,7 @@ def fallback_collect_from_collections(
                     },
                 }
                 response, data = perform_graphql_request(
-                    session, endpoint, payload, token=None
+                    session, endpoint, payload, token=token
                 )
                 if first_status is None and response is not None:
                     first_status = response.status_code
@@ -3456,8 +3904,8 @@ def fallback_collect_from_collections(
         if rows and success:
             accealgolia_entry = {
                 "endpoint": endpoint,
-                "token": "",
-                "token_source": "fallback_unauthenticated",
+                "token": token or "",
+                "token_source": token_source,
                 "status_code": first_status or "",
                 "ok": True,
                 "note": "fallback_success",
@@ -3742,6 +4190,31 @@ def gather_storefront_data(
             "description/tags available, inventory counts unavailable"
         )
         return best_no_inv, access_rows
+
+    # ── Phase 3.5: simple fallback query WITH provided/discovered tokens ──────
+    # The complex introspection query may return no rows for some tokens even
+    # though those tokens are valid; try the simpler FALLBACK_COLLECTION_QUERY
+    # with an authenticated token so we get description/tags in the output.
+    all_tried_tokens = list(dict.fromkeys(
+        [(t, s) for t, s in provided_tokens + discovered_tokens if t is not None]
+    ))
+    for token, source in all_tried_tokens:
+        simple_rows, simple_entry = fallback_collect_from_collections(
+            session,
+            endpoints_to_use,
+            logger,
+            token=token,
+            token_source=f"{source}_simple_fallback",
+        )
+        if simple_entry:
+            access_rows.append(simple_entry)
+        if simple_rows:
+            logger.info(
+                "Storefront: authenticated simple-query fallback succeeded via %s — "
+                "description available, inventory counts unavailable",
+                source,
+            )
+            return simple_rows, access_rows
 
     # ── Phase 4: unauthenticated fallback ────────────────────────────────────
     fallback_rows, fallback_entry = fallback_collect_storefront(
