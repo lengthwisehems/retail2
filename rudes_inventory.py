@@ -421,7 +421,7 @@ def run():
                     "Style Id": prod_id,
                     "Handle": handle,
                     "Published At": date_only_mmddyy(published),
-                    "Product": title,
+                    "Product": f"{title} - {color}",
                     "Product Type": product_type,
                     "Vendor": vendor,
                     "Description": clean_html_to_text(body),
