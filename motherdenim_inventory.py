@@ -252,6 +252,20 @@ def normalize_text(raw: Optional[str]) -> str:
     return re.sub(r"\s+", " ", normalize_quotes(str(raw))).strip()
 
 
+def format_reset_date(raw: Optional[str]) -> str:
+    """Format a SearchSpring ISO timestamp ('2026-07-22T12:08:57Z') as
+    'YYYY-MM-DD HH:MM:SS'. Returns '' when the value is missing/unparseable."""
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", text)
+        return f"{m.group(1)} {m.group(2)}" if m else text
+
+
 def fraction_to_decimal(token: str) -> str:
     """'10 3/4' -> '10.75', '9 3/8' -> '9.38' (round half-to-even, 2 places)."""
     token = token.strip()
@@ -1435,7 +1449,7 @@ def assemble_rows() -> List[Dict[str, Any]]:
             gql_qty = coerce_int(qty_available)
             if ss_inv is not None and gql_qty is not None:
                 ga_purchases = max(0, ss_inv - gql_qty)
-            purchase_reset = ss_variant.get("updated_at") or ""
+            purchase_reset = format_reset_date(ss_variant.get("updated_at"))
 
             rows.append({
                 "Style Id": style["style_id"],
