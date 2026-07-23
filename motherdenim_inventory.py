@@ -16,9 +16,10 @@ import os
 import re
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -252,18 +253,23 @@ def normalize_text(raw: Optional[str]) -> str:
     return re.sub(r"\s+", " ", normalize_quotes(str(raw))).strip()
 
 
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
 def format_reset_date(raw: Optional[str]) -> str:
-    """Format a SearchSpring ISO timestamp ('2026-07-22T12:08:57Z') as
-    'YYYY-MM-DD HH:MM:SS'. Returns '' when the value is missing/unparseable."""
+    """Format a SearchSpring UTC timestamp ('2026-07-22T12:08:57Z') as US
+    Central time 'YYYY-MM-DD HH:MM:SS'. America/Chicago handles CST/CDT
+    automatically. Returns '' when the value is missing/unparseable."""
     if not raw:
         return ""
     text = str(raw).strip()
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(CENTRAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
-        m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", text)
-        return f"{m.group(1)} {m.group(2)}" if m else text
+        return text
 
 
 def fraction_to_decimal(token: str) -> str:
