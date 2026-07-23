@@ -1060,6 +1060,36 @@ def fetch_all_products() -> List[Dict[str, Any]]:
     return products
 
 
+def fetch_live_handles() -> set:
+    """Handles currently listed in the storefront collection catalogs
+    (products.json). The GraphQL collections retain dead/unpublished products,
+    so this set is used to drop them from the output."""
+    live: set = set()
+    for collection in COLLECTIONS:
+        for host in PDP_HOSTS:
+            try:
+                page = 1
+                collected: List[str] = []
+                while True:
+                    url = f"{host}/collections/{collection}/products.json"
+                    data = http_get(url, params={"limit": 250, "page": page})
+                    page_products = data.get("products") or []
+                    if not page_products:
+                        break
+                    collected.extend(p.get("handle") for p in page_products if p.get("handle"))
+                    if len(page_products) < 250:
+                        break
+                    page += 1
+                    time.sleep(0.2)
+                live.update(collected)
+                log(f"[live] products.json {collection}: {len(collected)} handles")
+                break  # succeeded on this host; no need to try the others
+            except Exception as exc:  # noqa: BLE001
+                log(f"[live] products.json {collection} failed on {host}: {exc}")
+    log(f"[live] total live handles: {len(live)}")
+    return live
+
+
 def _first(value: Any) -> Any:
     if isinstance(value, list):
         return value[0] if value else None
@@ -1404,12 +1434,19 @@ def _cross_fill(info: Dict[str, Dict[str, Any]], field: str, key_field: str) -> 
 # ---------------------------------------------------------------------------
 def assemble_rows() -> List[Dict[str, Any]]:
     products = fetch_all_products()
+    live_handles = fetch_live_handles()
     ss_by_handle, ss_variant_map = fetch_searchspring()
 
     # Filter out non-jean products before doing any per-product work.
     kept: List[Dict[str, Any]] = []
     for product in products:
         title = product.get("title", "")
+        handle = product.get("handle")
+        # Drop dead SKUs: present in the GraphQL collections but no longer
+        # listed in the storefront collection catalog (products.json).
+        if live_handles and handle not in live_handles:
+            log(f"[filter] drop '{title}' (not in products.json - dead sku)")
+            continue
         reason = title_is_excluded(title)
         if reason:
             log(f"[filter] drop '{title}' (title contains '{reason}')")
