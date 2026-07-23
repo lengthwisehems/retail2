@@ -32,6 +32,14 @@ HOSTS = [
     "https://www.motherdenim.com",
     "https://motherdenim.com",
 ]
+# The myshopify.com domain rate-limits storefront *page* requests aggressively
+# (429/503), so PDP fetches try the customer-facing domain first. GraphQL is
+# unaffected and keeps using HOSTS as-is.
+PDP_HOSTS = [
+    "https://www.motherdenim.com",
+    "https://motherdenim.com",
+    "https://motherdenim.myshopify.com",
+]
 GRAPHQL_PATH = "/api/unstable/graphql.json"
 STOREFRONT_TOKEN = "a7c1044bc2a3798166579fa2874b03e3"
 
@@ -971,7 +979,7 @@ def fetch_pdp_html(handle: str) -> str:
     (e.g. an unpublished product that still appears in a collection)."""
     time.sleep(PDP_THROTTLE_SECONDS)
     last_exc: Optional[Exception] = None
-    for host in HOSTS:
+    for host in PDP_HOSTS:
         url = f"{host}/products/{handle}"
         try:
             return http_get(url, expect_json=False)
