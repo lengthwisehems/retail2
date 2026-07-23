@@ -236,6 +236,14 @@ def clean_description(raw: Optional[str]) -> str:
     return raw.strip()
 
 
+def normalize_text(raw: Optional[str]) -> str:
+    """Tidy user-facing text: straighten curly quotes/apostrophes and collapse
+    runs of whitespace to a single space."""
+    if not raw:
+        return ""
+    return re.sub(r"\s+", " ", normalize_quotes(str(raw))).strip()
+
+
 def fraction_to_decimal(token: str) -> str:
     """'10 3/4' -> '10.75', '9 3/8' -> '9.38' (round half-to-even, 2 places)."""
     token = token.strip()
@@ -755,12 +763,11 @@ def derive_color_standardized(color: str, description: str, title: str,
                               option1: str) -> str:
     d = description or ""
 
-    # 1. Print check (description). "stripes" is deferred below so that a base
-    #    colour named right after the wash name (e.g. "mid-blue with stripes")
-    #    still classifies by the base colour.
+    # 1. Print check (description). A "stripes" reference makes it a Print even
+    #    when a base colour is also named (e.g. "mid-blue with white stripes").
     if whole_word_present(d, "Animal Print") or whole_word_present(d, "leopard") or whole_word_present(d, "snake"):
         return "Animal Print"
-    if whole_word_present(d, "Print"):
+    if whole_word_present(d, "Print") or whole_word_present(d, "stripes"):
         return "Print"
 
     # 2. Description cues, anchored after COLOR_TITLE where possible.
@@ -791,10 +798,6 @@ def derive_color_standardized(color: str, description: str, title: str,
     label = _color_from_tokens(option1)
     if label:
         return label
-
-    # Deferred stripes -> Print (only when no base colour was found).
-    if whole_word_present(d, "stripes"):
-        return "Print"
     return ""
 
 
@@ -827,7 +830,7 @@ def derive_color_simplified(color_standardized: str, description: str) -> str:
                "washed gray", "washed grey"]):
         return "Light"
     if "dark grey" in d or "dark gray" in d:
-        return "Light"
+        return "Medium"
     if any_in(["dark khaki", "dark tan", "dark beige"]):
         return "Medium"
     if any_in(["faded khaki", "light khaki", "faded tan", "light tan",
@@ -1185,8 +1188,8 @@ def build_style_info(products: List[Dict[str, Any]],
         handle = product.get("handle")
         if not handle:
             continue
-        title = product.get("title", "")
-        description = clean_description(product.get("description"))
+        title = normalize_text(product.get("title", ""))
+        description = normalize_text(clean_description(product.get("description")))
         desc_match = normalize_quotes(description)
         ss_item = ss_by_handle.get(handle, {})
         mfield = ss_item.get("mfield_product_details")
@@ -1403,7 +1406,7 @@ def assemble_rows() -> List[Dict[str, Any]]:
         style = info.get(handle)
         if not style:
             continue
-        product_title = product.get("title", "")
+        product_title = style["title"]  # normalized (single spaces, straight quotes)
         online_url = product.get("onlineStoreUrl") or f"{HOSTS[1]}/products/{handle}"
         image_url = product_image_url(product)
         published_at = product.get("publishedAt", "") or ""
