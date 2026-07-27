@@ -1068,7 +1068,7 @@ def apply_style_name_rules(rows: List[List[str]]) -> None:
             continue
         js = _col(row, "Jean Style")
         if js:
-            prefix = js.split(" from ")[0].strip() if " from " in js else js.strip()
+            prefix = js.split()[0]
             _set(row, "Style Name", f"{sn} {prefix}".strip())
 
 
