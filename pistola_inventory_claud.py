@@ -808,14 +808,14 @@ def _get_rebuy_key_endpoint() -> Tuple[str, str]:
 
 
 def fetch_all_rebuy_data(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Batch-fetch Rebuy inventory + metafields for all products.
+    """Attempt to batch-fetch Rebuy inventory for all products.
 
-    Returns {product_id_str: {
-        "variant_qty":     {variant_id_str: int},
-        "wishlist_social_count":  str,
-        "tab1":            str  (raw HTML from metafield),
-        "tab2":            str  (raw HTML from metafield),
-    }}
+    WARNING: Widget 28256 (hardcoded) no longer exists on Pistola's Rebuy account
+    (returns 400: "Unable to find custom_endpoint object using id: 28256").
+    This function will return empty dict; build_rows() falls back to REST JSON.
+
+    Returns {product_id_str: {"variant_qty": {variant_id_str: int}}}
+    (will be empty if widget is inactive).
     """
     if not product_ids:
         return {}
@@ -838,10 +838,10 @@ def fetch_all_rebuy_data(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                 resp.raise_for_status()
                 payload = resp.json()
 
-                # Products live in metadata.input_products[] (preferred) or data[]
+                # Try to extract queried products from metadata.input_products
                 products: List[Dict[str, Any]] = (
                     (payload.get("metadata") or {}).get("input_products") or []
-                ) or (payload.get("data") or [])
+                )
 
                 for p in products:
                     pid = str(p.get("id", ""))
@@ -856,20 +856,18 @@ def fetch_all_rebuy_data(product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                                 variant_qty[vid] = int(qty)
                             except (TypeError, ValueError):
                                 pass
-                    mf = p.get("metafields") or {}
-                    result[pid] = {
-                        "variant_qty": variant_qty,
-                        "wishlist_count": str(mf.get("wishlist_social_count") or ""),
-                        "tab1": str(mf.get("tab1") or ""),
-                        "tab2": str(mf.get("tab2") or ""),
-                    }
+                    result[pid] = {"variant_qty": variant_qty}
                 break
             except Exception as exc:
-                log.warning("Rebuy chunk attempt %d: %s", attempt + 1, exc)
+                log.debug("Rebuy chunk attempt %d: %s", attempt + 1, exc)
                 time.sleep(1.5 ** attempt)
         time.sleep(0.1)
 
-    log.info("Rebuy data fetched for %d / %d products", len(result), len(product_ids))
+    if result:
+        log.info("Rebuy inventory fetched for %d products", len(result))
+    else:
+        log.warning("Rebuy returned no products; will use REST JSON inventory (capped at 20)")
+
     return result
 
 
@@ -1019,8 +1017,9 @@ def inseam_from_description(description: str) -> str:
 # Build rows
 # ---------------------------------------------------------------------------
 def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Pre-fetch all Rebuy data in one batch (avoids per-product calls and
-    # returns real inventory quantities uncapped by the REST JSON 20-unit limit).
+    # NOTE: Rebuy widget 28256 (hardcoded) is no longer active on Pistola's account.
+    # Attempted to fetch from Rebuy but it returns 400: "Unable to find custom_endpoint object".
+    # Will use REST JSON inventory (capped at 20 per variant) as the only available source.
     all_style_ids = [
         strip_gid(p.get("id", ""), "gid://shopify/Product/")
         for p in products
@@ -1063,22 +1062,9 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         stretch_from_desc = derive_stretch_from_description(description_raw)
         stretch = stretch_from_desc or pdp.get("stretch", "")
 
-        # Rebuy data: inventory, wishlist count, metafield tabs
+        # Try Rebuy (will be empty since widget is inactive), fall back to REST JSON
         rebuy_prod = rebuy_all.get(style_id, {})
-        inv_map_str: Dict[str, int] = rebuy_prod.get("variant_qty", {})  # {variant_id_str: qty}
-        wishlist_count: str = rebuy_prod.get("wishlist_count", "")
-        tab1_raw: str = rebuy_prod.get("tab1", "")
-        tab2_raw: str = rebuy_prod.get("tab2", "")
-
-        # Inseam fallback: if PDP scraping returned blank, try Rebuy tab1
-        if not inseam and tab1_raw:
-            inseam = extract_measurement(_tab_plain(tab1_raw), ["Inseam", "Inleg"])
-
-        # Enrich description: append cleaned tab1 and tab2 content
-        tab1_text = _tab_clean(tab1_raw)
-        tab2_text = _tab_clean(tab2_raw)
-        desc_parts = [description_raw] + [t for t in (tab1_text, tab2_text) if t]
-        enriched_description = " ".join(desc_parts)
+        inv_map_str: Dict[str, int] = rebuy_prod.get("variant_qty", {})
 
         # Style name base (Step 1+2 only; Steps 3-4 in post-processing)
         style_name_base = derive_style_name_base(title)
@@ -1086,7 +1072,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Reviews
         avg_score, total_reviews = fetch_yotpo(product_id_int)
 
-        # Quantity of style = sum of all variant inventory from Rebuy
+        # Quantity of style: sum of all variant inventory (Rebuy if populated, else REST)
         quantity_of_style: Any = sum(inv_map_str.values()) if inv_map_str else ""
 
         variants = (product.get("variants") or {}).get("nodes") or []
@@ -1100,8 +1086,12 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             available = variant.get("availableForSale")
             available_str = "TRUE" if available else "FALSE"
 
-            # Inventory quantity from Rebuy (string-keyed variant id)
+            # Inventory: try Rebuy first, fall back to GraphQL variant (REST-backed)
             qty_available = inv_map_str.get(sku_shopify, "")
+            if not qty_available:
+                # Fall back to GraphQL quantityAvailable (which may be capped at 20)
+                qty_gql = variant.get("quantityAvailable")
+                qty_available = qty_gql if qty_gql is not None else ""
 
             price_raw = (variant.get("price") or {}).get("amount", "")
             compare_raw = (variant.get("compareAtPrice") or {}).get("amount", "")
@@ -1120,7 +1110,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "Product Type": product_type,
                 "Tags": tags_str,
                 "Vendor": vendor,
-                "Description": enriched_description,
+                "Description": description_raw,
                 "Variant Title": variant_title,
                 "Color": color,
                 "Size": size,
@@ -1146,7 +1136,7 @@ def build_rows(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "Stretch": stretch,
                 "Review AVG": avg_score,
                 "Review Count": total_reviews,
-                "Wishlist count": wishlist_count,
+                "Wishlist count": "",
                 # Internal flags (removed before CSV output)
                 "_is_petite": is_petite or "petite" in title.lower(),
                 "_tags_list": tags,
