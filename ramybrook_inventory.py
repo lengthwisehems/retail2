@@ -116,7 +116,7 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Braided", "Cargo", "Carpenter", "Chap", "Checkered", "Coated",
     "Constructed", "Contrast", "Corduroy", "Crochet", "Crop", "Cropped",
     "Crushed", "Crystal", "Cuff", "Cuffed", "Cutoff", "Cut-Out", "Darted",
-    "Destroyed", "Distressed", "Drawstring", "Embroidery", "Faux", "Fit",
+    "Destroyed", "Distressed", "Drawstring", "Embroidery", "Embroidered", "Faux", "Fit",
     "Flag", "Flap Pocket", "Flap", "Flip", "Floral", "Frayed Seam",
     "Front Yoke", "Frontier", "Graffitimetalik", "High Rise", "High Waisted",
     "High-Rise", "Inch", "Inset", "Jean W/ Slit Hem", "Jean", "Krushed",
@@ -128,7 +128,7 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Rinse", "Ripped", "Rolled Hem", "Saddle", "Seam", "Seamed Front Yoke",
     "Seamed", "Selvedge", "Sequin", "Side Seam Snaps", "Slice", "Slit",
     "Snake Print", "Sneaker Length", "Sott", "Spark", "Sparkle", "Spliced",
-    "Split", "Stacked Waist", "Stacked", "Stitched", "Stoned", "Straight",
+    "Split", "Stacked Waist", "Stacked", "Stitched", "Stoned",
     "Studded", "Suede", "Super", "The", "Track Pant", "Trashed", "Trim",
     "Trouser Jean", "Trouser", "Ultra", "Vegan Leather", "Velvet", "Vent",
     "V-High Rise", "Vintage", "W/ Contrast Front Panel", "W/ Cuff",
@@ -418,7 +418,6 @@ def derive_style_name_base(product_title: str) -> str:
     text = text.split(" - ", 1)[0]   # strip " - Color" suffix
     text = text.replace("Boot Cut", "Bootcut").strip()
     text = text.replace('"', " ").replace("“", " ").replace("”", " ")
-    text = re.sub(r"\b\d+\b", " ", text)
     for phrase in sorted(STYLE_NAME_REMOVE_PHRASES, key=len, reverse=True):
         if phrase.lower() == "jean":
             text = re.sub(r"\bJeans?\b", " ", text, flags=re.IGNORECASE)
@@ -426,6 +425,7 @@ def derive_style_name_base(product_title: str) -> str:
             text = re.sub(rf"\b{re.escape(phrase)}(?=\s|$)", " ", text, flags=re.IGNORECASE)
         else:
             text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d+\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     # Clean dangling single-letter artifacts
     text = re.sub(r"(?<!\w)[A-Z]-\s*", "", text).strip()
