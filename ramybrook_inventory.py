@@ -412,8 +412,11 @@ def extract_color_size(selected_options: List[Dict]) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def derive_style_name_base(product_title: str) -> str:
-    """Step 1: remove everything after '-'. Step 2: remove styling words."""
-    text = (product_title or "").split("-", 1)[0].strip()
+    """Step 1: strip pipe/color suffixes. Step 2: remove styling words."""
+    text = (product_title or "")
+    text = text.split(" | ", 1)[0]   # strip Ramy Brook pipe-notation color suffix
+    text = text.split(" - ", 1)[0]   # strip " - Color" suffix
+    text = text.replace("Boot Cut", "Bootcut").strip()
     text = text.replace('"', " ").replace("“", " ").replace("”", " ")
     text = re.sub(r"\b\d+\b", " ", text)
     for phrase in sorted(STYLE_NAME_REMOVE_PHRASES, key=len, reverse=True):
@@ -1339,7 +1342,11 @@ class RamyBrookScraper:
                 _set(row, "Handle",              handle)
                 _set(row, "Published At",        published_at)
                 _set(row, "Created At",          created_at)
-                _set(row, "Product",             f"{title} - {color}" if color else title)
+                _title = title.replace("Boot Cut", "Bootcut")
+                if " | " in _title:
+                    _set(row, "Product", _title.replace(" | ", " - "))
+                else:
+                    _set(row, "Product", f"{_title} - {color}" if color else _title)
                 _set(row, "Style Name",          derive_style_name_base(title))
                 _set(row, "Product Type",        product_type)
                 _set(row, "Tags",                tags_str)
