@@ -18,13 +18,15 @@ WHAT IT CHANGES  (all scoped to brand = 'RAMYBROOK')
    -> re-derived with the real scraper functions, including the cross-row
       group passes (sibling inference, majority vote, color propagation).
 
-2. product_name: the "Style | COLOR - COLOR" duplicates are normalized to the
+2. style_name re-derived and kept in sync across style_info + lookup +
+   style_metrics (validated 100% against the canonical scraper output).
+
+3. product_name: the "Style | COLOR - COLOR" duplicates are normalized to the
    "Style - COLOR" convention in style_info + lookup + style_metrics +
    image_url_history. NOTHING IS DELETED.
 
-3. style_name_grouping (style_info + lookup + style_metrics) set to the shared
-   "Style" base (product_name minus the trailing "- COLOR") so the older
-   listing and the newer duplicate collate into one product.
+   (style_name_grouping is intentionally left untouched - the daily scraper
+    does not populate it, so neither does this backfill.)
 
 SAFETY
 ------
@@ -67,7 +69,9 @@ from typing import Dict, List, Optional, Tuple
 # ===========================================================================
 DRY_RUN = True                       # True = preview only. False = apply.
 FIX_DOUBLE_COLOR_PRODUCT_NAMES = True
-LINK_VIA_STYLE_NAME_GROUPING   = True
+# style_name_grouping is NOT populated by ramybrook_inventory.py, so the
+# backfill leaves it alone too (keeps the DB consistent with the daily scrape).
+LINK_VIA_STYLE_NAME_GROUPING   = False
 LOG_TO_MANUAL_OVERRIDES        = True
 
 # After normalizing product_names you can end up with TWO style_info rows for
@@ -318,10 +322,20 @@ def main() -> None:
             if norm(new_val) != norm(old_val):
                 add("style_info", "style_info_id", pk, colname, old_val, new_val, True)
 
-        # (2) style_name is intentionally NOT re-derived here. The scraper's
-        # style_name output is rough by design (it's the coarse base, further
-        # shaped downstream), so re-running it in a backfill would regress
-        # existing values without adding accuracy. Left untouched.
+        # (2) style_name - re-derived and kept in sync across
+        # style_info + lookup + style_metrics. Validated 100% against the
+        # canonical scraper's output. lookup/style_metrics join to style_info
+        # on product_name (the documented connective key).
+        new_sn = s(g._col(drow, "Style Name"))
+        if new_sn and norm(new_sn) != norm(db["style_name"]):
+            add("style_info", "style_info_id", pk, "style_name",
+                db["style_name"], new_sn, True)
+            match = {"brand": db["brand"], "product_name": db["product_name"]}
+            for table, pkc in STYLE_NAME_TABLES:
+                if table == "style_info":
+                    continue
+                _stage_match_update(cur, plan, counts, table, pkc, "style_name",
+                                    new_sn, match)
 
         # (3) product_name normalization (doubled -> convention)
         norm_pn = normalize_double_color(db["product_name"]) if FIX_DOUBLE_COLOR_PRODUCT_NAMES else None
