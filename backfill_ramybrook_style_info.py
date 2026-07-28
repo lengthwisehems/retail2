@@ -255,7 +255,7 @@ def main() -> None:
     import pymssql
     conn = pymssql.connect(server=SQL_SERVER, user=SQL_USERNAME,
                            password=SQL_PASSWORD, database=SQL_DATABASE,
-                           timeout=120, login_timeout=30)
+                           timeout=600, login_timeout=60)
     cur = conn.cursor(as_dict=True)
 
     # ---- read every RAMYBROOK style_info row ------------------------------

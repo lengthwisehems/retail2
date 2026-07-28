@@ -80,12 +80,8 @@ STYLE_INFO_FIELDS: List[Tuple[str, str]] = [
     ("Color - Simplified",   "color_simplified"),
     ("Color - Standardized", "color_standardized"),
 ]
-# color and style_name also live in these tables (table, pk column):
-MULTI_TABLE = [
-    ("style_info",    "style_info_id"),
-    ("lookup",        "lookup_id"),
-    ("style_metrics", "style_metric_id"),
-]
+# color and style_name also live in lookup + style_metrics; they are synced
+# there from style_info in the apply phase (see _propagate_multi).
 
 
 # ===========================================================================
@@ -185,7 +181,7 @@ def main() -> None:
     import pymssql
     conn = pymssql.connect(server=SQL_SERVER, user=SQL_USERNAME,
                            password=SQL_PASSWORD, database=SQL_DATABASE,
-                           timeout=120, login_timeout=30)
+                           timeout=600, login_timeout=60)
     cur = conn.cursor(as_dict=True)
 
     cur.execute("""
@@ -241,7 +237,6 @@ def main() -> None:
             skipped_locked += 1
             continue
         pk = db["pk"]
-        match = {"brand": db["brand"], "product_name": db["product_name"]}
 
         # (1) style_info-only categorization fields
         for hdr, colname in STYLE_INFO_FIELDS:
@@ -254,23 +249,16 @@ def main() -> None:
             if norm(new_val) != norm(old_val):
                 add("style_info", "style_info_id", pk, colname, old_val, new_val, True)
 
-        # (2) color - style_info + lookup + style_metrics
+        # (2) color and (3) style_name: written to style_info here; the values
+        # are then synced into lookup + style_metrics with one set-based UPDATE
+        # each in the apply phase (see _propagate_multi) - far cheaper and more
+        # reliable than a per-row query against those tables.
         new_color = s(g._col(drow, "Color"))
         if new_color and norm(new_color) != norm(db["color"]):
             add("style_info", "style_info_id", pk, "color", db["color"], new_color, True)
-            for table, pkc in MULTI_TABLE:
-                if table != "style_info":
-                    _stage_match_update(cur, plan, counts, table, pkc, "color",
-                                        new_color, match)
-
-        # (3) style_name - style_info + lookup + style_metrics
         new_sn = s(g._col(drow, "Style Name"))
         if new_sn and norm(new_sn) != norm(db["style_name"]):
             add("style_info", "style_info_id", pk, "style_name", db["style_name"], new_sn, True)
-            for table, pkc in MULTI_TABLE:
-                if table != "style_info":
-                    _stage_match_update(cur, plan, counts, table, pkc, "style_name",
-                                        new_sn, match)
 
     # ---- preview ----------------------------------------------------------
     print("-" * 66)
@@ -286,7 +274,10 @@ def main() -> None:
         print(f"   {prod} :: {hdr} = '{val}'")
     if len(unresolved) > 10:
         print(f"   ... and {len(unresolved) - 10} more")
-    print(f"\nTotal individual column writes queued: {len(plan)}")
+    print(f"\nstyle_info column writes queued: {len(plan)}")
+    if counts.get("color") or counts.get("style_name"):
+        print("On apply, color/style_name are also synced into lookup and "
+              "style_metrics (one set-based UPDATE each).")
 
     if DRY_RUN:
         print("\nDRY RUN complete - nothing written. Review the numbers, then set "
@@ -296,8 +287,9 @@ def main() -> None:
 
     # ---- apply (single transaction; rolls back on any error) --------------
     print("\nApplying...")
-    applied = audit = 0
+    applied = audit = prop = 0
     try:
+        # 1) style_info row updates + audit log
         for table, pkc, pk, field, old, new, is_si in plan:
             cur.execute(f"UPDATE [{table}] SET [{field}] = %s WHERE [{pkc}] = %s",
                         (new, pk))
@@ -311,6 +303,14 @@ def main() -> None:
                     (table, pk, field, old, new, datetime.now(), OVERRIDDEN_BY,
                      "automated TRIARCHY categorization backfill"))
                 audit += 1
+
+        # 2) Sync color + style_name from style_info into lookup & style_metrics
+        #    with one set-based UPDATE each (indexed join on brand+product_name).
+        #    Only non-blank style_info values propagate, so a blank never
+        #    overwrites an existing value.
+        print("Syncing color / style_name into lookup and style_metrics...")
+        prop = _propagate_multi(cur)
+
         conn.commit()
     except Exception:
         conn.rollback()
@@ -319,29 +319,27 @@ def main() -> None:
         raise
 
     conn.close()
-    print(f"Done. {applied} column writes applied. {audit} style_info changes "
-          f"logged to manual_overrides.")
+    print(f"Done. {applied} style_info writes applied, {audit} logged to "
+          f"manual_overrides, {prop} lookup/style_metrics rows synced.")
 
 
-def _stage_match_update(cur, plan, counts, table, pk_col, field, new_val, match):
-    """Find rows in `table` matching `match` (dict of col->value, blanks
-    ignored) and queue a per-row UPDATE for `field` where it actually differs."""
-    where, params = [], []
-    for c, v in match.items():
-        if v == "" or v is None:
-            continue
-        where.append(f"[{c}] = %s")
-        params.append(v)
-    if not where:
-        return
-    cur.execute(f"SELECT [{pk_col}] AS pk, [{field}] AS cur_val FROM [{table}] "
-                f"WHERE {' AND '.join(where)}", params)
-    for r in cur.fetchall():
-        if norm(r["cur_val"]) != norm(new_val):
-            plan.append((table, pk_col, r["pk"], field, s(r["cur_val"]),
-                         s(new_val), False))
-            key = f"{field} ({table})"
-            counts[key] = counts.get(key, 0) + 1
+def _propagate_multi(cur) -> int:
+    """Set-based sync of color + style_name from style_info to lookup and
+    style_metrics (brand = TRIARCHY). One UPDATE per field/table."""
+    total = 0
+    for tbl in ("lookup", "style_metrics"):
+        for fld in ("color", "style_name"):
+            cur.execute(
+                f"UPDATE t SET t.[{fld}] = si.[{fld}] "
+                f"FROM [{tbl}] t "
+                f"JOIN style_info si ON si.brand = t.brand "
+                f"                  AND si.product_name = t.product_name "
+                f"WHERE si.brand = %s "
+                f"  AND NULLIF(LTRIM(RTRIM(si.[{fld}])), '') IS NOT NULL "
+                f"  AND ISNULL(t.[{fld}], '') <> ISNULL(si.[{fld}], '')",
+                (BRAND,))
+            total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return total
 
 
 if __name__ == "__main__":
