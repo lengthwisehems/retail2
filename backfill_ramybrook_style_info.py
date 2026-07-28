@@ -460,42 +460,66 @@ def main() -> None:
         conn.close()
         return
 
-    # ---- apply ------------------------------------------------------------
+    # ---- apply (single transaction; rolls back completely on any error) ---
     print("\nApplying...")
-    applied = 0
-    audit = 0
-    for table, pkc, pk, field, old, new, is_si in plan:
-        cur.execute(f"UPDATE [{table}] SET [{field}] = %s WHERE [{pkc}] = %s",
-                    (new, pk))
-        applied += 1
-        if is_si and LOG_TO_MANUAL_OVERRIDES:
-            cur.execute(
-                "INSERT INTO manual_overrides "
-                "(table_name, record_id, field_name, old_value, new_value, "
-                " overridden_at, overridden_by, notes) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (table, pk, field, old, new, datetime.now(), OVERRIDDEN_BY,
-                 "automated RAMYBROOK categorization backfill"))
-            audit += 1
+    applied = audit = deleted = 0
+    try:
+        # 1) DELETE the consolidated duplicate style_info rows FIRST. style_info
+        #    has a unique index on (brand, product_name), so the stale row must
+        #    be gone before we rename its surviving twin onto the same name.
+        deleted_pks = set()
+        if CONSOLIDATE_DUPLICATE_STYLE_INFO:
+            for d in deletes:
+                if LOG_TO_MANUAL_OVERRIDES:
+                    cur.execute(
+                        "INSERT INTO manual_overrides "
+                        "(table_name, record_id, field_name, old_value, new_value, "
+                        " overridden_at, overridden_by, notes) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        ("style_info", d["pk"], "(row deleted - duplicate)",
+                         f"{d['product_name']} / style_id {d['style_id']}", None,
+                         datetime.now(), OVERRIDDEN_BY,
+                         f"consolidated into style_info_id {d['survivor']}"))
+                cur.execute("DELETE FROM style_info WHERE style_info_id = %s", (d["pk"],))
+                deleted_pks.add(d["pk"])
+                deleted += 1
 
-    # consolidate: delete redundant style_info dimension rows (history untouched)
-    deleted = 0
-    if CONSOLIDATE_DUPLICATE_STYLE_INFO:
-        for d in deletes:
-            if LOG_TO_MANUAL_OVERRIDES:
+        # 2) Apply the staged column writes.
+        for table, pkc, pk, field, old, new, is_si in plan:
+            if is_si and pk in deleted_pks:
+                continue  # this row was just consolidated away
+            # defensive guard: never violate the unique (brand, product_name)
+            # index - if the target name is still taken by another surviving
+            # style_info row, skip the rename instead of crashing.
+            if is_si and field == "product_name":
+                cur.execute("SELECT COUNT(*) AS n FROM style_info "
+                            "WHERE brand = %s AND product_name = %s "
+                            "AND style_info_id <> %s", (BRAND, new, pk))
+                if (cur.fetchone() or {}).get("n", 0) > 0:
+                    print(f"   SKIP rename style_info_id={pk} -> '{new}' "
+                          f"(name already exists; enable "
+                          f"CONSOLIDATE_DUPLICATE_STYLE_INFO to merge)")
+                    continue
+            cur.execute(f"UPDATE [{table}] SET [{field}] = %s WHERE [{pkc}] = %s",
+                        (new, pk))
+            applied += 1
+            if is_si and LOG_TO_MANUAL_OVERRIDES:
                 cur.execute(
                     "INSERT INTO manual_overrides "
                     "(table_name, record_id, field_name, old_value, new_value, "
                     " overridden_at, overridden_by, notes) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    ("style_info", d["pk"], "(row deleted - duplicate)",
-                     f"{d['product_name']} / style_id {d['style_id']}", None,
-                     datetime.now(), OVERRIDDEN_BY,
-                     f"consolidated into style_info_id {d['survivor']}"))
-            cur.execute("DELETE FROM style_info WHERE style_info_id = %s", (d["pk"],))
-            deleted += 1
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (table, pk, field, old, new, datetime.now(), OVERRIDDEN_BY,
+                     "automated RAMYBROOK categorization backfill"))
+                audit += 1
 
-    conn.commit()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        print("\nERROR during apply - transaction rolled back, database unchanged.")
+        raise
+
     conn.close()
     print(f"Done. {applied} column writes applied. {audit} style_info changes "
           f"logged to manual_overrides." +
