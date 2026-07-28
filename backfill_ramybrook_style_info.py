@@ -55,8 +55,10 @@ import os
 import re
 import sys
 import csv
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
+
+_MIN_DATE = date(1900, 1, 1)
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -67,6 +69,16 @@ DRY_RUN = True                       # True = preview only. False = apply.
 FIX_DOUBLE_COLOR_PRODUCT_NAMES = True
 LINK_VIA_STYLE_NAME_GROUPING   = True
 LOG_TO_MANUAL_OVERRIDES        = True
+
+# After normalizing product_names you can end up with TWO style_info rows for
+# the same product_name (the old dead-style_id listing + the new live one).
+# style_info is the product DIMENSION and needs a unique product_name for a
+# clean Power Pivot join ("all in one line"). This step keeps the newest row
+# per (brand, product_name) and deletes the older redundant one FROM style_info
+# ONLY - never from lookup/style_metrics/variant_metrics, so no history is lost.
+# Off by default because it deletes dimension rows; the dry run shows you every
+# keep/delete first. Locked rows (is_manual_override=1) are never deleted.
+CONSOLIDATE_DUPLICATE_STYLE_INFO = False
 OVERRIDDEN_BY = "ramybrook backfill"
 
 BRAND = "RAMYBROOK"
@@ -342,6 +354,31 @@ def main() -> None:
                         _stage_match_update(cur, plan, counts, table, pkc,
                                             "style_name_grouping", grp, match)
 
+    # ---- consolidate duplicate style_info dimension rows (opt-in) ---------
+    # keep newest per (brand, final product_name); delete older redundant ones
+    deletes: List[Dict] = []
+    if CONSOLIDATE_DUPLICATE_STYLE_INFO:
+        by_pn: Dict[Tuple[str, str], List[Dict]] = {}
+        for db in db_rows:
+            final_pn = normalize_double_color(db["product_name"]) or db["product_name"]
+            db["_final_pn"] = final_pn
+            by_pn.setdefault((db["brand"], norm(final_pn)), []).append(db)
+        for (_, _), members in by_pn.items():
+            if len(members) < 2:
+                continue
+            # never delete a locked row; keep newest created_at then highest pk
+            keepers = sorted(
+                members,
+                key=lambda d: (d["created_at"] or _MIN_DATE, d["pk"]),
+                reverse=True)
+            survivor = keepers[0]
+            for d in keepers[1:]:
+                if d["locked"]:
+                    continue  # protected - leave it, admit two rows remain
+                deletes.append({"pk": d["pk"], "product_name": d["_final_pn"],
+                                "style_id": d["style_id"], "survivor": survivor["pk"],
+                                "survivor_style_id": survivor["style_id"]})
+
     report_path = _write_duplicate_report(g, db_rows)
 
     # ---- preview ----------------------------------------------------------
@@ -363,6 +400,15 @@ def main() -> None:
         print(f"   {prod} :: {hdr} = '{val}'")
     if len(unresolved) > 10:
         print(f"   ... and {len(unresolved) - 10} more")
+    if CONSOLIDATE_DUPLICATE_STYLE_INFO:
+        print(f"\nDuplicate style_info rows to DELETE (dimension only, history kept): {len(deletes)}")
+        for d in deletes[:15]:
+            print(f"   delete style_info_id={d['pk']} style_id={d['style_id']} "
+                  f"'{d['product_name']}'  (kept id={d['survivor']} "
+                  f"style_id={d['survivor_style_id']})")
+        if len(deletes) > 15:
+            print(f"   ... and {len(deletes) - 15} more")
+
     print(f"\nTotal individual column writes queued: {len(plan)}")
     print(f"Duplicate review report: {report_path}")
 
@@ -390,10 +436,28 @@ def main() -> None:
                  "automated RAMYBROOK categorization backfill"))
             audit += 1
 
+    # consolidate: delete redundant style_info dimension rows (history untouched)
+    deleted = 0
+    if CONSOLIDATE_DUPLICATE_STYLE_INFO:
+        for d in deletes:
+            if LOG_TO_MANUAL_OVERRIDES:
+                cur.execute(
+                    "INSERT INTO manual_overrides "
+                    "(table_name, record_id, field_name, old_value, new_value, "
+                    " overridden_at, overridden_by, notes) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    ("style_info", d["pk"], "(row deleted - duplicate)",
+                     f"{d['product_name']} / style_id {d['style_id']}", None,
+                     datetime.now(), OVERRIDDEN_BY,
+                     f"consolidated into style_info_id {d['survivor']}"))
+            cur.execute("DELETE FROM style_info WHERE style_info_id = %s", (d["pk"],))
+            deleted += 1
+
     conn.commit()
     conn.close()
     print(f"Done. {applied} column writes applied. {audit} style_info changes "
-          f"logged to manual_overrides.")
+          f"logged to manual_overrides." +
+          (f" {deleted} duplicate style_info rows consolidated." if deleted else ""))
 
 
 def _stage_match_update(cur, plan, counts, table, pk_col, field, new_val, match):
