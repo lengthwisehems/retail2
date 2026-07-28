@@ -192,6 +192,8 @@ EXCLUDED_TITLE_KEYWORDS = {
     "vests",
     "zip up",
 }
+EXCLUDE_TAG_KEYWORDS = {"Men's", "MEN", "mens-jeans", "men"}
+EXCLUDE_PRODUCT_TYPES = {"Men", "Man", "Boy"}
 ALLOWED_INSEAMS = {
     "25",
     "25.25",
@@ -379,6 +381,8 @@ def post_graphql(payload: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_products() -> List[Dict[str, Any]]:
     products: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
+    tag_excludes = {k.lower() for k in EXCLUDE_TAG_KEYWORDS}
+    type_excludes = {k.lower() for k in EXCLUDE_PRODUCT_TYPES}
     while True:
         payload = {
             "query": GRAPHQL_QUERY,
@@ -396,6 +400,12 @@ def fetch_products() -> List[Dict[str, Any]]:
             node = edge.get("node") or {}
             title = (node.get("title") or "").lower()
             if any(keyword in title for keyword in EXCLUDED_TITLE_KEYWORDS):
+                continue
+            tags_lower = {t.lower() for t in (node.get("tags") or [])}
+            if tags_lower & tag_excludes:
+                continue
+            product_type = (node.get("productType") or "").lower()
+            if any(product_type.startswith(k) for k in type_excludes):
                 continue
             products.append(node)
         page_info = (
