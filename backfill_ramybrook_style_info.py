@@ -18,8 +18,14 @@ WHAT IT CHANGES  (all scoped to brand = 'RAMYBROOK')
    -> re-derived with the real scraper functions, including the cross-row
       group passes (sibling inference, majority vote, color propagation).
 
+1b. product_type: BLANK-fill only (never overwrite). ramybrook_inventory.py
+    passes Shopify's productType through unchanged ("Jeans" for every RAMYBROOK
+    jeans row), so blanks are filled from a same-style sibling, else the brand
+    mode. product_type exists only in style_info.
+
 2. style_name re-derived and kept in sync across style_info + lookup +
-   style_metrics (validated 100% against the canonical scraper output).
+   style_metrics (validated 100% against the canonical scraper output). It is
+   the only one of these fields that exists on tables other than style_info.
 
 3. product_name: the "Style | COLOR - COLOR" duplicates are normalized to the
    "Style - COLOR" convention in style_info + lookup + style_metrics +
@@ -57,6 +63,7 @@ import os
 import re
 import sys
 import csv
+from collections import Counter
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -255,7 +262,7 @@ def main() -> None:
     cur.execute("""
         SELECT style_info_id, is_manual_override, brand, style_id,
                product_name, handle, color,
-               style_name, style_name_grouping,
+               style_name, style_name_grouping, product_type,
                jean_style, inseam_label, inseam_style, rise_label,
                color_simplified, color_standardized,
                description, tags, leg_opening, inseam, rise, created_at
@@ -275,6 +282,7 @@ def main() -> None:
         "product_name":        s(r["product_name"]),
         "style_name":          s(r["style_name"]),
         "style_name_grouping": s(r["style_name_grouping"]),
+        "product_type":        s(r["product_type"]),
         "description":         s(r["description"]),
         "tags":                s(r["tags"]),
         "leg_opening":         s(r["leg_opening"]),
@@ -367,6 +375,26 @@ def main() -> None:
                     else:
                         _stage_match_update(cur, plan, counts, table, pkc,
                                             "style_name_grouping", grp, match)
+
+    # ---- product_type (blank fill only) -----------------------------------
+    # ramybrook_inventory.py has no text rule for product_type - it passes
+    # Shopify's productType straight through, which is "Jeans" for every
+    # RAMYBROOK jeans-collection row. So fill BLANKS only (never overwrite),
+    # using a same-style sibling's value, falling back to the brand's mode.
+    # product_type exists only in style_info, so nothing to propagate.
+    _pt_all = [d["product_type"] for d in db_rows if d["product_type"]]
+    _pt_global = Counter(_pt_all).most_common(1)[0][0] if _pt_all else ""
+    _pt_by_sn: Dict[str, Counter] = {}
+    for d in db_rows:
+        if d["product_type"]:
+            _pt_by_sn.setdefault(norm(d["style_name"]), Counter())[d["product_type"]] += 1
+    for d in db_rows:
+        if d["locked"] or d["product_type"]:
+            continue
+        c = _pt_by_sn.get(norm(d["style_name"]))
+        fill = c.most_common(1)[0][0] if c else _pt_global
+        if fill:
+            add("style_info", "style_info_id", d["pk"], "product_type", "", fill, True)
 
     # ---- consolidate duplicate style_info dimension rows (opt-in) ---------
     # keep newest per (brand, final product_name); delete older redundant ones
