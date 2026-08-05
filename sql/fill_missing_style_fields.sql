@@ -96,12 +96,36 @@ BEGIN TRY
         old_barcode              VARCHAR(100),  new_barcode              VARCHAR(100)
     );
 
+    -- dbo.lookup has a unique index on (brand, sku_shopify) [uq_lookup_sku].
+    -- A supplied sku_shopify can collide with a value that ALREADY belongs to
+    -- a different lookup_id (a pre-existing duplicate/stale row for the same
+    -- variant under a different sku_brand). Detect those up front so the
+    -- UPDATE can skip just that field instead of erroring out, and report
+    -- them for manual reconciliation.
+    IF OBJECT_ID('tempdb..#lookup_sku_conflicts') IS NOT NULL DROP TABLE #lookup_sku_conflicts;
+    SELECT
+        l.lookup_id,
+        l.brand,
+        l.sku_brand,
+        f.new_sku_shopify           AS attempted_sku_shopify,
+        other.lookup_id             AS conflicting_lookup_id,
+        other.sku_brand             AS conflicting_sku_brand
+    INTO #lookup_sku_conflicts
+    FROM dbo.lookup AS l
+    INNER JOIN #fill_values AS f ON f.lookup_id = l.lookup_id
+    INNER JOIN dbo.lookup AS other
+        ON other.brand = l.brand
+       AND other.sku_shopify = f.new_sku_shopify
+       AND other.lookup_id <> l.lookup_id
+    WHERE l.sku_shopify IS NULL AND f.new_sku_shopify IS NOT NULL;
+
     UPDATE l
     SET
         style_id            = COALESCE(l.style_id, f.new_style_id),
         style_name           = COALESCE(l.style_name, f.new_style_name),
         style_name_grouping  = COALESCE(l.style_name_grouping, f.new_style_name_grouping),
-        sku_shopify          = COALESCE(l.sku_shopify, f.new_sku_shopify),
+        sku_shopify          = COALESCE(l.sku_shopify,
+                                   CASE WHEN c.lookup_id IS NULL THEN f.new_sku_shopify END),
         barcode              = COALESCE(l.barcode, f.new_barcode)
     OUTPUT
         deleted.lookup_id,
@@ -113,6 +137,7 @@ BEGIN TRY
     INTO #lookup_changes
     FROM dbo.lookup AS l
     INNER JOIN #fill_values AS f ON f.lookup_id = l.lookup_id
+    LEFT JOIN #lookup_sku_conflicts AS c ON c.lookup_id = l.lookup_id
     WHERE l.style_id IS NULL OR l.style_name IS NULL OR l.style_name_grouping IS NULL
        OR l.sku_shopify IS NULL OR l.barcode IS NULL;
 
@@ -284,7 +309,16 @@ BEGIN TRY
         (SELECT COUNT(*) FROM #style_info_changes)         AS style_info_rows_touched,
         (SELECT COUNT(*) FROM #style_metrics_changes)      AS style_metrics_rows_touched,
         (SELECT COUNT(*) FROM #variant_metrics_changes)    AS variant_metrics_rows_touched,
+        (SELECT COUNT(*) FROM #lookup_sku_conflicts)       AS lookup_sku_shopify_conflicts_skipped,
         @dry_run                                           AS dry_run;
+
+    -- Rows where sku_shopify was intentionally left blank because the
+    -- supplied value already belongs to a different lookup_id for this
+    -- brand. Investigate conflicting_lookup_id -- these usually indicate a
+    -- stale/duplicate dbo.lookup row for the same real-world variant that
+    -- should be merged or deleted by hand before re-running this script.
+    IF EXISTS (SELECT 1 FROM #lookup_sku_conflicts)
+        SELECT * FROM #lookup_sku_conflicts;
 
     IF @dry_run = 1
     BEGIN

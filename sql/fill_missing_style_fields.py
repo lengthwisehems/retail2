@@ -171,12 +171,18 @@ def main() -> None:
         )
         cursor.execute(script_body)
 
-        while cursor.description is None and cursor.nextset():
-            pass
-        if cursor.description is not None:
-            columns = [c[0] for c in cursor.description]
-            for row in cursor.fetchall():
-                print(dict(zip(columns, row)))
+        # The script can emit more than one result set (the summary counts,
+        # and -- if any sku_shopify values collided with an existing row --
+        # a conflicts report). Print every result set the driver hands back.
+        has_more = True
+        while has_more:
+            if cursor.description is not None:
+                columns = [c[0] for c in cursor.description]
+                rows = cursor.fetchall()
+                print(f"--- {columns} ---")
+                for row in rows:
+                    print(dict(zip(columns, row)))
+            has_more = cursor.nextset()
 
         for msg in conn.messages:
             print(msg[1])
