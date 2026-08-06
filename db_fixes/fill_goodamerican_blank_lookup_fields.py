@@ -49,17 +49,25 @@ repo, derived from the "GA skus that need numbers" worksheet).
 
 USAGE
 -----
-    export SQL_SERVER=denim-sql.database.windows.net
-    export SQL_DATABASE=denim_analytics
-    export SQL_USERNAME=...
-    export SQL_PASSWORD=...
+1. Set the SQL_SERVER / SQL_DATABASE / SQL_USERNAME / SQL_PASSWORD
+   environment variables (Windows cmd.exe example):
 
-    # 1. Always preview first -- makes no changes, just reports what would happen.
-    python3 fill_goodamerican_blank_lookup_fields.py --dry-run
+       set SQL_SERVER=denim-sql.database.windows.net
+       set SQL_DATABASE=denim_analytics
+       set SQL_USERNAME=...
+       set SQL_PASSWORD=...
 
-    # 2. Apply for real, inside one transaction. Rolls back automatically on
-    #    any error.
-    python3 fill_goodamerican_blank_lookup_fields.py --execute
+2. Look at the DRY_RUN setting a few lines below (right after the imports).
+   Leave it as DRY_RUN = True the first time -- that mode only reports what
+   *would* happen and makes no database changes. Once you've reviewed the
+   report, change it to DRY_RUN = False and run the script again to apply
+   the changes for real, inside one transaction (it rolls back automatically
+   on any error).
+
+3. Run it with Python -- a .py file is not itself a program Windows can
+   execute, it has to be handed to python.exe. In Command Prompt:
+
+       python "C:\path\to\fill_goodamerican_blank_lookup_fields.py"
 
 Requires `pymssql` (`pip install pymssql`) -- no local ODBC driver needed.
 
@@ -72,6 +80,11 @@ import csv
 import os
 import sys
 from datetime import datetime
+
+# ============================================================================
+# SET THIS. True = preview only, no database changes. False = apply for real.
+DRY_RUN = True
+# ============================================================================
 
 BRAND = "GOODAMERICAN"
 
@@ -313,13 +326,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", default=os.path.join(os.path.dirname(__file__), "data", "goodamerican_lookup_fill_values.csv"),
                      help="CSV or .xlsx with lookup_id + fill_* columns (default: bundled CSV)")
-    mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true", help="Report what would happen; makes no database changes.")
-    mode.add_argument("--execute", action="store_true", help="Apply the changes for real, inside one transaction.")
     ap.add_argument("--skip-variant-metrics", action="store_true", help="Skip the variant_metrics backfill pass.")
     ap.add_argument("--skip-style-tables", action="store_true", help="Skip the style_info/style_metrics backfill pass.")
     args = ap.parse_args()
+    args.dry_run = DRY_RUN
+    args.execute = not DRY_RUN
 
+    print("DRY RUN (preview only, no changes will be made)" if DRY_RUN else "EXECUTE (changes WILL be written to the database)")
     print(f"Loading fill data from {args.input} ...")
     rows = load_rows(args.input)
     print(f"  {len(rows)} lookup_id rows loaded.")
@@ -424,4 +437,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n{type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        # Keeps the window open when this is run by double-clicking in
+        # Windows Explorer instead of from an already-open Command Prompt --
+        # otherwise it flashes and closes before the output can be read.
+        input("\nPress Enter to close this window...")
