@@ -38,11 +38,25 @@ following this database's existing backup_<brand>_... convention (see
 backup_rudes_lookup_5duplicates / backup_rudes_lookup_5products for
 precedent).
 
-As a second pass, once dbo.lookup has no more blank sku_shopify/barcode for
-GOODAMERICAN, the same sku_brand match is used to backfill blank sku_shopify/
-barcode in dbo.variant_metrics (safe: variant_metrics' uniqueness is keyed on
-variant_title + captured_datetime, not sku_shopify, so this cannot create a
-duplicate there).
+IMPORTANT -- why variant_metrics with a blank sku_shopify is NOT at risk:
+dbo.lookup is meant to be the hub that ties style_info/style_metrics/
+variant_metrics together, so losing a row's ability to join back into it
+would be a real loss even though the variant_metrics row itself survives.
+The "twin" a duplicate is matched against is found purely by sku_shopify
+equality -- there is no guarantee the deleted legacy row and the twin being
+kept share the same sku_brand (they will in the overwhelmingly common case,
+but not if the brand ever re-issued a SKU code between the early and late
+scrape). So this script never relies on the surviving twin to carry the old
+sku_brand forward: dbo.variant_metrics is backfilled FIRST and directly from
+the input list itself (each legacy row's own sku_brand -> its own
+fill_sku_shopify/fill_barcode), before dbo.lookup is touched at all. That
+reaches every variant_metrics row tied to any of the input rows regardless
+of what happens to that lookup_id afterwards. A second, smaller pass then
+backfills anything else via the now-fixed dbo.lookup (safe either way:
+variant_metrics' uniqueness is keyed on variant_title + captured_datetime,
+never on sku_shopify, so backfilling it can't create a duplicate there).
+The script also reports (without blocking) any duplicate pair whose legacy
+and twin sku_brand actually differ, so a real SKU-code change is visible.
 
 A third, best-effort pass backfills blank style_id/style_name/
 style_name_grouping in dbo.style_info and dbo.style_metrics by matching on
@@ -168,6 +182,21 @@ SELECT COUNT(*) FROM dbo.manual_overrides
 WHERE table_name = 'lookup' AND record_id IN (SELECT legacy_id FROM #ga_dupes)
 """
 
+# A "duplicate" pair is matched purely on sku_shopify (the thing the unique
+# index actually enforces). It is NOT guaranteed the legacy row being deleted
+# and the twin being kept share the same sku_brand -- if the brand ever
+# re-issued a SKU code between the early and late scrape, they won't. This
+# doesn't change what we do (see UPDATE_VARIANT_METRICS_FROM_STAGING_SQL
+# below, which sidesteps the question entirely), but it's worth surfacing so
+# a real SKU-code change is visible rather than silent.
+PREVIEW_SKUBRAND_MISMATCH_SQL = """
+SELECT legacy.lookup_id, legacy.sku_brand, twin.lookup_id, twin.sku_brand
+FROM #ga_dupes d
+JOIN dbo.lookup legacy ON legacy.lookup_id = d.legacy_id
+JOIN dbo.lookup twin ON twin.lookup_id = d.twin_id
+WHERE legacy.sku_brand IS NULL OR twin.sku_brand IS NULL OR legacy.sku_brand <> twin.sku_brand
+"""
+
 BACKUP_REMOVED_SQL = f"""
 INSERT INTO dbo.{BACKUP_TABLE}
     (lookup_id, brand, style_id, product_name, handle, sku_url, color, style_name,
@@ -225,6 +254,23 @@ WHERE NOT EXISTS (SELECT 1 FROM #ga_dupes d WHERE d.legacy_id = l.lookup_id);
 
 # --- Step 2: variant_metrics backfill (safe -- uniqueness there is keyed on
 # variant_title + captured_datetime, never on sku_shopify/barcode) ---------
+#
+# Two passes, run in this order:
+#
+#   2a. Directly from #ga_fill_staging (keyed on each legacy row's OWN
+#       sku_brand, matched to that row's OWN fill_sku_shopify/fill_barcode).
+#       This is intentionally independent of whether that legacy lookup row
+#       ends up deleted-as-duplicate or updated-in-place in Step 1 -- it
+#       reaches every variant_metrics row tagged with any of the 4,457
+#       sku_brand values in the input file, even in the edge case where a
+#       deleted duplicate's sku_brand differs from its surviving twin's (a
+#       SKU code change), which would otherwise orphan that sku_brand from
+#       dbo.lookup entirely. This is what actually guarantees no
+#       variant_metrics history loses its path back into dbo.lookup.
+#
+#   2b. From dbo.lookup via sku_brand, for anything pass 2a didn't cover
+#       (sku_brand values that were already fine in dbo.lookup and were
+#       never part of this blank-fields problem in the first place).
 
 CHECK_SKUBRAND_UNIQUE_SQL = f"""
 SELECT sku_brand, COUNT(*) AS n
@@ -232,6 +278,26 @@ FROM dbo.lookup
 WHERE brand = '{BRAND}' AND sku_brand IS NOT NULL
 GROUP BY sku_brand
 HAVING COUNT(*) > 1
+"""
+
+PREVIEW_VARIANT_METRICS_STAGING_SQL = f"""
+SELECT COUNT(*)
+FROM dbo.variant_metrics vm
+JOIN #ga_fill_staging s ON s.sku_brand = vm.sku_brand
+WHERE vm.brand = '{BRAND}'
+  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
+  AND vm.sku_brand IS NOT NULL
+"""
+
+UPDATE_VARIANT_METRICS_FROM_STAGING_SQL = f"""
+UPDATE vm
+SET sku_shopify = COALESCE(vm.sku_shopify, s.fill_sku_shopify),
+    barcode = COALESCE(vm.barcode, s.fill_barcode)
+FROM dbo.variant_metrics vm
+JOIN #ga_fill_staging s ON s.sku_brand = vm.sku_brand
+WHERE vm.brand = '{BRAND}'
+  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
+  AND vm.sku_brand IS NOT NULL;
 """
 
 PREVIEW_VARIANT_METRICS_SQL = f"""
@@ -403,18 +469,43 @@ def main():
                   f"will become stale (no FK enforces it either way) -- review dbo.manual_overrides "
                   f"WHERE table_name='lookup' after running this.")
 
+        cur.execute(PREVIEW_SKUBRAND_MISMATCH_SQL)
+        mismatches = cur.fetchall()
+        if mismatches:
+            print(f"\n  NOTE: {len(mismatches)} duplicate pair(s) have a DIFFERENT sku_brand on the "
+                  f"legacy row being removed than on the twin being kept (legacy_id, legacy_sku_brand, "
+                  f"twin_id, twin_sku_brand):")
+            for m in mismatches[:20]:
+                print(f"    {m}")
+            if len(mismatches) > 20:
+                print(f"    ... and {len(mismatches) - 20} more")
+            print(f"  This does not orphan any variant_metrics history -- the variant_metrics backfill "
+                  f"below is matched from each legacy row's own recorded sku_brand, independent of "
+                  f"whether that lookup row is kept or removed. Still worth a look: it usually means the "
+                  f"brand re-issued a SKU code.")
+
+        # Pass 2a: variant_metrics backfilled directly from the input list, keyed
+        # on each legacy row's OWN sku_brand -- independent of dbo.lookup dedup,
+        # so it's unaffected even by the sku_brand mismatches reported above.
+        if not args.skip_variant_metrics:
+            cur.execute(PREVIEW_VARIANT_METRICS_STAGING_SQL)
+            (vm_staging_count,) = cur.fetchone()
+            print(f"\n=== dbo.variant_metrics, matched directly from the input list ===")
+            print(f"  rows with blank sku_shopify/barcode fillable via each row's own sku_brand: {vm_staging_count}")
+
         if args.dry_run:
-            # These two passes depend on dbo.lookup already being fixed (Step 1),
-            # so in a dry run they can only report today's (pre-fix) numbers as a
-            # lower bound -- say so explicitly rather than imply they're final.
+            # This last pair of passes depend on dbo.lookup already being fixed
+            # (Step 1), so in a dry run they can only report today's (pre-fix)
+            # numbers as a lower bound -- say so explicitly rather than imply
+            # they're final.
             print("\n--- estimates below are computed against dbo.lookup's CURRENT (pre-fix) state ---")
             print("--- actual --execute numbers for these two passes will be different (usually higher) ---")
 
             if not args.skip_variant_metrics:
                 cur.execute(PREVIEW_VARIANT_METRICS_SQL)
                 (vm_count,) = cur.fetchone()
-                print(f"\n=== dbo.variant_metrics (estimate) ===")
-                print(f"  rows with blank sku_shopify/barcode fillable from dbo.lookup via sku_brand: {vm_count}")
+                print(f"\n=== dbo.variant_metrics, matched via dbo.lookup (estimate) ===")
+                print(f"  additional rows fillable from dbo.lookup via sku_brand: {vm_count}")
 
             if not args.skip_style_tables:
                 cur.execute(BUILD_HANDLE_AGG_SQL)
@@ -442,6 +533,17 @@ def main():
 
         # --- apply ---
         print("\nApplying changes...")
+
+        # Pass 2a first, deliberately BEFORE the lookup dedup below: it reads
+        # only #ga_fill_staging (every legacy row's own sku_brand + its
+        # correct fill_sku_shopify/fill_barcode), so it reaches every
+        # variant_metrics row tied to any of the input rows regardless of
+        # what Step 1 is about to do to dbo.lookup.
+        if not args.skip_variant_metrics:
+            cur.execute(UPDATE_VARIANT_METRICS_FROM_STAGING_SQL)
+            print(f"  dbo.variant_metrics: backfilled sku_shopify/barcode for {cur.rowcount} row(s) "
+                  f"directly from the input list (via each row's own sku_brand).")
+
         cur.execute(BACKUP_REMOVED_SQL)
         cur.execute(BACKUP_TWIN_SQL)
         cur.execute(BACKUP_FILLED_SQL)
@@ -453,17 +555,21 @@ def main():
         # From here on, dbo.lookup reflects the fix above (same transaction, same
         # session -- reads see our own uncommitted writes), so re-derive the
         # sku_brand/handle matches fresh instead of reusing pre-fix numbers.
+        # This second variant_metrics pass (2b) only picks up sku_brand values
+        # that were never part of the input list at all.
 
         if not args.skip_variant_metrics:
             cur.execute(CHECK_SKUBRAND_UNIQUE_SQL)
             dupe_skubrand = cur.fetchall()
             if dupe_skubrand:
-                print(f"\n  dbo.variant_metrics backfill SKIPPED: {len(dupe_skubrand)} sku_brand value(s) "
-                      f"are still not unique in dbo.lookup for {BRAND} even after the fix above -- "
-                      f"investigate before backfilling from an ambiguous join.")
+                print(f"\n  dbo.variant_metrics backfill via dbo.lookup SKIPPED: {len(dupe_skubrand)} "
+                      f"sku_brand value(s) are still not unique in dbo.lookup for {BRAND} even after the "
+                      f"fix above -- investigate before backfilling from an ambiguous join. (Pass 2a above "
+                      f"already ran regardless.)")
             else:
                 cur.execute(UPDATE_VARIANT_METRICS_SQL)
-                print(f"  dbo.variant_metrics: backfilled sku_shopify/barcode for {cur.rowcount} row(s) via sku_brand match.")
+                print(f"  dbo.variant_metrics: backfilled sku_shopify/barcode for {cur.rowcount} more "
+                      f"row(s) via dbo.lookup sku_brand match.")
 
         if not args.skip_style_tables:
             cur.execute(BUILD_HANDLE_AGG_SQL)
