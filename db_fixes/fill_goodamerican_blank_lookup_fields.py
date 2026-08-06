@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Fill blank style_id / style_name / style_name_grouping / sku_shopify / barcode
 for brand = GOODAMERICAN, everywhere those fields show up.
 
@@ -72,8 +72,15 @@ USAGE
 Requires `pymssql` (`pip install pymssql`) -- no local ODBC driver needed.
 
 Credentials are read only from the SQL_SERVER / SQL_DATABASE / SQL_USERNAME /
-SQL_PASSWORD environment variables; they are intentionally never hardcoded
-here or written to any file this script produces.
+SQL_PASSWORD environment variables. As an alternative, you can instead type
+them directly into the SQL_SERVER / SQL_DATABASE / SQL_USERNAME /
+SQL_PASSWORD constants a few lines below -- whichever of the two you fill
+in, environment variables win if both are set.
+
+IMPORTANT if you fill in the constants below: this file then contains your
+database password in plain text. Keep it local to your own machine only --
+never email it, upload it anywhere shared (a shared drive, Slack, a git
+repo, etc.), or send it to anyone.
 """
 import argparse
 import csv
@@ -84,6 +91,14 @@ from datetime import datetime
 # ============================================================================
 # SET THIS. True = preview only, no database changes. False = apply for real.
 DRY_RUN = True
+
+# OPTIONAL: fill these in so you don't have to run `set` commands first.
+# Leave them blank ("") to keep using environment variables instead.
+# See the IMPORTANT note above the imports before you put a real password here.
+SQL_SERVER_INLINE = ""
+SQL_DATABASE_INLINE = ""
+SQL_USERNAME_INLINE = ""
+SQL_PASSWORD_INLINE = ""
 # ============================================================================
 
 BRAND = "GOODAMERICAN"
@@ -289,8 +304,21 @@ def load_rows(path):
         for r in df[needed].itertuples(index=False):
             rows.append(dict(zip(needed, r)))
     else:
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
+        # utf-8-sig (not plain utf-8) strips the invisible BOM marker Excel
+        # writes at the start of a CSV it saves -- without this, that marker
+        # glues onto the first header ("lookup_id" reads as "﻿lookup_id")
+        # and every row fails with KeyError: 'lookup_id'.
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            required = ["lookup_id", "sku_brand", "fill_style_id", "fill_style_name",
+                        "fill_style_name_grouping", "fill_sku_shopify", "fill_barcode"]
+            missing_cols = [c for c in required if c not in (reader.fieldnames or [])]
+            if missing_cols:
+                raise ValueError(
+                    f"{path} is missing column(s) {missing_cols}. "
+                    f"Columns actually found: {reader.fieldnames}"
+                )
+            for row in reader:
                 rows.append(row)
 
     for r in rows:
@@ -310,14 +338,15 @@ def load_rows(path):
 
 def connect():
     import pymssql
-    server = os.environ.get("SQL_SERVER")
-    database = os.environ.get("SQL_DATABASE")
-    user = os.environ.get("SQL_USERNAME")
-    password = os.environ.get("SQL_PASSWORD")
+    server = os.environ.get("SQL_SERVER") or SQL_SERVER_INLINE
+    database = os.environ.get("SQL_DATABASE") or SQL_DATABASE_INLINE
+    user = os.environ.get("SQL_USERNAME") or SQL_USERNAME_INLINE
+    password = os.environ.get("SQL_PASSWORD") or SQL_PASSWORD_INLINE
     missing = [n for n, v in [("SQL_SERVER", server), ("SQL_DATABASE", database),
                                ("SQL_USERNAME", user), ("SQL_PASSWORD", password)] if not v]
     if missing:
-        sys.exit(f"Missing required environment variable(s): {', '.join(missing)}")
+        sys.exit(f"Missing {', '.join(missing)} -- either run `set` for these first, "
+                  f"or fill in the SQL_*_INLINE constants near the top of this file.")
     return pymssql.connect(server=server, database=database, user=user, password=password,
                             login_timeout=30, timeout=120, autocommit=False)
 
