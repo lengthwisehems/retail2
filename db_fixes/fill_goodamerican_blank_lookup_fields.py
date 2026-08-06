@@ -347,8 +347,15 @@ def connect():
     if missing:
         sys.exit(f"Missing {', '.join(missing)} -- either run `set` for these first, "
                   f"or fill in the SQL_*_INLINE constants near the top of this file.")
+    # timeout=0 means "no query timeout" (pymssql's default). This is a
+    # one-off maintenance script run interactively, and dbo.variant_metrics
+    # is a large historical table -- a couple of the reporting queries can
+    # legitimately take a few minutes on it. A short timeout doesn't just
+    # cancel the slow query, it tends to drop the whole TDS connection
+    # ("Not connected to any MS SQL server" on the very next statement),
+    # which would be far worse mid-UPDATE than just waiting.
     return pymssql.connect(server=server, database=database, user=user, password=password,
-                            login_timeout=30, timeout=120, autocommit=False)
+                            login_timeout=30, timeout=0, autocommit=False)
 
 
 def main():
