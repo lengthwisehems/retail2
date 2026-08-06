@@ -1,68 +1,40 @@
 #!/usr/bin/env python3
 """
 Fill blank style_id / style_name / style_name_grouping / sku_shopify / barcode
-for brand = GOODAMERICAN, without losing variant_metrics history.
+for brand = GOODAMERICAN, everywhere those fields show up.
 
-BACKGROUND
-----------
-Early GOODAMERICAN scrapes did not capture style_id, style_name,
-style_name_grouping, sku_shopify, or barcode. Those variants were still
-written to dbo.lookup (keyed by sku_brand, which was always captured), so a
-lot of rows in dbo.lookup for GOODAMERICAN have those five fields NULL.
-A later, fuller scrape re-captured the same variants -- this time with every
-field populated -- as brand-new dbo.lookup rows (new lookup_id, same
-sku_brand/variant).
+This script never deletes or merges any row, in any table. dbo.lookup is
+allowed to (and does) carry more than one row for the same sku_brand over
+time -- that is by design, so that data captured against an older row is
+never orphaned. This script only ever fills a NULL field with a value; it
+never overwrites a value that is already there, and it never removes a row.
 
-So for many of the "blank" legacy rows, a fully-populated twin row for the
-exact same variant already exists elsewhere in dbo.lookup. If we simply wrote
-the correct values into the legacy row, it would become a byte-for-byte
-duplicate of its twin -- identical brand/style_id/product_name/handle/
-sku_url/color/style_name/style_name_grouping/variant_title/size/sku_shopify/
-sku_brand/barcode, differing only by lookup_id. That collides with the
-uq_lookup_sku unique index on (brand, sku_shopify), so the raw UPDATE would
-either fail outright or (if run row by row) silently leave two rows aliasing
-one SKU.
+STEP 1 -- dbo.lookup
+    For each lookup_id in the input file, fill style_id, style_name,
+    style_name_grouping, sku_shopify, and barcode wherever they are
+    currently NULL, using the value supplied for that row (input file
+    columns "If <field> is blank, fill with").
 
-This script resolves that per row, decided live against the database:
+    The one real constraint: dbo.lookup has a unique index on
+    (brand, sku_shopify) for non-NULL sku_shopify. If the sku_shopify value
+    we're about to write already exists on a *different* lookup_id, SQL
+    Server will not allow it on this row too. When that happens, this
+    script still fills every other blank field on that row and simply
+    leaves sku_shopify as it was (NULL), then prints exactly which
+    lookup_id it conflicts with so you can look at it by hand. Nothing is
+    deleted or guessed on your behalf.
 
-  * If a twin with the same (brand, sku_shopify) already exists elsewhere in
-    dbo.lookup, the legacy row is redundant -- it is deleted. Nothing is lost:
-    dbo.variant_metrics/style_metrics/style_info are captured-history tables
-    with no foreign key to lookup_id, so they are untouched either way.
-  * Otherwise the row is genuinely unique history -- its blank fields are
-    filled in from the supplied data (existing non-NULL values are never
-    overwritten).
+STEP 2 -- dbo.style_info and dbo.style_metrics
+    For each row still missing style_id, style_name, or style_name_grouping,
+    fill it from dbo.lookup by matching brand + product_name. Where more
+    than one dbo.lookup row shares that product_name (expected, given
+    dbo.lookup intentionally keeps old and new rows), any one populated,
+    non-NULL value found for that product_name is used -- MAX() ignores
+    NULLs, so it naturally picks the first real value it finds.
 
-Every row touched (deleted or updated) is copied to a backup table first,
-following this database's existing backup_<brand>_... convention (see
-backup_rudes_lookup_5duplicates / backup_rudes_lookup_5products for
-precedent).
-
-IMPORTANT -- why variant_metrics with a blank sku_shopify is NOT at risk:
-dbo.lookup is meant to be the hub that ties style_info/style_metrics/
-variant_metrics together, so losing a row's ability to join back into it
-would be a real loss even though the variant_metrics row itself survives.
-The "twin" a duplicate is matched against is found purely by sku_shopify
-equality -- there is no guarantee the deleted legacy row and the twin being
-kept share the same sku_brand (they will in the overwhelmingly common case,
-but not if the brand ever re-issued a SKU code between the early and late
-scrape). So this script never relies on the surviving twin to carry the old
-sku_brand forward: dbo.variant_metrics is backfilled FIRST and directly from
-the input list itself (each legacy row's own sku_brand -> its own
-fill_sku_shopify/fill_barcode), before dbo.lookup is touched at all. That
-reaches every variant_metrics row tied to any of the input rows regardless
-of what happens to that lookup_id afterwards. A second, smaller pass then
-backfills anything else via the now-fixed dbo.lookup (safe either way:
-variant_metrics' uniqueness is keyed on variant_title + captured_datetime,
-never on sku_shopify, so backfilling it can't create a duplicate there).
-The script also reports (without blocking) any duplicate pair whose legacy
-and twin sku_brand actually differ, so a real SKU-code change is visible.
-
-A third, best-effort pass backfills blank style_id/style_name/
-style_name_grouping in dbo.style_info and dbo.style_metrics by matching on
-(brand, handle) against dbo.lookup, but only where every matching lookup row
-agrees on a single value -- ambiguous handles are left alone and reported for
-manual review, never guessed.
+STEP 3 -- dbo.variant_metrics
+    For each row still missing sku_shopify or barcode, fill it from
+    dbo.lookup by matching brand + sku_brand, the same way.
 
 INPUT
 -----
@@ -105,6 +77,10 @@ BRAND = "GOODAMERICAN"
 
 BACKUP_TABLE = "backup_goodamerican_lookup_fillblanks"
 
+# NOTE: BRAND is interpolated as a literal (not passed as a bound parameter)
+# in every statement that CREATEs a temp table, and for simplicity in every
+# other statement too, since it's a hardcoded constant, not user input.
+
 CREATE_BACKUP_TABLE_SQL = f"""
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = '{BACKUP_TABLE}')
 BEGIN
@@ -124,8 +100,6 @@ BEGIN
         sku_shopify           VARCHAR(100)  NULL,
         sku_brand             VARCHAR(255)  NULL,
         barcode               VARCHAR(100)  NULL,
-        backup_action         VARCHAR(20)   NOT NULL,  -- 'removed_duplicate' | 'duplicate_twin_kept' | 'filled_blanks'
-        matched_lookup_id     INT           NULL,       -- for removed_duplicate/duplicate_twin_kept: the other side of the pair
         backup_at             DATETIME2(7)  NOT NULL
     );
 END
@@ -150,226 +124,136 @@ INSERT INTO #ga_fill_staging
 VALUES (%s, %s, %s, %s, %s, %s, %s)
 """
 
-# NOTE: BRAND is interpolated as a literal (not passed as a bound parameter)
-# in every statement that CREATEs a temp table. pyodbc/ODBC parameterized
-# execs run dynamic SQL via sp_executesql, whose nested scope silently drops
-# any #temp table created inside it the moment the call returns -- the next
-# statement then fails with "Invalid object name '#...'" We sidestep that
-# whole class of bug by never parameterizing a CREATE ... INTO #temp
-# statement. BRAND is a hardcoded constant, not user input, so this is safe.
-
-CREATE_DUPES_TABLE_SQL = f"""
-IF OBJECT_ID('tempdb..#ga_dupes') IS NOT NULL DROP TABLE #ga_dupes;
-SELECT s.lookup_id AS legacy_id, twin.lookup_id AS twin_id
-INTO #ga_dupes
+# Rows whose target sku_shopify already exists on a DIFFERENT lookup_id.
+# dbo.lookup's unique index on (brand, sku_shopify) would reject writing it
+# there too, so these are left with sku_shopify untouched and reported.
+PREVIEW_SKU_CONFLICTS_SQL = f"""
+SELECT s.lookup_id, s.fill_sku_shopify, other.lookup_id AS conflicts_with_lookup_id
 FROM #ga_fill_staging s
-JOIN dbo.lookup twin
-  ON twin.brand = '{BRAND}'
- AND twin.sku_shopify = s.fill_sku_shopify
- AND twin.lookup_id <> s.lookup_id;
+JOIN dbo.lookup other
+  ON other.brand = '{BRAND}'
+ AND other.sku_shopify = s.fill_sku_shopify
+ AND other.lookup_id <> s.lookup_id
+ORDER BY s.lookup_id;
 """
 
 PREVIEW_COUNTS_SQL = """
 SELECT
     (SELECT COUNT(*) FROM #ga_fill_staging) AS staged_rows,
-    (SELECT COUNT(*) FROM #ga_dupes) AS duplicate_rows_to_remove,
-    (SELECT COUNT(*) FROM #ga_fill_staging s WHERE NOT EXISTS (SELECT 1 FROM #ga_dupes d WHERE d.legacy_id = s.lookup_id)) AS rows_to_fill,
     (SELECT COUNT(*) FROM #ga_fill_staging s LEFT JOIN dbo.lookup l ON l.lookup_id = s.lookup_id WHERE l.lookup_id IS NULL) AS lookup_ids_not_found
 """
 
-PREVIEW_MANUAL_OVERRIDE_HITS_SQL = """
-SELECT COUNT(*) FROM dbo.manual_overrides
-WHERE table_name = 'lookup' AND record_id IN (SELECT legacy_id FROM #ga_dupes)
-"""
-
-# A "duplicate" pair is matched purely on sku_shopify (the thing the unique
-# index actually enforces). It is NOT guaranteed the legacy row being deleted
-# and the twin being kept share the same sku_brand -- if the brand ever
-# re-issued a SKU code between the early and late scrape, they won't. This
-# doesn't change what we do (see UPDATE_VARIANT_METRICS_FROM_STAGING_SQL
-# below, which sidesteps the question entirely), but it's worth surfacing so
-# a real SKU-code change is visible rather than silent.
-PREVIEW_SKUBRAND_MISMATCH_SQL = """
-SELECT legacy.lookup_id, legacy.sku_brand, twin.lookup_id, twin.sku_brand
-FROM #ga_dupes d
-JOIN dbo.lookup legacy ON legacy.lookup_id = d.legacy_id
-JOIN dbo.lookup twin ON twin.lookup_id = d.twin_id
-WHERE legacy.sku_brand IS NULL OR twin.sku_brand IS NULL OR legacy.sku_brand <> twin.sku_brand
-"""
-
-BACKUP_REMOVED_SQL = f"""
+BACKUP_LOOKUP_ROWS_SQL = f"""
 INSERT INTO dbo.{BACKUP_TABLE}
     (lookup_id, brand, style_id, product_name, handle, sku_url, color, style_name,
-     style_name_grouping, variant_title, size, sku_shopify, sku_brand, barcode,
-     backup_action, matched_lookup_id, backup_at)
+     style_name_grouping, variant_title, size, sku_shopify, sku_brand, barcode, backup_at)
 SELECT l.lookup_id, l.brand, l.style_id, l.product_name, l.handle, l.sku_url, l.color, l.style_name,
-       l.style_name_grouping, l.variant_title, l.size, l.sku_shopify, l.sku_brand, l.barcode,
-       'removed_duplicate', d.twin_id, SYSDATETIME()
+       l.style_name_grouping, l.variant_title, l.size, l.sku_shopify, l.sku_brand, l.barcode, SYSDATETIME()
 FROM dbo.lookup l
-JOIN #ga_dupes d ON d.legacy_id = l.lookup_id;
+JOIN #ga_fill_staging s ON s.lookup_id = l.lookup_id;
 """
 
-BACKUP_TWIN_SQL = f"""
-INSERT INTO dbo.{BACKUP_TABLE}
-    (lookup_id, brand, style_id, product_name, handle, sku_url, color, style_name,
-     style_name_grouping, variant_title, size, sku_shopify, sku_brand, barcode,
-     backup_action, matched_lookup_id, backup_at)
-SELECT DISTINCT l.lookup_id, l.brand, l.style_id, l.product_name, l.handle, l.sku_url, l.color, l.style_name,
-       l.style_name_grouping, l.variant_title, l.size, l.sku_shopify, l.sku_brand, l.barcode,
-       'duplicate_twin_kept', d.legacy_id, SYSDATETIME()
-FROM dbo.lookup l
-JOIN #ga_dupes d ON d.twin_id = l.lookup_id;
-"""
-
-BACKUP_FILLED_SQL = f"""
-INSERT INTO dbo.{BACKUP_TABLE}
-    (lookup_id, brand, style_id, product_name, handle, sku_url, color, style_name,
-     style_name_grouping, variant_title, size, sku_shopify, sku_brand, barcode,
-     backup_action, matched_lookup_id, backup_at)
-SELECT l.lookup_id, l.brand, l.style_id, l.product_name, l.handle, l.sku_url, l.color, l.style_name,
-       l.style_name_grouping, l.variant_title, l.size, l.sku_shopify, l.sku_brand, l.barcode,
-       'filled_blanks', NULL, SYSDATETIME()
-FROM dbo.lookup l
-JOIN #ga_fill_staging s ON s.lookup_id = l.lookup_id
-WHERE NOT EXISTS (SELECT 1 FROM #ga_dupes d WHERE d.legacy_id = l.lookup_id);
-"""
-
-DELETE_DUPES_SQL = """
-DELETE l
-FROM dbo.lookup l
-JOIN #ga_dupes d ON d.legacy_id = l.lookup_id;
-"""
-
-UPDATE_FILL_SQL = """
+# Fills every blank field. sku_shopify is only written when doing so would
+# not collide with a different row's existing sku_shopify (see
+# PREVIEW_SKU_CONFLICTS_SQL above) -- otherwise it's left exactly as it was.
+UPDATE_LOOKUP_SQL = f"""
 UPDATE l
 SET style_id = COALESCE(l.style_id, s.fill_style_id),
     style_name = COALESCE(l.style_name, s.fill_style_name),
     style_name_grouping = COALESCE(l.style_name_grouping, s.fill_style_name_grouping),
-    sku_shopify = COALESCE(l.sku_shopify, s.fill_sku_shopify),
-    barcode = COALESCE(l.barcode, s.fill_barcode)
+    barcode = COALESCE(l.barcode, s.fill_barcode),
+    sku_shopify = CASE
+        WHEN l.sku_shopify IS NOT NULL THEN l.sku_shopify
+        WHEN EXISTS (
+            SELECT 1 FROM dbo.lookup other
+            WHERE other.brand = l.brand AND other.sku_shopify = s.fill_sku_shopify AND other.lookup_id <> l.lookup_id
+        ) THEN NULL
+        ELSE s.fill_sku_shopify
+    END
 FROM dbo.lookup l
 JOIN #ga_fill_staging s ON s.lookup_id = l.lookup_id
-WHERE NOT EXISTS (SELECT 1 FROM #ga_dupes d WHERE d.legacy_id = l.lookup_id);
+WHERE l.brand = '{BRAND}';
 """
 
-# --- Step 2: variant_metrics backfill (safe -- uniqueness there is keyed on
-# variant_title + captured_datetime, never on sku_shopify/barcode) ---------
-#
-# Two passes, run in this order:
-#
-#   2a. Directly from #ga_fill_staging (keyed on each legacy row's OWN
-#       sku_brand, matched to that row's OWN fill_sku_shopify/fill_barcode).
-#       This is intentionally independent of whether that legacy lookup row
-#       ends up deleted-as-duplicate or updated-in-place in Step 1 -- it
-#       reaches every variant_metrics row tagged with any of the 4,457
-#       sku_brand values in the input file, even in the edge case where a
-#       deleted duplicate's sku_brand differs from its surviving twin's (a
-#       SKU code change), which would otherwise orphan that sku_brand from
-#       dbo.lookup entirely. This is what actually guarantees no
-#       variant_metrics history loses its path back into dbo.lookup.
-#
-#   2b. From dbo.lookup via sku_brand, for anything pass 2a didn't cover
-#       (sku_brand values that were already fine in dbo.lookup and were
-#       never part of this blank-fields problem in the first place).
-
-CHECK_SKUBRAND_UNIQUE_SQL = f"""
-SELECT sku_brand, COUNT(*) AS n
-FROM dbo.lookup
-WHERE brand = '{BRAND}' AND sku_brand IS NOT NULL
-GROUP BY sku_brand
-HAVING COUNT(*) > 1
-"""
-
-PREVIEW_VARIANT_METRICS_STAGING_SQL = f"""
-SELECT COUNT(*)
-FROM dbo.variant_metrics vm
-JOIN #ga_fill_staging s ON s.sku_brand = vm.sku_brand
-WHERE vm.brand = '{BRAND}'
-  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
-  AND vm.sku_brand IS NOT NULL
-"""
-
-UPDATE_VARIANT_METRICS_FROM_STAGING_SQL = f"""
-UPDATE vm
-SET sku_shopify = COALESCE(vm.sku_shopify, s.fill_sku_shopify),
-    barcode = COALESCE(vm.barcode, s.fill_barcode)
-FROM dbo.variant_metrics vm
-JOIN #ga_fill_staging s ON s.sku_brand = vm.sku_brand
-WHERE vm.brand = '{BRAND}'
-  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
-  AND vm.sku_brand IS NOT NULL;
-"""
-
-PREVIEW_VARIANT_METRICS_SQL = f"""
-SELECT COUNT(*)
-FROM dbo.variant_metrics vm
-JOIN dbo.lookup l ON l.brand = vm.brand AND l.sku_brand = vm.sku_brand
-WHERE vm.brand = '{BRAND}'
-  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
-  AND vm.sku_brand IS NOT NULL
-  AND (l.sku_shopify IS NOT NULL OR l.barcode IS NOT NULL)
-"""
-
-UPDATE_VARIANT_METRICS_SQL = f"""
-UPDATE vm
-SET sku_shopify = COALESCE(vm.sku_shopify, l.sku_shopify),
-    barcode = COALESCE(vm.barcode, l.barcode)
-FROM dbo.variant_metrics vm
-JOIN dbo.lookup l ON l.brand = vm.brand AND l.sku_brand = vm.sku_brand
-WHERE vm.brand = '{BRAND}'
-  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
-  AND vm.sku_brand IS NOT NULL;
-"""
-
-# --- Step 3: style_info / style_metrics backfill (best effort, only where
-# every dbo.lookup row for that handle agrees on a single value) -----------
-
-BUILD_HANDLE_AGG_SQL = f"""
-IF OBJECT_ID('tempdb..#ga_handle_agg') IS NOT NULL DROP TABLE #ga_handle_agg;
-SELECT handle,
-       COUNT(DISTINCT style_id) AS n_style_id, MAX(style_id) AS one_style_id,
-       COUNT(DISTINCT style_name) AS n_style_name, MAX(style_name) AS one_style_name,
-       COUNT(DISTINCT style_name_grouping) AS n_style_name_grouping, MAX(style_name_grouping) AS one_style_name_grouping
-INTO #ga_handle_agg
-FROM dbo.lookup
-WHERE brand = '{BRAND}' AND handle IS NOT NULL
-GROUP BY handle;
-"""
+# --- Step 2: style_info / style_metrics, matched on product_name ----------
 
 def preview_style_table_sql(table):
     return f"""
-    SELECT
-        SUM(CASE WHEN t.style_id IS NULL AND a.n_style_id = 1 THEN 1 ELSE 0 END) AS style_id_fillable,
-        SUM(CASE WHEN t.style_id IS NULL AND a.n_style_id > 1 THEN 1 ELSE 0 END) AS style_id_ambiguous,
-        SUM(CASE WHEN t.style_name IS NULL AND a.n_style_name = 1 THEN 1 ELSE 0 END) AS style_name_fillable,
-        SUM(CASE WHEN t.style_name_grouping IS NULL AND a.n_style_name_grouping = 1 THEN 1 ELSE 0 END) AS style_name_grouping_fillable
+    SELECT COUNT(*)
     FROM dbo.{table} t
-    JOIN #ga_handle_agg a ON a.handle = t.handle
+    JOIN (
+        SELECT product_name,
+               MAX(style_id) AS style_id,
+               MAX(style_name) AS style_name,
+               MAX(style_name_grouping) AS style_name_grouping
+        FROM dbo.lookup
+        WHERE brand = '{BRAND}' AND product_name IS NOT NULL
+        GROUP BY product_name
+    ) agg ON agg.product_name = t.product_name
     WHERE t.brand = '{BRAND}'
       AND (t.style_id IS NULL OR t.style_name IS NULL OR t.style_name_grouping IS NULL)
+      AND (agg.style_id IS NOT NULL OR agg.style_name IS NOT NULL OR agg.style_name_grouping IS NOT NULL)
     """
 
 def update_style_table_sql(table):
     return f"""
     UPDATE t
-    SET style_id = CASE WHEN t.style_id IS NULL AND a.n_style_id = 1 THEN a.one_style_id ELSE t.style_id END,
-        style_name = CASE WHEN t.style_name IS NULL AND a.n_style_name = 1 THEN a.one_style_name ELSE t.style_name END,
-        style_name_grouping = CASE WHEN t.style_name_grouping IS NULL AND a.n_style_name_grouping = 1 THEN a.one_style_name_grouping ELSE t.style_name_grouping END
+    SET style_id = COALESCE(t.style_id, agg.style_id),
+        style_name = COALESCE(t.style_name, agg.style_name),
+        style_name_grouping = COALESCE(t.style_name_grouping, agg.style_name_grouping)
     FROM dbo.{table} t
-    JOIN #ga_handle_agg a ON a.handle = t.handle
-    WHERE t.brand = '{BRAND}'
-      AND (
-            (t.style_id IS NULL AND a.n_style_id = 1)
-         OR (t.style_name IS NULL AND a.n_style_name = 1)
-         OR (t.style_name_grouping IS NULL AND a.n_style_name_grouping = 1)
-      );
+    JOIN (
+        SELECT product_name,
+               MAX(style_id) AS style_id,
+               MAX(style_name) AS style_name,
+               MAX(style_name_grouping) AS style_name_grouping
+        FROM dbo.lookup
+        WHERE brand = '{BRAND}' AND product_name IS NOT NULL
+        GROUP BY product_name
+    ) agg ON agg.product_name = t.product_name
+    WHERE t.brand = '{BRAND}';
     """
 
-AMBIGUOUS_HANDLES_SQL = """
-SELECT handle, n_style_id, n_style_name, n_style_name_grouping
-FROM #ga_handle_agg
-WHERE n_style_id > 1 OR n_style_name > 1 OR n_style_name_grouping > 1
-ORDER BY handle;
+# --- Step 3: variant_metrics, matched on sku_brand -------------------------
+
+PREVIEW_VARIANT_METRICS_SQL = f"""
+SELECT COUNT(*)
+FROM dbo.variant_metrics vm
+JOIN (
+    SELECT sku_brand, MAX(sku_shopify) AS sku_shopify, MAX(barcode) AS barcode
+    FROM dbo.lookup
+    WHERE brand = '{BRAND}' AND sku_brand IS NOT NULL
+    GROUP BY sku_brand
+) agg ON agg.sku_brand = vm.sku_brand
+WHERE vm.brand = '{BRAND}'
+  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL)
+  AND (agg.sku_shopify IS NOT NULL OR agg.barcode IS NOT NULL)
+"""
+
+# sku_brand values where dbo.lookup has more than one distinct non-NULL
+# sku_shopify -- MAX() will pick one deterministically, but this is worth a
+# look since it would mean a real disagreement in the source data.
+PREVIEW_VARIANT_METRICS_AMBIGUOUS_SQL = f"""
+SELECT sku_brand, COUNT(DISTINCT sku_shopify) AS distinct_sku_shopify
+FROM dbo.lookup
+WHERE brand = '{BRAND}' AND sku_brand IS NOT NULL AND sku_shopify IS NOT NULL
+GROUP BY sku_brand
+HAVING COUNT(DISTINCT sku_shopify) > 1
+"""
+
+UPDATE_VARIANT_METRICS_SQL = f"""
+UPDATE vm
+SET sku_shopify = COALESCE(vm.sku_shopify, agg.sku_shopify),
+    barcode = COALESCE(vm.barcode, agg.barcode)
+FROM dbo.variant_metrics vm
+JOIN (
+    SELECT sku_brand, MAX(sku_shopify) AS sku_shopify, MAX(barcode) AS barcode
+    FROM dbo.lookup
+    WHERE brand = '{BRAND}' AND sku_brand IS NOT NULL
+    GROUP BY sku_brand
+) agg ON agg.sku_brand = vm.sku_brand
+WHERE vm.brand = '{BRAND}'
+  AND (vm.sku_shopify IS NULL OR vm.barcode IS NULL);
 """
 
 
@@ -451,81 +335,58 @@ def main():
              r["fill_style_name_grouping"], r["fill_sku_shopify"], r["fill_barcode"])
             for r in rows
         ])
-        cur.execute(CREATE_DUPES_TABLE_SQL)
 
         cur.execute(PREVIEW_COUNTS_SQL)
-        staged, dupe_count, fill_count, missing_count = cur.fetchone()
+        staged, missing_count = cur.fetchone()
         print("\n=== dbo.lookup ===")
-        print(f"  staged rows (from input file):        {staged}")
-        print(f"  lookup_id not found in dbo.lookup:      {missing_count}  (already handled previously?)")
-        print(f"  will be DELETED as duplicate of a twin: {dupe_count}")
-        print(f"  will be UPDATED (blanks filled in):     {fill_count}")
+        print(f"  staged rows (from input file):     {staged}")
+        print(f"  lookup_id not found in dbo.lookup:   {missing_count}  (already handled previously?)")
+        print(f"  Nothing is ever deleted. Every blank field on every one of these rows gets filled,")
+        print(f"  except see the sku_shopify conflicts below, if any.")
 
-        cur.execute(PREVIEW_MANUAL_OVERRIDE_HITS_SQL)
-        (mo_count,) = cur.fetchone()
-        if mo_count:
-            print(f"  NOTE: {mo_count} row(s) in dbo.manual_overrides reference a lookup_id "
-                  f"that will be deleted as a duplicate. Their table_name/record_id pointer "
-                  f"will become stale (no FK enforces it either way) -- review dbo.manual_overrides "
-                  f"WHERE table_name='lookup' after running this.")
+        cur.execute(PREVIEW_SKU_CONFLICTS_SQL)
+        conflicts = cur.fetchall()
+        if conflicts:
+            print(f"\n  {len(conflicts)} row(s) have a target sku_shopify that already exists on a "
+                  f"DIFFERENT lookup_id. dbo.lookup's unique index on (brand, sku_shopify) won't allow "
+                  f"writing it there too, so sku_shopify is left as-is on these rows (every other blank "
+                  f"field on them still gets filled). Nothing is deleted -- these just need a human look:")
+            print(f"  (lookup_id, target_sku_shopify, conflicts_with_lookup_id)")
+            for c in conflicts[:30]:
+                print(f"    {c}")
+            if len(conflicts) > 30:
+                print(f"    ... and {len(conflicts) - 30} more")
+        else:
+            print(f"\n  No sku_shopify conflicts found -- every row can be filled completely.")
 
-        cur.execute(PREVIEW_SKUBRAND_MISMATCH_SQL)
-        mismatches = cur.fetchall()
-        if mismatches:
-            print(f"\n  NOTE: {len(mismatches)} duplicate pair(s) have a DIFFERENT sku_brand on the "
-                  f"legacy row being removed than on the twin being kept (legacy_id, legacy_sku_brand, "
-                  f"twin_id, twin_sku_brand):")
-            for m in mismatches[:20]:
-                print(f"    {m}")
-            if len(mismatches) > 20:
-                print(f"    ... and {len(mismatches) - 20} more")
-            print(f"  This does not orphan any variant_metrics history -- the variant_metrics backfill "
-                  f"below is matched from each legacy row's own recorded sku_brand, independent of "
-                  f"whether that lookup row is kept or removed. Still worth a look: it usually means the "
-                  f"brand re-issued a SKU code.")
-
-        # Pass 2a: variant_metrics backfilled directly from the input list, keyed
-        # on each legacy row's OWN sku_brand -- independent of dbo.lookup dedup,
-        # so it's unaffected even by the sku_brand mismatches reported above.
         if not args.skip_variant_metrics:
-            cur.execute(PREVIEW_VARIANT_METRICS_STAGING_SQL)
-            (vm_staging_count,) = cur.fetchone()
-            print(f"\n=== dbo.variant_metrics, matched directly from the input list ===")
-            print(f"  rows with blank sku_shopify/barcode fillable via each row's own sku_brand: {vm_staging_count}")
+            cur.execute(PREVIEW_VARIANT_METRICS_AMBIGUOUS_SQL)
+            ambiguous_vm = cur.fetchall()
+            if ambiguous_vm:
+                print(f"\n  NOTE: {len(ambiguous_vm)} sku_brand value(s) have more than one distinct "
+                      f"sku_shopify across dbo.lookup rows -- worth a look (sku_brand, distinct_count):")
+                for a in ambiguous_vm[:20]:
+                    print(f"    {a}")
 
         if args.dry_run:
-            # This last pair of passes depend on dbo.lookup already being fixed
-            # (Step 1), so in a dry run they can only report today's (pre-fix)
-            # numbers as a lower bound -- say so explicitly rather than imply
-            # they're final.
+            # These two passes read dbo.lookup, which Step 1 (above) is what
+            # fixes -- so in a dry run they can only report today's (pre-fix)
+            # numbers as a lower bound.
             print("\n--- estimates below are computed against dbo.lookup's CURRENT (pre-fix) state ---")
-            print("--- actual --execute numbers for these two passes will be different (usually higher) ---")
+            print("--- actual --execute numbers will be different (usually higher) ---")
 
             if not args.skip_variant_metrics:
                 cur.execute(PREVIEW_VARIANT_METRICS_SQL)
                 (vm_count,) = cur.fetchone()
-                print(f"\n=== dbo.variant_metrics, matched via dbo.lookup (estimate) ===")
-                print(f"  additional rows fillable from dbo.lookup via sku_brand: {vm_count}")
+                print(f"\n=== dbo.variant_metrics (estimate) ===")
+                print(f"  rows with blank sku_shopify/barcode fillable via sku_brand match: {vm_count}")
 
             if not args.skip_style_tables:
-                cur.execute(BUILD_HANDLE_AGG_SQL)
                 for table in ("style_info", "style_metrics"):
                     cur.execute(preview_style_table_sql(table))
-                    sid_fill, sid_ambig, sname_fill, sgroup_fill = cur.fetchone()
+                    (count,) = cur.fetchone()
                     print(f"\n=== dbo.{table} (estimate) ===")
-                    print(f"  style_id fillable (unambiguous by handle):          {sid_fill or 0}")
-                    print(f"  style_id ambiguous (handle has >1 distinct value):  {sid_ambig or 0}  (left alone)")
-                    print(f"  style_name fillable:                                {sname_fill or 0}")
-                    print(f"  style_name_grouping fillable:                       {sgroup_fill or 0}")
-                cur.execute(AMBIGUOUS_HANDLES_SQL)
-                ambiguous = cur.fetchall()
-                if ambiguous:
-                    print(f"\n  {len(ambiguous)} handle(s) have inconsistent style_id/style_name/style_name_grouping "
-                          f"across dbo.lookup rows and will be left blank for manual review:")
-                    for h in ambiguous[:20]:
-                        print(f"    {h}")
-                    if len(ambiguous) > 20:
-                        print(f"    ... and {len(ambiguous) - 20} more")
+                    print(f"  rows with blank style_id/style_name/style_name_grouping fillable via product_name match: {count}")
 
             print("\nDry run only -- no changes made. Re-run with --execute to apply.")
             conn.rollback()
@@ -533,50 +394,22 @@ def main():
 
         # --- apply ---
         print("\nApplying changes...")
+        cur.execute(BACKUP_LOOKUP_ROWS_SQL)
+        cur.execute(UPDATE_LOOKUP_SQL)
+        print(f"  dbo.lookup: filled blanks on {cur.rowcount} row(s) (sku_shopify held back on the "
+              f"{len(conflicts)} conflict(s) reported above). Pre-update state backed up to dbo.{BACKUP_TABLE}.")
 
-        # Pass 2a first, deliberately BEFORE the lookup dedup below: it reads
-        # only #ga_fill_staging (every legacy row's own sku_brand + its
-        # correct fill_sku_shopify/fill_barcode), so it reaches every
-        # variant_metrics row tied to any of the input rows regardless of
-        # what Step 1 is about to do to dbo.lookup.
-        if not args.skip_variant_metrics:
-            cur.execute(UPDATE_VARIANT_METRICS_FROM_STAGING_SQL)
-            print(f"  dbo.variant_metrics: backfilled sku_shopify/barcode for {cur.rowcount} row(s) "
-                  f"directly from the input list (via each row's own sku_brand).")
-
-        cur.execute(BACKUP_REMOVED_SQL)
-        cur.execute(BACKUP_TWIN_SQL)
-        cur.execute(BACKUP_FILLED_SQL)
-        cur.execute(DELETE_DUPES_SQL)
-        cur.execute(UPDATE_FILL_SQL)
-        print(f"  dbo.lookup: removed {dupe_count} duplicate row(s), filled {fill_count} row(s). "
-              f"Full before-state backed up to dbo.{BACKUP_TABLE}.")
-
-        # From here on, dbo.lookup reflects the fix above (same transaction, same
-        # session -- reads see our own uncommitted writes), so re-derive the
-        # sku_brand/handle matches fresh instead of reusing pre-fix numbers.
-        # This second variant_metrics pass (2b) only picks up sku_brand values
-        # that were never part of the input list at all.
+        # dbo.lookup now reflects the fix above (same transaction, same
+        # session -- reads see our own uncommitted writes).
 
         if not args.skip_variant_metrics:
-            cur.execute(CHECK_SKUBRAND_UNIQUE_SQL)
-            dupe_skubrand = cur.fetchall()
-            if dupe_skubrand:
-                print(f"\n  dbo.variant_metrics backfill via dbo.lookup SKIPPED: {len(dupe_skubrand)} "
-                      f"sku_brand value(s) are still not unique in dbo.lookup for {BRAND} even after the "
-                      f"fix above -- investigate before backfilling from an ambiguous join. (Pass 2a above "
-                      f"already ran regardless.)")
-            else:
-                cur.execute(UPDATE_VARIANT_METRICS_SQL)
-                print(f"  dbo.variant_metrics: backfilled sku_shopify/barcode for {cur.rowcount} more "
-                      f"row(s) via dbo.lookup sku_brand match.")
+            cur.execute(UPDATE_VARIANT_METRICS_SQL)
+            print(f"  dbo.variant_metrics: filled sku_shopify/barcode on {cur.rowcount} row(s) via sku_brand match.")
 
         if not args.skip_style_tables:
-            cur.execute(BUILD_HANDLE_AGG_SQL)
             for table in ("style_info", "style_metrics"):
                 cur.execute(update_style_table_sql(table))
-                print(f"  dbo.{table}: backfilled unambiguous style_id/style_name/style_name_grouping "
-                      f"for {cur.rowcount} row(s) by matching handle.")
+                print(f"  dbo.{table}: filled style_id/style_name/style_name_grouping on {cur.rowcount} row(s) via product_name match.")
 
         conn.commit()
         print(f"\nDone. Committed at {datetime.now().isoformat()}.")
