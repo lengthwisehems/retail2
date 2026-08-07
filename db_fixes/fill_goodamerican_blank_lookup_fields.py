@@ -26,11 +26,15 @@ STEP 1 -- dbo.lookup
 
 STEP 2 -- dbo.style_info and dbo.style_metrics
     For each row still missing style_id, style_name, or style_name_grouping,
-    fill it from dbo.lookup by matching brand + product_name. Where more
-    than one dbo.lookup row shares that product_name (expected, given
+    fill it from dbo.lookup by matching brand + handle (handle, not
+    product_name -- handle is the normalized URL slug, so it isn't thrown
+    off by whitespace/typo/accent differences between how the same product's
+    name got typed into different tables, e.g. "GOOD BOY BERMUDA SHORTS" vs.
+    "GOOD BOY BERMURDA SHORTS" both resolve to the one real handle). Where
+    more than one dbo.lookup row shares that handle (expected, given
     dbo.lookup intentionally keeps old and new rows), any one populated,
-    non-NULL value found for that product_name is used -- MAX() ignores
-    NULLs, so it naturally picks the first real value it finds.
+    non-NULL value found for that handle is used -- MAX() ignores NULLs, so
+    it naturally picks the first real value it finds.
 
 STEP 3 -- dbo.variant_metrics
     For each row still missing sku_shopify or barcode, fill it from
@@ -46,6 +50,15 @@ currently has a blank field, and the value to fill each blank field with:
 
 Default: db_fixes/data/goodamerican_lookup_fill_values.csv (checked into this
 repo, derived from the "GA skus that need numbers" worksheet).
+
+Some rows in that worksheet have "REMOVE FROM ALL TABLES" in every fill
+column instead of a real value -- that's a human instruction about that
+specific lookup_id/sku_brand, not a fill value, and this script does NOT
+write that literal text into the database. It excludes those rows from the
+fill entirely and prints the excluded lookup_id/sku_brand list every run so
+they stay visible. This script does not delete anything, so removal of
+those rows (if that's what's wanted) is a separate, deliberate action --
+not something to infer and act on automatically.
 
 USAGE
 -----
@@ -203,21 +216,25 @@ JOIN #ga_fill_staging s ON s.lookup_id = l.lookup_id
 WHERE l.brand = '{BRAND}';
 """
 
-# --- Step 2: style_info / style_metrics, matched on product_name ----------
+# --- Step 2: style_info / style_metrics, matched on handle -----------------
+# handle (the URL slug) rather than product_name: product_name is free text
+# and varies between tables for the same product (whitespace, typos, accented
+# characters), while handle is the normalized identifier that's consistent
+# everywhere it's captured.
 
 def preview_style_table_sql(table):
     return f"""
     SELECT COUNT(*)
     FROM dbo.{table} t
     JOIN (
-        SELECT product_name,
+        SELECT handle,
                MAX(style_id) AS style_id,
                MAX(style_name) AS style_name,
                MAX(style_name_grouping) AS style_name_grouping
         FROM dbo.lookup
-        WHERE brand = '{BRAND}' AND product_name IS NOT NULL
-        GROUP BY product_name
-    ) agg ON agg.product_name = t.product_name
+        WHERE brand = '{BRAND}' AND handle IS NOT NULL
+        GROUP BY handle
+    ) agg ON agg.handle = t.handle
     WHERE t.brand = '{BRAND}'
       AND (t.style_id IS NULL OR t.style_name IS NULL OR t.style_name_grouping IS NULL)
       AND (agg.style_id IS NOT NULL OR agg.style_name IS NOT NULL OR agg.style_name_grouping IS NOT NULL)
@@ -231,14 +248,14 @@ def update_style_table_sql(table):
         style_name_grouping = COALESCE(t.style_name_grouping, agg.style_name_grouping)
     FROM dbo.{table} t
     JOIN (
-        SELECT product_name,
+        SELECT handle,
                MAX(style_id) AS style_id,
                MAX(style_name) AS style_name,
                MAX(style_name_grouping) AS style_name_grouping
         FROM dbo.lookup
-        WHERE brand = '{BRAND}' AND product_name IS NOT NULL
-        GROUP BY product_name
-    ) agg ON agg.product_name = t.product_name
+        WHERE brand = '{BRAND}' AND handle IS NOT NULL
+        GROUP BY handle
+    ) agg ON agg.handle = t.handle
     WHERE t.brand = '{BRAND}';
     """
 
@@ -327,13 +344,35 @@ def load_rows(path):
             if r.get(k) in (None, "", "nan"):
                 raise ValueError(f"lookup_id {r['lookup_id']}: missing required fill value for {k}")
 
+    # "REMOVE FROM ALL TABLES" in the fill columns is a human instruction
+    # about that lookup_id, not a value to write -- pull those rows out
+    # entirely rather than let the literal text get written into the
+    # database. Deletion is a separate, deliberate decision this script
+    # does not make on its own.
+    REMOVE_MARKER = "REMOVE FROM ALL TABLES"
+    fill_cols = ("fill_style_id", "fill_style_name", "fill_style_name_grouping", "fill_sku_shopify", "fill_barcode")
+    marked = [r for r in rows if any(r.get(k) == REMOVE_MARKER for k in fill_cols)]
+    rows = [r for r in rows if r not in marked]
+
     seen = set()
     for r in rows:
         if r["lookup_id"] in seen:
             raise ValueError(f"duplicate lookup_id {r['lookup_id']} in input file")
         seen.add(r["lookup_id"])
 
-    return rows
+    dupe_targets = {}
+    for r in rows:
+        dupe_targets.setdefault(r["fill_sku_shopify"], []).append(r["lookup_id"])
+    intra_batch_dupes = {v: ids for v, ids in dupe_targets.items() if len(ids) > 1}
+    if intra_batch_dupes:
+        raise ValueError(
+            f"{len(intra_batch_dupes)} fill_sku_shopify value(s) are targeted by more than one "
+            f"lookup_id within the input file itself -- that would violate dbo.lookup's unique "
+            f"index no matter what dbo.lookup currently contains. Examples: "
+            f"{dict(list(intra_batch_dupes.items())[:5])}. Fix the input file before re-running."
+        )
+
+    return rows, marked
 
 
 def connect():
@@ -370,8 +409,16 @@ def main():
 
     print("DRY RUN (preview only, no changes will be made)" if DRY_RUN else "EXECUTE (changes WILL be written to the database)")
     print(f"Loading fill data from {args.input} ...")
-    rows = load_rows(args.input)
-    print(f"  {len(rows)} lookup_id rows loaded.")
+    rows, marked_for_removal = load_rows(args.input)
+    print(f"  {len(rows)} lookup_id rows loaded and will be filled in.")
+    if marked_for_removal:
+        print(f"  {len(marked_for_removal)} row(s) say \"REMOVE FROM ALL TABLES\" in the input file -- "
+              f"these are EXCLUDED from this run (nothing written, nothing deleted). "
+              f"(lookup_id, sku_brand):")
+        for r in marked_for_removal[:30]:
+            print(f"    ({r['lookup_id']}, {r['sku_brand']})")
+        if len(marked_for_removal) > 30:
+            print(f"    ... and {len(marked_for_removal) - 30} more")
 
     conn = connect()
     cur = conn.cursor()
