@@ -482,7 +482,7 @@ def main():
                     cur.execute(preview_style_table_sql(table))
                     (count,) = cur.fetchone()
                     print(f"\n=== dbo.{table} (estimate) ===")
-                    print(f"  rows with blank style_id/style_name/style_name_grouping fillable via product_name match: {count}")
+                    print(f"  rows with blank style_id/style_name/style_name_grouping fillable via handle match: {count}")
 
             print("\nDry run only -- no changes made. Re-run with --execute to apply.")
             conn.rollback()
@@ -505,7 +505,7 @@ def main():
         if not args.skip_style_tables:
             for table in ("style_info", "style_metrics"):
                 cur.execute(update_style_table_sql(table))
-                print(f"  dbo.{table}: filled style_id/style_name/style_name_grouping on {cur.rowcount} row(s) via product_name match.")
+                print(f"  dbo.{table}: filled style_id/style_name/style_name_grouping on {cur.rowcount} row(s) via handle match.")
 
         conn.commit()
         print(f"\nDone. Committed at {datetime.now().isoformat()}.")
