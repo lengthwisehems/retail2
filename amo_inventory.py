@@ -115,6 +115,9 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
 # Words stripped from the handle when deriving Color
 COLOR_STRIP_TOKENS = {"crop", "petite", "petites", "regular", "tall"}
 
+# Length descriptors split out into their own Variant Title segment
+LENGTH_TOKENS = ("Petite", "Regular", "Long", "Tall")
+
 # ---------------------------------------------------------------------------
 # Valid size values
 # ---------------------------------------------------------------------------
@@ -408,9 +411,30 @@ def clean_title(title: str) -> str:
 
 
 def product_title_for_product_field(title: str) -> str:
-    """Product field title: cleaned, with a standalone ' Boot ' -> ' Bootcut '."""
+    """Product field title: cleaned, with "Boot" -> "Bootcut"."""
     t = clean_title(title)
-    return re.sub(r"\s+", " ", t.replace(" Boot ", " Bootcut ")).strip()
+    t = re.sub(r"\bBoot\b", "Bootcut", t, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def derive_length_token(title: str, handle: str, color: str) -> str:
+    """Length descriptor in the title/handle that is not part of the color."""
+    color_words = {w.lower() for w in re.split(r"[\s\-]+", color or "") if w}
+    hay = f"{clean_title(title)} {handle.replace('-', ' ')}".lower()
+    for tok in LENGTH_TOKENS:
+        low = tok.lower()
+        if low in color_words:
+            continue
+        if re.search(rf"\b{low}\b", hay):
+            return tok
+    return ""
+
+
+def strip_length_token(text: str, token: str) -> str:
+    if not token:
+        return text
+    out = re.sub(rf"\b{re.escape(token)}\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def derive_color(handle: str, title: str) -> str:
@@ -1031,6 +1055,11 @@ def build_rows(session: requests.Session) -> List[List[str]]:
         color = derive_color(handle, title)
         style_src = derive_style_name_base(title)
 
+        # Variant Title splits any length descriptor out of the title and
+        # appends it as its own trailing segment.
+        length_token = derive_length_token(title, handle, color)
+        vt_title = strip_length_token(product_field, length_token)
+
         jean_style = derive_jean_style(title, desc, tags_str, leg_open)
         rise_label = derive_rise_label(title, desc, rise)
 
@@ -1086,7 +1115,8 @@ def build_rows(session: requests.Session) -> List[List[str]]:
             _set(row, "Tags",               tags_str)
             _set(row, "Vendor",             vendor)
             _set(row, "Description",        desc)
-            _set(row, "Variant Title",      f"{prod_full} {size}".strip())
+            _set(row, "Variant Title", " / ".join(
+                p for p in (vt_title, color_disp, size, length_token) if p))
             _set(row, "Color",              color)
             _set(row, "Size",               size)
             _set(row, "Rise",               rise)
