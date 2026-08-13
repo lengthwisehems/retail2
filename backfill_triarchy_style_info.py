@@ -85,6 +85,27 @@ STYLE_INFO_FIELDS: List[Tuple[str, str]] = [
 
 
 # ===========================================================================
+# Timestamped logging (Central time) - every line gets a [YYYY-MM-DD HH:MM:SS]
+# ===========================================================================
+def _resolve_log_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/Chicago")
+    except Exception:
+        from datetime import timezone, timedelta
+        return timezone(timedelta(hours=-6))
+
+
+_LOG_TZ = _resolve_log_tz()
+
+
+def log(msg: str = "") -> None:
+    stamp = datetime.now(_LOG_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    for part in str(msg).split("\n"):
+        print(f"[{stamp}] {part}")
+
+
+# ===========================================================================
 # Helpers
 # ===========================================================================
 def s(v) -> str:
@@ -166,13 +187,13 @@ def build_derived_rows(g, db_rows: List[Dict]) -> List[List[str]]:
 # Main
 # ===========================================================================
 def main() -> None:
-    print("=" * 66)
-    print("TRIARCHY STYLE_INFO BACKFILL")
-    print("DRY RUN - nothing will be written" if DRY_RUN else "LIVE RUN - applying changes")
-    print("=" * 66)
+    log("=" * 66)
+    log("TRIARCHY STYLE_INFO BACKFILL")
+    log("DRY RUN - nothing will be written" if DRY_RUN else "LIVE RUN - applying changes")
+    log("=" * 66)
 
     g = load_scraper(SCRAPER_PATH)
-    print(f"Loaded classification rules from: {SCRAPER_PATH}")
+    log(f"Loaded classification rules from: {SCRAPER_PATH}")
 
     if not SQL_USERNAME or not SQL_PASSWORD:
         sys.exit("ERROR: set SQL_USERNAME and SQL_PASSWORD (env vars) or fill "
@@ -194,7 +215,7 @@ def main() -> None:
         WHERE brand = %s
     """, (BRAND,))
     raw = cur.fetchall()
-    print(f"Read {len(raw)} {BRAND} rows from style_info.\n")
+    log(f"Read {len(raw)} {BRAND} rows from style_info.\n")
 
     db_rows = [{
         "pk":           r["style_info_id"],
@@ -261,32 +282,32 @@ def main() -> None:
             add("style_info", "style_info_id", pk, "style_name", db["style_name"], new_sn, True)
 
     # ---- preview ----------------------------------------------------------
-    print("-" * 66)
-    print("PLANNED CHANGES (rows affected, by field/table):")
+    log("-" * 66)
+    log("PLANNED CHANGES (rows affected, by field/table):")
     if counts:
         for k in sorted(counts):
-            print(f"   {k:<38} {counts[k]:>6}")
+            log(f"   {k:<38} {counts[k]:>6}")
     else:
-        print("   none - everything already matches the rules")
-    print(f"\nRows skipped (is_manual_override = 1): {skipped_locked}")
-    print(f"Existing values the rules can't confirm (left as-is): {len(unresolved)}")
+        log("   none - everything already matches the rules")
+    log(f"\nRows skipped (is_manual_override = 1): {skipped_locked}")
+    log(f"Existing values the rules can't confirm (left as-is): {len(unresolved)}")
     for prod, hdr, val in unresolved[:10]:
-        print(f"   {prod} :: {hdr} = '{val}'")
+        log(f"   {prod} :: {hdr} = '{val}'")
     if len(unresolved) > 10:
-        print(f"   ... and {len(unresolved) - 10} more")
-    print(f"\nstyle_info column writes queued: {len(plan)}")
+        log(f"   ... and {len(unresolved) - 10} more")
+    log(f"\nstyle_info column writes queued: {len(plan)}")
     if counts.get("color") or counts.get("style_name"):
-        print("On apply, color/style_name are also synced into lookup and "
+        log("On apply, color/style_name are also synced into lookup and "
               "style_metrics (one set-based UPDATE each).")
 
     if DRY_RUN:
-        print("\nDRY RUN complete - nothing written. Review the numbers, then set "
+        log("\nDRY RUN complete - nothing written. Review the numbers, then set "
               "DRY_RUN = False and run again to apply.")
         conn.close()
         return
 
     # ---- apply (single transaction; rolls back on any error) --------------
-    print("\nApplying...")
+    log("\nApplying...")
     applied = audit = prop = 0
     try:
         # 1) style_info row updates + audit log
@@ -308,18 +329,18 @@ def main() -> None:
         #    with one set-based UPDATE each (indexed join on brand+product_name).
         #    Only non-blank style_info values propagate, so a blank never
         #    overwrites an existing value.
-        print("Syncing color / style_name into lookup and style_metrics...")
+        log("Syncing color / style_name into lookup and style_metrics...")
         prop = _propagate_multi(cur)
 
         conn.commit()
     except Exception:
         conn.rollback()
         conn.close()
-        print("\nERROR during apply - transaction rolled back, database unchanged.")
+        log("\nERROR during apply - transaction rolled back, database unchanged.")
         raise
 
     conn.close()
-    print(f"Done. {applied} style_info writes applied, {audit} logged to "
+    log(f"Done. {applied} style_info writes applied, {audit} logged to "
           f"manual_overrides, {prop} lookup/style_metrics rows synced.")
 
 

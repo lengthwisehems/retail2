@@ -8,6 +8,8 @@ Export all denim_analytics rows for ONE brand to two files:
      you to review by eye.
 
 Both files land in the SAME folder as this script. Timestamp is Central time.
+Every log line is prefixed with a Central-time stamp like [2026-08-13 15:09:24];
+the big tables (style_metrics, variant_metrics) also log progress every 10%.
 
 CONFIGURE below: set BRAND, then flip each table True (pull it) / False (skip).
 
@@ -42,6 +44,9 @@ TABLES = {
     "dbo.image_url_history": False,   # flip True if you want image history too
 }
 
+# Tables that get 10%-increment progress logging (the big, slow ones).
+PROGRESS_TABLES = {"style_metrics", "variant_metrics"}
+
 WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
@@ -55,23 +60,34 @@ SQL_USERNAME = HARDCODED_USERNAME or os.environ.get("SQL_USERNAME", "")
 SQL_PASSWORD = HARDCODED_PASSWORD or os.environ.get("SQL_PASSWORD", "")
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+FETCH_CHUNK = 2000   # rows per fetchmany batch (for progress reporting)
 
 
 # ===========================================================================
-# Helpers
+# Central-time logging (every line is timestamped)
 # ===========================================================================
-def central_now() -> dt.datetime:
-    """Current time in US Central (CST/CDT). Falls back to a fixed -6:00
-    offset if the IANA tz database isn't installed (pip install tzdata)."""
+def _resolve_tz():
     try:
         from zoneinfo import ZoneInfo
-        return dt.datetime.now(ZoneInfo("America/Chicago"))
+        return ZoneInfo("America/Chicago"), False
     except Exception:
-        print("   (note: tzdata not found - using fixed UTC-6 for the timestamp; "
-              "pip install tzdata for exact Central time)")
-        return dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=6)
+        return dt.timezone(dt.timedelta(hours=-6)), True
 
 
+_TZ, _TZ_FALLBACK = _resolve_tz()
+
+
+def now_central() -> dt.datetime:
+    return dt.datetime.now(_TZ)
+
+
+def log(msg: str = "") -> None:
+    print(f"[{now_central().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+# ===========================================================================
+# Value serialization
+# ===========================================================================
 def json_safe(v):
     if v is None:
         return None
@@ -99,6 +115,55 @@ def table_short(name: str) -> str:
     return name.split(".")[-1].strip().strip("[]")
 
 
+class Decile:
+    """Emit a log line each time progress crosses the next 10% boundary."""
+    def __init__(self, total: int, label: str, enabled: bool):
+        self.total = total
+        self.label = label
+        self.enabled = enabled and total > 0
+        self.next = 10
+
+    def update(self, done: int) -> None:
+        if not self.enabled:
+            return
+        while self.next <= 100 and done >= self.total * self.next / 100:
+            log(f"   {self.label}: {self.next}% ({min(done, self.total)}/{self.total})")
+            self.next += 10
+
+
+# ===========================================================================
+# Fetch one table (chunked, with optional 10% progress)
+# ===========================================================================
+def fetch_table(cur, tbl: str, progress: bool):
+    top = f"TOP {int(MAX_ROWS_PER_TABLE)} " if MAX_ROWS_PER_TABLE else ""
+
+    total = None
+    if progress:
+        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = %s", (BRAND,))
+        total = cur.fetchone()[0]
+        if MAX_ROWS_PER_TABLE:
+            total = min(total, int(MAX_ROWS_PER_TABLE))
+        log(f"{tbl}: fetching {total} rows...")
+    else:
+        log(f"{tbl}: fetching...")
+
+    cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = %s ORDER BY 1", (BRAND,))
+    cols = [d[0] for d in cur.description]
+
+    if not progress:
+        rows = cur.fetchall()
+    else:
+        rows = []
+        dec = Decile(total or 0, f"{tbl} fetch", True)
+        while True:
+            chunk = cur.fetchmany(FETCH_CHUNK)
+            if not chunk:
+                break
+            rows.extend(chunk)
+            dec.update(len(rows))
+    return cols, rows
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -110,14 +175,18 @@ def main() -> None:
         sys.exit("ERROR: set SQL_USERNAME and SQL_PASSWORD (env vars) or fill "
                  "HARDCODED_USERNAME/PASSWORD near the top of this file.")
 
-    stamp = central_now().strftime("%Y-%m-%d_%H-%M-%S")
+    stamp = now_central().strftime("%Y-%m-%d_%H-%M-%S")
     base = f"{BRAND}_DB_Values_{stamp}"
-    print("=" * 64)
-    print(f"EXPORT {BRAND} DB VALUES  ({stamp} CST)")
-    print("Tables:", ", ".join(table_short(t) for t in selected))
-    print("=" * 64)
+    log("=" * 58)
+    log(f"EXPORT {BRAND} DB VALUES")
+    log("Tables: " + ", ".join(table_short(t) for t in selected))
+    if _TZ_FALLBACK:
+        log("(tzdata not found - timestamps use a fixed UTC-6; "
+            "pip install tzdata for exact Central time)")
+    log("=" * 58)
 
     import pymssql
+    log("Connecting to database...")
     conn = pymssql.connect(server=SQL_SERVER, user=SQL_USERNAME,
                            password=SQL_PASSWORD, database=SQL_DATABASE,
                            timeout=600, login_timeout=60)
@@ -126,17 +195,14 @@ def main() -> None:
     export: dict = {}
     for t in selected:
         tbl = table_short(t)
-        top = f"TOP {int(MAX_ROWS_PER_TABLE)} " if MAX_ROWS_PER_TABLE else ""
+        progress = tbl.lower() in {p.lower() for p in PROGRESS_TABLES}
         try:
-            cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = %s "
-                        f"ORDER BY 1", (BRAND,))
+            cols, rows = fetch_table(cur, tbl, progress)
         except Exception as exc:
-            print(f"   {tbl:<20} SKIPPED - query failed: {exc}")
+            log(f"{tbl}: SKIPPED - query failed: {exc}")
             continue
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
         export[tbl] = {"columns": cols, "row_count": len(rows), "rows": rows}
-        print(f"   {tbl:<20} {len(rows):>7} rows, {len(cols)} columns")
+        log(f"{tbl}: done - {len(rows)} rows, {len(cols)} columns")
 
     conn.close()
 
@@ -144,8 +210,8 @@ def main() -> None:
         sys.exit("No data pulled - nothing written.")
 
     # ---- 1) Claude-readable JSON ------------------------------------------
-    json_path = SCRIPT_DIR / f"{base}.json"
     if WRITE_JSON:
+        log("Writing Claude JSON...")
         payload = {
             "brand": BRAND,
             "generated_at_central": stamp,
@@ -159,9 +225,10 @@ def main() -> None:
                 for tbl, d in export.items()
             },
         }
+        json_path = SCRIPT_DIR / f"{base}.json"
         with json_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=1)
-        print(f"\nClaude JSON : {json_path}")
+        log(f"Claude JSON written: {json_path}")
 
     # ---- 2) Excel review workbook -----------------------------------------
     if WRITE_XLSX:
@@ -169,26 +236,31 @@ def main() -> None:
             from openpyxl import Workbook
             from openpyxl.utils import get_column_letter
         except ImportError:
-            print("\n(xlsx skipped - run 'pip install openpyxl' to enable the "
-                  "Excel file; the JSON was still written.)")
+            log("Excel skipped - run 'pip install openpyxl' to enable it "
+                "(the JSON was still written).")
         else:
+            log("Writing Excel workbook...")
             wb = Workbook()
             wb.remove(wb.active)
             for tbl, d in export.items():
                 ws = wb.create_sheet(title=tbl[:31])
                 ws.append(d["columns"])
-                for row in d["rows"]:
+                progress = tbl.lower() in {p.lower() for p in PROGRESS_TABLES}
+                dec = Decile(d["row_count"], f"{tbl} xlsx", progress)
+                for i, row in enumerate(d["rows"], start=1):
                     ws.append([xlsx_safe(v) for v in row])
-                # freeze header + reasonable column widths
+                    dec.update(i)
                 ws.freeze_panes = "A2"
                 for i, cname in enumerate(d["columns"], start=1):
                     ws.column_dimensions[get_column_letter(i)].width = \
                         min(max(len(str(cname)) + 2, 12), 60)
+                log(f"{tbl}: sheet written ({d['row_count']} rows)")
             xlsx_path = SCRIPT_DIR / f"{base}.xlsx"
+            log("Saving Excel file (this can take a moment for large tables)...")
             wb.save(xlsx_path)
-            print(f"Excel file  : {xlsx_path}")
+            log(f"Excel file written: {xlsx_path}")
 
-    print("\nDone.")
+    log("Done.")
 
 
 if __name__ == "__main__":

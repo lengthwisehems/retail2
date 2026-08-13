@@ -135,6 +135,27 @@ GROUPING_TABLES = STYLE_NAME_TABLES  # style_name_grouping lives here too
 
 
 # ===========================================================================
+# Timestamped logging (Central time) - every line gets a [YYYY-MM-DD HH:MM:SS]
+# ===========================================================================
+def _resolve_log_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/Chicago")
+    except Exception:
+        from datetime import timezone, timedelta
+        return timezone(timedelta(hours=-6))
+
+
+_LOG_TZ = _resolve_log_tz()
+
+
+def log(msg: str = "") -> None:
+    stamp = datetime.now(_LOG_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    for part in str(msg).split("\n"):
+        print(f"[{stamp}] {part}")
+
+
+# ===========================================================================
 # Helpers
 # ===========================================================================
 def s(v) -> str:
@@ -240,13 +261,13 @@ def build_derived_rows(g, db_rows: List[Dict]) -> List[List[str]]:
 # Main
 # ===========================================================================
 def main() -> None:
-    print("=" * 66)
-    print("RAMYBROOK STYLE_INFO BACKFILL")
-    print("DRY RUN - nothing will be written" if DRY_RUN else "LIVE RUN - applying changes")
-    print("=" * 66)
+    log("=" * 66)
+    log("RAMYBROOK STYLE_INFO BACKFILL")
+    log("DRY RUN - nothing will be written" if DRY_RUN else "LIVE RUN - applying changes")
+    log("=" * 66)
 
     g = load_scraper(SCRAPER_PATH)
-    print(f"Loaded classification rules from: {SCRAPER_PATH}")
+    log(f"Loaded classification rules from: {SCRAPER_PATH}")
 
     if not SQL_USERNAME or not SQL_PASSWORD:
         sys.exit("ERROR: set SQL_USERNAME and SQL_PASSWORD (env vars) or fill "
@@ -270,7 +291,7 @@ def main() -> None:
         WHERE brand = %s
     """, (BRAND,))
     raw = cur.fetchall()
-    print(f"Read {len(raw)} {BRAND} rows from style_info.\n")
+    log(f"Read {len(raw)} {BRAND} rows from style_info.\n")
 
     db_rows = [{
         "pk":                  r["style_info_id"],
@@ -424,44 +445,44 @@ def main() -> None:
     report_path = _write_duplicate_report(g, db_rows)
 
     # ---- preview ----------------------------------------------------------
-    print("-" * 66)
-    print("PLANNED CHANGES (rows affected, by field/table):")
+    log("-" * 66)
+    log("PLANNED CHANGES (rows affected, by field/table):")
     if counts:
         for k in sorted(counts):
-            print(f"   {k:<38} {counts[k]:>6}")
+            log(f"   {k:<38} {counts[k]:>6}")
     else:
-        print("   none - everything already matches the rules")
-    print(f"\nDouble-color product_names normalized: {len(pname_fixes)}")
+        log("   none - everything already matches the rules")
+    log(f"\nDouble-color product_names normalized: {len(pname_fixes)}")
     for old, new in pname_fixes[:15]:
-        print(f"   {old}  ->  {new}")
+        log(f"   {old}  ->  {new}")
     if len(pname_fixes) > 15:
-        print(f"   ... and {len(pname_fixes) - 15} more")
-    print(f"\nRows skipped (is_manual_override = 1): {skipped_locked}")
-    print(f"Existing values the rules can't confirm (left as-is): {len(unresolved)}")
+        log(f"   ... and {len(pname_fixes) - 15} more")
+    log(f"\nRows skipped (is_manual_override = 1): {skipped_locked}")
+    log(f"Existing values the rules can't confirm (left as-is): {len(unresolved)}")
     for prod, hdr, val in unresolved[:10]:
-        print(f"   {prod} :: {hdr} = '{val}'")
+        log(f"   {prod} :: {hdr} = '{val}'")
     if len(unresolved) > 10:
-        print(f"   ... and {len(unresolved) - 10} more")
+        log(f"   ... and {len(unresolved) - 10} more")
     if CONSOLIDATE_DUPLICATE_STYLE_INFO:
-        print(f"\nDuplicate style_info rows to DELETE (dimension only, history kept): {len(deletes)}")
+        log(f"\nDuplicate style_info rows to DELETE (dimension only, history kept): {len(deletes)}")
         for d in deletes[:15]:
-            print(f"   delete style_info_id={d['pk']} style_id={d['style_id']} "
+            log(f"   delete style_info_id={d['pk']} style_id={d['style_id']} "
                   f"'{d['product_name']}'  (kept id={d['survivor']} "
                   f"style_id={d['survivor_style_id']})")
         if len(deletes) > 15:
-            print(f"   ... and {len(deletes) - 15} more")
+            log(f"   ... and {len(deletes) - 15} more")
 
-    print(f"\nTotal individual column writes queued: {len(plan)}")
-    print(f"Duplicate review report: {report_path}")
+    log(f"\nTotal individual column writes queued: {len(plan)}")
+    log(f"Duplicate review report: {report_path}")
 
     if DRY_RUN:
-        print("\nDRY RUN complete - nothing written. Review the numbers and the "
+        log("\nDRY RUN complete - nothing written. Review the numbers and the "
               "report csv, then set DRY_RUN = False and run again to apply.")
         conn.close()
         return
 
     # ---- apply (single transaction; rolls back completely on any error) ---
-    print("\nApplying...")
+    log("\nApplying...")
     applied = audit = deleted = 0
     try:
         # 1) DELETE the consolidated duplicate style_info rows FIRST. style_info
@@ -484,8 +505,13 @@ def main() -> None:
                 deleted_pks.add(d["pk"])
                 deleted += 1
 
-        # 2) Apply the staged column writes.
-        for table, pkc, pk, field, old, new, is_si in plan:
+        # 2) Apply the staged column writes (log progress every 10%).
+        total_plan = len(plan)
+        next_mark = 10
+        for i, (table, pkc, pk, field, old, new, is_si) in enumerate(plan, start=1):
+            if total_plan and i >= total_plan * next_mark / 100:
+                log(f"   applying writes: {next_mark}% ({i}/{total_plan})")
+                next_mark += 10
             if is_si and pk in deleted_pks:
                 continue  # this row was just consolidated away
             # defensive guard: never violate the unique (brand, product_name)
@@ -496,7 +522,7 @@ def main() -> None:
                             "WHERE brand = %s AND product_name = %s "
                             "AND style_info_id <> %s", (BRAND, new, pk))
                 if (cur.fetchone() or {}).get("n", 0) > 0:
-                    print(f"   SKIP rename style_info_id={pk} -> '{new}' "
+                    log(f"   SKIP rename style_info_id={pk} -> '{new}' "
                           f"(name already exists; enable "
                           f"CONSOLIDATE_DUPLICATE_STYLE_INFO to merge)")
                     continue
@@ -517,11 +543,11 @@ def main() -> None:
     except Exception:
         conn.rollback()
         conn.close()
-        print("\nERROR during apply - transaction rolled back, database unchanged.")
+        log("\nERROR during apply - transaction rolled back, database unchanged.")
         raise
 
     conn.close()
-    print(f"Done. {applied} column writes applied. {audit} style_info changes "
+    log(f"Done. {applied} column writes applied. {audit} style_info changes "
           f"logged to manual_overrides." +
           (f" {deleted} duplicate style_info rows consolidated." if deleted else ""))
 
