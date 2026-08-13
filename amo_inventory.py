@@ -458,7 +458,12 @@ def derive_style_name_base(product_title: str) -> str:
             text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text,
                           flags=re.IGNORECASE)
     text = re.sub(r"\b\d+\b", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    # Numeric-only names (e.g. the "143") are emptied by the number strip.
+    # Fall back to the cleaned title so the one-word rule can still run.
+    if not text:
+        text = clean_title(product_title)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +483,8 @@ def _straight_bucket(leg_opening) -> str:
 def jean_style_from_title(title: str, desc: str, leg_opening) -> str:
     t = (title or "").lower()
     if text_has_any(t, ("barrel", "barrell", "bowed", "bow leg", "stovepipe",
-                        "stove-pipe", "curved straight", "horseshoe")):
+                        "stove-pipe", "curved straight", "horseshoe",
+                        "straight wide leg, with a subtle taper")):
         return "Barrel"
     if text_has_any(t, ("tapered", "relaxed skinny", "mom")):
         return "Tapered"
@@ -498,7 +504,9 @@ def jean_style_from_title(title: str, desc: str, leg_opening) -> str:
         return "Flare"
     if "skinny" in t:
         return "Skinny"
-    if text_has_any(t, ("wide leg", "wide-leg", "trouser")):
+    # "Trouser" deliberately excluded here: an Easy Army Trouser style is a
+    # straight pant, so the leg-opening rules must decide rather than the name.
+    if text_has_any(t, ("wide leg", "wide-leg")):
         return "Wide Leg"
     if "boyfriend" in t:
         return "Boyfriend"
@@ -514,7 +522,8 @@ def jean_style_from_title(title: str, desc: str, leg_opening) -> str:
 def jean_style_from_desc(desc: str, leg_opening) -> str:
     d = (desc or "").lower()
     if text_has_any(d, ("barrel", "barrell", "bowed", "bow leg", "stovepipe",
-                        "stove-pipe", "curved outseam", "horseshoe")):
+                        "stove-pipe", "curved outseam", "horseshoe",
+                        "straight wide leg, with a subtle taper")):
         return "Barrel"
     if "skinny" in d:
         return "Skinny"
