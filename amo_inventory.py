@@ -83,7 +83,7 @@ FILTER_WORDS: List[str] = [
 STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "1999", "5-Pocket", "Accent Hardware", "Ankle", "Beaded", "Bee's Knees",
     "Belted", "Braided", "Button", "Cargo", "Carpenter", "Chap", "Checkered",
-    "Chew", "Coated", "Constructed", "Contrast", "Corduroy", "Crochet",
+    "Chew", "Coated", "Constructed", "Contrast", "Cord", "Corduroy", "Crochet",
     "Crop", "Cropped", "Crushed", "Crystal", "Cuff", "Cuffed", "Cutoff",
     "Cut-Out", "Darted", "Destroyed", "Diamond Cut", "Distressed",
     "Double Flood", "Double Heel", "Double Prep", "Double Sneak", "Drawn",
