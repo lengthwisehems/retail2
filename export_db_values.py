@@ -51,6 +51,15 @@ WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
 
+# variant_metrics is huge because it keeps a row per daily capture. To shrink
+# the exports, collapse it to one row per unique variant: rows sharing the same
+# V_UNIQUE_KEY (brand + sku_shopify + sku_brand + barcode + variant_title + size)
+# are deduped down to the one with the OLDEST imported_at. The key itself is
+# NOT added to the output. Set False to export every variant_metrics row.
+DEDUPE_VARIANT_METRICS = True
+V_UNIQUE_KEY_COLS = ["brand", "sku_shopify", "sku_brand", "barcode",
+                     "variant_title", "size"]
+
 # Database connection --------------------------------------------------------
 SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
 SQL_DATABASE = os.environ.get("SQL_DATABASE", "denim_analytics")
@@ -113,6 +122,26 @@ def xlsx_safe(v):
 def table_short(name: str) -> str:
     """'dbo.style_info' -> 'style_info'."""
     return name.split(".")[-1].strip().strip("[]")
+
+
+def dedupe_oldest(cols, rows, key_cols, date_col):
+    """Collapse rows sharing the same key_cols concat down to the one with the
+    OLDEST value in date_col. Column order/values are otherwise untouched and
+    no key column is added to the output."""
+    lower = {c.lower(): i for i, c in enumerate(cols)}
+    kidx = [lower[c.lower()] for c in key_cols if c.lower() in lower]
+    didx = lower.get(date_col.lower())
+    best: dict = {}
+    for r in rows:
+        key = tuple("" if r[i] is None else str(r[i]).strip() for i in kidx)
+        cur = best.get(key)
+        if cur is None:
+            best[key] = r
+        elif didx is not None:
+            a, b = r[didx], cur[didx]
+            if a is not None and (b is None or a < b):   # keep the oldest
+                best[key] = r
+    return list(best.values())
 
 
 class Decile:
@@ -201,6 +230,11 @@ def main() -> None:
         except Exception as exc:
             log(f"{tbl}: SKIPPED - query failed: {exc}")
             continue
+        if DEDUPE_VARIANT_METRICS and tbl.lower() == "variant_metrics":
+            before = len(rows)
+            rows = dedupe_oldest(cols, rows, V_UNIQUE_KEY_COLS, "imported_at")
+            log(f"{tbl}: deduped {before} -> {len(rows)} rows "
+                f"(unique variant, oldest imported_at kept)")
         export[tbl] = {"columns": cols, "row_count": len(rows), "rows": rows}
         log(f"{tbl}: done - {len(rows)} rows, {len(cols)} columns")
 
