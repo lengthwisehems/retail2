@@ -129,26 +129,6 @@ def table_short(name: str) -> str:
     return name.split(".")[-1].strip().strip("[]")
 
 
-def dedupe_oldest(cols, rows, key_cols, date_col):
-    """Collapse rows sharing the same key_cols concat down to the one with the
-    OLDEST value in date_col. Column order/values are otherwise untouched and
-    no key column is added to the output."""
-    lower = {c.lower(): i for i, c in enumerate(cols)}
-    kidx = [lower[c.lower()] for c in key_cols if c.lower() in lower]
-    didx = lower.get(date_col.lower())
-    best: dict = {}
-    for r in rows:
-        key = tuple("" if r[i] is None else str(r[i]).strip() for i in kidx)
-        cur = best.get(key)
-        if cur is None:
-            best[key] = r
-        elif didx is not None:
-            a, b = r[didx], cur[didx]
-            if a is not None and (b is None or a < b):   # keep the oldest
-                best[key] = r
-    return list(best.values())
-
-
 class Decile:
     """Emit a log line each time progress crosses the next 10% boundary."""
     def __init__(self, total: int, label: str, enabled: bool):
@@ -170,6 +150,13 @@ class Decile:
 # ===========================================================================
 def fetch_table(cur, tbl: str, progress: bool):
     top = f"TOP {int(MAX_ROWS_PER_TABLE)} " if MAX_ROWS_PER_TABLE else ""
+
+    # Deduped tables are collapsed IN SQL (ROW_NUMBER per key, oldest
+    # captured_datetime) so only the survivors cross the wire - the full history
+    # never leaves the server, which avoids the huge-fetch timeout.
+    rule = DEDUPE_RULES.get(tbl.lower())
+    if rule:
+        return _fetch_deduped(cur, tbl, rule, top)
 
     total = None
     if progress:
@@ -195,6 +182,31 @@ def fetch_table(cur, tbl: str, progress: bool):
                 break
             rows.extend(chunk)
             dec.update(len(rows))
+    return cols, rows
+
+
+def _fetch_deduped(cur, tbl, rule, top):
+    """Server-side dedupe: keep one row per key with the oldest date column."""
+    key_cols, date_col = rule
+    # real column list, in order (so the output matches a plain SELECT *)
+    cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = 'dbo' "
+                "ORDER BY ORDINAL_POSITION", (tbl,))
+    allcols = [r[0] for r in cur.fetchall()]
+    pk = allcols[0]
+    collist = ", ".join(f"[{c}]" for c in allcols)
+    partition = ", ".join(f"[{c}]" for c in key_cols)
+    log(f"{tbl}: fetching (deduped in SQL on {len(key_cols)}-col key, "
+        f"oldest {date_col})...")
+    cur.execute(
+        f"WITH ranked AS ("
+        f"  SELECT {collist}, ROW_NUMBER() OVER ("
+        f"    PARTITION BY {partition} "
+        f"    ORDER BY [{date_col}] ASC, [{pk}] ASC) AS _rn "
+        f"  FROM [dbo].[{tbl}] WHERE [brand] = %s) "
+        f"SELECT {top}{collist} FROM ranked WHERE _rn = 1", (BRAND,))
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     return cols, rows
 
 
@@ -235,12 +247,6 @@ def main() -> None:
         except Exception as exc:
             log(f"{tbl}: SKIPPED - query failed: {exc}")
             continue
-        if tbl.lower() in DEDUPE_RULES:
-            key_cols, date_col = DEDUPE_RULES[tbl.lower()]
-            before = len(rows)
-            rows = dedupe_oldest(cols, rows, key_cols, date_col)
-            log(f"{tbl}: deduped {before} -> {len(rows)} rows "
-                f"(unique key, oldest {date_col} kept)")
         export[tbl] = {"columns": cols, "row_count": len(rows), "rows": rows}
         log(f"{tbl}: done - {len(rows)} rows, {len(cols)} columns")
 
