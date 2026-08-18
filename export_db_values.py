@@ -48,8 +48,12 @@ WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
 
-# Tables that get 10%-progress logging (the big ones). Others just log start/end.
-PROGRESS_TABLES = {"variant_metrics", "style_metrics", "image_url_history"}
+# Tables that get 10%-progress logging while they download, e.g.
+# {"variant_metrics"}. Empty = every table just logs start and end, and is
+# pulled in one plain fetch. Progress logging costs an extra SELECT COUNT(*)
+# per table and downloads in chunks, so leave this empty unless you want the
+# percentages; it does not change what ends up in either file.
+PROGRESS_TABLES: set = set()
 
 # --- JSON de-duplication ---------------------------------------------------
 # This is Excel's Data > Remove Duplicates, applied to the JSON file only.
@@ -221,12 +225,20 @@ def fetch_table(cur, tbl: str, progress: bool):
 
     total = None
     if progress:
-        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = %s", (BRAND,))
-        total = cur.fetchone()[0]
-        if MAX_ROWS_PER_TABLE:
-            total = min(total, int(MAX_ROWS_PER_TABLE))
-        log(f"{tbl}: fetching {total} rows...")
-    else:
+        # Only used to turn row counts into percentages. If it fails (a big
+        # table can time out on COUNT alone) fall back to a plain fetch - a
+        # progress nicety must never cost us the table itself.
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = %s", (BRAND,))
+            total = cur.fetchone()[0]
+            if MAX_ROWS_PER_TABLE:
+                total = min(total, int(MAX_ROWS_PER_TABLE))
+            log(f"{tbl}: fetching {total} rows...")
+        except Exception as exc:
+            log(f"{tbl}: row-count for progress failed ({exc}); "
+                "fetching without progress...")
+            progress = False
+    if not progress:
         log(f"{tbl}: fetching...")
 
     cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = %s ORDER BY 1", (BRAND,))
@@ -275,13 +287,18 @@ def main() -> None:
     cur = conn.cursor()
 
     export: dict = {}
+    failed: dict = {}
     for t in selected:
         tbl = table_short(t)
         progress = tbl.lower() in {p.lower() for p in PROGRESS_TABLES}
         try:
             cols, rows = fetch_table(cur, tbl, progress)
         except Exception as exc:
-            log(f"{tbl}: SKIPPED - query failed: {exc}")
+            log("*" * 58)
+            log(f"*** {tbl}: SKIPPED - query failed: {exc}")
+            log(f"*** {tbl} will be MISSING from both output files.")
+            log("*" * 58)
+            failed[tbl] = str(exc)
             continue
         export[tbl] = {"columns": cols, "row_count": len(rows), "rows": rows}
         log(f"{tbl}: done - {len(rows)} rows, {len(cols)} columns")
@@ -314,6 +331,8 @@ def main() -> None:
             "database": SQL_DATABASE,
             "tables": tables_out,
         }
+        if failed:
+            payload["tables_that_failed"] = failed
         json_path = SCRIPT_DIR / f"{base}.json"
         with json_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=1)
@@ -349,6 +368,14 @@ def main() -> None:
             wb.save(xlsx_path)
             log(f"Excel file written: {xlsx_path}")
 
+    log("Tables exported: " + ", ".join(f"{t} ({d['row_count']} rows)"
+                                        for t, d in export.items()))
+    if failed:
+        log("!" * 58)
+        log("!!! TABLES MISSING FROM BOTH FILES: " + ", ".join(failed))
+        for t, exc in failed.items():
+            log(f"!!!   {t}: {exc}")
+        log("!" * 58)
     log("Done.")
 
 
