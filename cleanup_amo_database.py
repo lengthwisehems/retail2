@@ -338,7 +338,7 @@ def main() -> None:
     si_handles = {s(d.get("handle")).lower() for d in tabs["style_info"]}
     missing_handles = sorted(
         {s(d.get("handle")).lower() for d in tabs["lookup"]
-         if s(d.get("ACTION")).lower() != "remove"} - si_handles)
+         if s(d.get("ACTION")).lower() != "remove" and s(d.get("handle"))} - si_handles)
     missing = {h: output_idx[h] for h in missing_handles if h in output_idx}
     no_data = [h for h in missing_handles if h not in output_idx]
     log(f"Missing styles: {len(missing_handles)} "
@@ -346,6 +346,9 @@ def main() -> None:
     if no_data:
         log("   NO OUTPUT DATA for: " + ", ".join(no_data[:15]))
 
+    # The derivation map always includes the missing styles so that lookup /
+    # style_metrics "Use amo_inventory.py" cells for those handles resolve, even
+    # when DO_INSERT_MISSING is off (their rows are still corrected in place).
     deriver = Deriver(g, tabs["style_info"], missing, tabs["lookup"])
     log(f"Derivation map: {len(deriver.by_handle)} handles")
 
@@ -362,26 +365,33 @@ def main() -> None:
             if ups:
                 plan_updates[sheet].append((key, ups))
 
-    # --- plan inserts ------------------------------------------------------
-    inserts = plan_inserts(tabs["lookup"], missing, deriver, output_idx)
+    # --- plan inserts (only when enabled) ----------------------------------
+    inserts = (plan_inserts(tabs["lookup"], missing, deriver, output_idx)
+               if DO_INSERT_MISSING else {"style_info": [], "style_metrics": []})
 
     # --- preview -----------------------------------------------------------
     log("-" * 60)
-    log(f"Phase 1 INSERT: style_info +{len(inserts['style_info'])}, "
-        f"style_metrics +{len(inserts['style_metrics'])}")
+    if DO_INSERT_MISSING:
+        log(f"Phase 1 INSERT: style_info +{len(inserts['style_info'])}, "
+            f"style_metrics +{len(inserts['style_metrics'])}")
+    else:
+        log("Phase 1 INSERT: skipped (DO_INSERT_MISSING = False)")
     for sheet in tabs:
         nf = sum(len(u) for _, u in plan_updates[sheet])
         log(f"Phase 2 {sheet:16} remove={len(plan_removes[sheet]):>5} "
-            f"update_rows={len(plan_updates[sheet]):>5} field_writes={nf}")
-    log("Phase 3 dedupe: lookup + style_info (keep corrected) — runs on live DB")
+            f"update_rows={len(plan_updates[sheet]):>5} field_writes={nf}"
+            + ("" if DO_CORRECTIONS else "  (DO_CORRECTIONS = False)"))
+    log("Phase 3 dedupe: lookup + style_info (keep corrected) — runs on live DB"
+        + ("" if DO_DEDUPE else "  (DO_DEDUPE = False)"))
 
     if DRY_RUN:
-        log("Sample inserted style_info rows for missing styles "
-            "(style_name | jean_style | rise_label | inseam_label | inseam_style):")
-        for r in inserts["style_info"][:12]:
-            log(f"   {r['handle']:34} {r.get('style_name',''):22} | "
-                f"{r.get('jean_style',''):24} | {r.get('rise_label',''):5} | "
-                f"{r.get('inseam_label',''):8} | {r.get('inseam_style','')}")
+        if DO_INSERT_MISSING and inserts["style_info"]:
+            log("Sample inserted style_info rows for missing styles "
+                "(style_name | jean_style | rise_label | inseam_label | inseam_style):")
+            for r in inserts["style_info"][:12]:
+                log(f"   {r['handle']:34} {r.get('style_name',''):22} | "
+                    f"{r.get('jean_style',''):24} | {r.get('rise_label',''):5} | "
+                    f"{r.get('inseam_label',''):8} | {r.get('inseam_style','')}")
         log("DRY RUN complete — nothing written.")
         return
 
