@@ -51,14 +51,19 @@ WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
 
-# variant_metrics is huge because it keeps a row per daily capture. To shrink
-# the exports, collapse it to one row per unique variant: rows sharing the same
-# V_UNIQUE_KEY (brand + sku_shopify + sku_brand + barcode + variant_title + size)
-# are deduped down to the one with the OLDEST imported_at. The key itself is
-# NOT added to the output. Set False to export every variant_metrics row.
-DEDUPE_VARIANT_METRICS = True
-V_UNIQUE_KEY_COLS = ["brand", "sku_shopify", "sku_brand", "barcode",
-                     "variant_title", "size"]
+# The metrics tables keep a row per daily capture, which makes the exports too
+# large to share. Collapse each to one row per unique record: rows sharing the
+# same key are deduped down to the one with the OLDEST captured_datetime. The
+# key itself is NOT added to the output, and no other column changes.
+# Set DEDUPE_RULES = {} to export every row.
+#   variant_metrics -> V_UNIQUE_KEY
+#   style_metrics   -> S_UNIQUE_KEY
+DEDUPE_RULES = {
+    "variant_metrics": (["brand", "sku_shopify", "sku_brand", "barcode",
+                         "variant_title", "size"], "captured_datetime"),
+    "style_metrics":   (["brand", "style_id", "product_name", "handle", "color",
+                         "style_name", "inseam", "inseam_label"], "captured_datetime"),
+}
 
 # Database connection --------------------------------------------------------
 SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
@@ -230,11 +235,12 @@ def main() -> None:
         except Exception as exc:
             log(f"{tbl}: SKIPPED - query failed: {exc}")
             continue
-        if DEDUPE_VARIANT_METRICS and tbl.lower() == "variant_metrics":
+        if tbl.lower() in DEDUPE_RULES:
+            key_cols, date_col = DEDUPE_RULES[tbl.lower()]
             before = len(rows)
-            rows = dedupe_oldest(cols, rows, V_UNIQUE_KEY_COLS, "imported_at")
+            rows = dedupe_oldest(cols, rows, key_cols, date_col)
             log(f"{tbl}: deduped {before} -> {len(rows)} rows "
-                f"(unique variant, oldest imported_at kept)")
+                f"(unique key, oldest {date_col} kept)")
         export[tbl] = {"columns": cols, "row_count": len(rows), "rows": rows}
         log(f"{tbl}: done - {len(rows)} rows, {len(cols)} columns")
 
