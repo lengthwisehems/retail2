@@ -22,7 +22,17 @@ Inputs
 ------
   CORR_WORKBOOK   per-table tabs with current cols + NEW cols + ACTION
   SCRAPER_PATH    amo_inventory.py @ commit 9ca26a5c
-  AMO_OUTPUT_DIR  folder of AMO_YYYYMMDD_HHMMSS.csv scraper outputs (blob)
+  AMO_OUTPUT_DIR  folder of AMO_YYYYMMDD_HHMMSS.csv scraper outputs (the blob).
+                  What must be in it: at least one output file that contains a
+                  row (Description + measurements) for EVERY style being inserted
+                  in Phase 1 (the styles present in lookup but missing from
+                  style_info). It is NOT a random sample. Simplest safe choice:
+                  drop in ALL your AMO output files - the script keeps the most
+                  recent, richest row per handle, so extra/older files never
+                  hurt. The dry run prints "Missing styles: N (with output data
+                  X, no data Y)"; if Y > 0, add the output file(s) that still
+                  listed those handles (usually the scrape just before they went
+                  inactive) and re-run until no-data = 0.
 
 SAFETY: DRY_RUN=True prints the full plan and writes nothing. Apply runs in one
 transaction, rolls back on any error. Every log line is Central-time stamped.
@@ -50,9 +60,9 @@ DO_DEDUPE         = True
 
 BRAND = "AMO"
 
-CORR_WORKBOOK  = r"AMO_DB_Values_20260813_151403_Claude.xlsx"
+CORR_WORKBOOK  = r"AMO_DB_Values_2026-08-13_15-14-03_Claude.xlsx"
 SCRAPER_PATH   = r"amo_inventory.py"
-AMO_OUTPUT_DIR = r"AMO_Output"
+AMO_OUTPUT_DIR = r"AMO_Output"   # see header: must cover every missing style
 
 SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
 SQL_DATABASE = os.environ.get("SQL_DATABASE", "denim_analytics")
@@ -190,13 +200,42 @@ def _title_of(product_name: str, color: str) -> str:
     return product_name
 
 
+def strip_color(text: str, color: str) -> str:
+    """STEP 2.5: remove the Color words from the (styling-stripped) title.
+    The DB product_name sometimes embeds the color, but the scraper derives the
+    Style Name from the title *before* color is appended - so a DB-only cleanup
+    must strip it. Guarded so it never empties the name."""
+    if not color:
+        return text
+    out = text
+    for tok in re.split(r"[\s\-/]+", color):
+        if len(tok) >= 2:
+            out = re.sub(rf"\b{re.escape(tok)}\b", " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out or text
+
+
 class Deriver:
     """Runs amo_inventory.py derivation + post-processing over the union of the
-    corrected style_info rows and the missing styles. Answers by handle."""
+    corrected style_info rows and the missing styles. Answers by handle.
 
-    def __init__(self, g, si_rows: List[dict], missing: Dict[str, dict]):
+    Missing styles take their title/color from the corrected lookup identity
+    (reliable "Style / Color") and their description/measurements from the AMO
+    output row; existing style_info rows use their own corrected fields. Every
+    title has the color stripped (STEP 2.5) before the styling-word removal
+    result is fed into the sibling/one-word rules."""
+
+    def __init__(self, g, si_rows: List[dict], missing: Dict[str, dict],
+                 lookup_rows: List[dict]):
         self.g = g
         self.by_handle: Dict[str, dict] = {}
+        # representative corrected (product_name, color) per handle from lookup
+        self.lk_rep: Dict[str, Tuple[str, str]] = {}
+        for d in lookup_rows:
+            if s(d.get("ACTION")).lower() == "remove":
+                continue
+            h = s(d.get("handle")).lower()
+            self.lk_rep.setdefault(h, (corr_val(d, "product_name"), corr_val(d, "color")))
         self._build(si_rows, missing)
 
     def _build(self, si_rows, missing):
@@ -204,7 +243,8 @@ class Deriver:
         WH = g.WORK_HEADERS
         work, handles = [], []
 
-        def add(title, desc, tags, handle, rise, inseam, leg):
+        def add(pn, color, desc, tags, handle, rise, inseam, leg):
+            title = strip_color(_title_of(pn, color), color)   # STEP 1, 2.5
             ss = g.derive_style_name_base(title)
             js = g.derive_jean_style(title, desc, tags, leg)
             rl = g.derive_rise_label(title, desc, rise)
@@ -222,17 +262,16 @@ class Deriver:
         for d in si_rows:
             if s(d.get("ACTION")).lower() == "remove":
                 continue
-            pn = corr_val(d, "product_name")
-            color = corr_val(d, "color")
-            add(_title_of(pn, color), s(d.get("description")), s(d.get("tags")),
-                s(d.get("handle")), s(d.get("rise")), s(d.get("inseam")),
-                s(d.get("leg_opening")))
+            add(corr_val(d, "product_name"), corr_val(d, "color"),
+                s(d.get("description")), s(d.get("tags")), s(d.get("handle")),
+                s(d.get("rise")), s(d.get("inseam")), s(d.get("leg_opening")))
         for h, r in missing.items():
-            prod = (r.get("Product") or "")
-            base = prod.split(" / ")[0] if " / " in prod else prod
-            add(g.product_title_for_product_field(base),
-                (r.get("Description") or "").strip(), (r.get("Tags") or "").strip(),
-                h, (r.get("Rise") or "").strip(), (r.get("Inseam") or "").strip(),
+            # title/color from the corrected lookup identity (reliable
+            # "Style / Color"); description/measurements from the output row.
+            pn, color = self.lk_rep.get(h, ((r.get("Product") or ""), (r.get("Color") or "")))
+            add(pn, color, (r.get("Description") or "").strip(),
+                (r.get("Tags") or "").strip(), h,
+                (r.get("Rise") or "").strip(), (r.get("Inseam") or "").strip(),
                 (r.get("Leg Opening") or "").strip())
 
         g.apply_jean_style_sibling_inference(work)
@@ -307,7 +346,7 @@ def main() -> None:
     if no_data:
         log("   NO OUTPUT DATA for: " + ", ".join(no_data[:15]))
 
-    deriver = Deriver(g, tabs["style_info"], missing)
+    deriver = Deriver(g, tabs["style_info"], missing, tabs["lookup"])
     log(f"Derivation map: {len(deriver.by_handle)} handles")
 
     # --- plan corrections --------------------------------------------------
@@ -315,8 +354,7 @@ def main() -> None:
     plan_removes: Dict[str, List[object]] = {t: [] for t in tabs}
     for sheet, rows in tabs.items():
         for row in rows:
-            key = (s(row.get("sku_shopify")) if sheet == "variant_metrics"
-                   else row.get(PK[sheet]))
+            key = row.get(PK[sheet])
             if s(row.get("ACTION")).lower() == "remove":
                 plan_removes[sheet].append(key)
                 continue
@@ -338,9 +376,12 @@ def main() -> None:
     log("Phase 3 dedupe: lookup + style_info (keep corrected) — runs on live DB")
 
     if DRY_RUN:
-        log("Sample derived style_names for missing styles:")
-        for h in list(missing)[:8]:
-            log(f"   {h:34} -> {deriver.get('style_name', h)!r}")
+        log("Sample inserted style_info rows for missing styles "
+            "(style_name | jean_style | rise_label | inseam_label | inseam_style):")
+        for r in inserts["style_info"][:12]:
+            log(f"   {r['handle']:34} {r.get('style_name',''):22} | "
+                f"{r.get('jean_style',''):24} | {r.get('rise_label',''):5} | "
+                f"{r.get('inseam_label',''):8} | {r.get('inseam_style','')}")
         log("DRY RUN complete — nothing written.")
         return
 
@@ -390,8 +431,14 @@ def plan_inserts(lookup_rows, missing, deriver, output_idx) -> Dict[str, List[di
     for (h, color), lk in colorways.items():
         out = missing[h]
         der = deriver.by_handle.get(h, {})
-        now = dt.datetime.now(_TZ).replace(tzinfo=None)
         cap_date = _out_date(out)
+        # style_name: prefer the curated lookup value (a literal NEW style_name
+        # overrides the scraper's sibling-rule result, e.g. billie -> "Billie
+        # Straight"); fall back to the derived value when lookup says
+        # "Use amo_inventory.py" or is blank.
+        _nv_sn = lk.get("NEW style_name")
+        style_name = (der.get("style_name", "")
+                      if (is_use_scraper(_nv_sn) or is_blank(_nv_sn)) else s(_nv_sn))
         base = {
             "brand": BRAND,
             "style_id": corr_val(lk, "style_id") or s(out.get("Style Id")),
@@ -399,7 +446,7 @@ def plan_inserts(lookup_rows, missing, deriver, output_idx) -> Dict[str, List[di
             "handle": s(lk.get("handle")),
             "sku_url": s(lk.get("sku_url")) or s(out.get("SKU URL")),
             "color": color,
-            "style_name": der.get("style_name", ""),
+            "style_name": style_name,
             "source_file_name": "AMO_cleanup_insert",
             "captured_date": cap_date, "captured_datetime": cap_date,
         }
@@ -467,25 +514,17 @@ def _out_date(out) -> dt.datetime:
 def apply_corrections(cur, plan_updates, plan_removes, corrected_pks):
     for sheet, removes in plan_removes.items():
         for key in removes:
-            if sheet == "variant_metrics":
-                cur.execute("DELETE FROM variant_metrics WHERE brand=%s AND sku_shopify=%s",
-                            (BRAND, key))
-            else:
-                cur.execute(f"DELETE FROM {sheet} WHERE {PK[sheet]}=%s", (key,))
+            cur.execute(f"DELETE FROM {sheet} WHERE {PK[sheet]}=%s", (key,))
         if removes:
             log(f"   {sheet}: removed {len(removes)}")
     for sheet, ups in plan_updates.items():
         for key, cols in ups:
             assigns = ", ".join(f"[{c}]=%s" for c in cols)
             vals = list(cols.values())
-            if sheet == "variant_metrics":
-                cur.execute(f"UPDATE variant_metrics SET {assigns} "
-                            f"WHERE brand=%s AND sku_shopify=%s", vals + [BRAND, key])
-            else:
-                cur.execute(f"UPDATE {sheet} SET {assigns} WHERE {PK[sheet]}=%s",
-                            vals + [key])
-                if sheet in corrected_pks:
-                    corrected_pks[sheet].add(key)
+            cur.execute(f"UPDATE {sheet} SET {assigns} WHERE {PK[sheet]}=%s",
+                        vals + [key])
+            if sheet in corrected_pks:
+                corrected_pks[sheet].add(key)
         if ups:
             log(f"   {sheet}: updated {len(ups)}")
 
