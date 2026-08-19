@@ -848,18 +848,34 @@ def _table_columns(cur, table) -> set:
     return {r["COLUMN_NAME"].lower() for r in cur.fetchall()}
 
 
-def _delete_by_values(cur, table, col, values, lower) -> int:
-    """DELETE ... WHERE brand=AMO AND col IN (values), chunked for the param cap."""
-    total = 0
+DELETE_BATCH = 5000   # rows per DELETE TOP(...) so no single statement times out
+
+
+def _delete_by_values(cur, conn, table, col, values, lower) -> int:
+    """DELETE ... WHERE brand=AMO AND col IN (values), in bounded TOP(N) batches
+    with a commit per batch. A big single-statement delete over the WAN (many
+    daily captures per variant) times out at 600s; deleting 5000 at a time keeps
+    each statement short and each transaction small. Safe to re-run - already
+    deleted rows simply aren't there. Returns total rows deleted."""
     vals = list(values)
+    if not vals:
+        return 0
     colexpr = f"LOWER([{col}])" if lower else f"[{col}]"
-    for i in range(0, len(vals), 500):
+    total = 0
+    for i in range(0, len(vals), 500):          # param-cap chunks of the IN list
         chunk = vals[i:i + 500]
         ph = ", ".join("%s" for _ in chunk)
-        cur.execute(f"DELETE FROM {table} WHERE brand=%s AND {colexpr} IN ({ph})",
-                    [BRAND] + list(chunk))
-        rc = cur.rowcount
-        total += rc if (rc and rc > 0) else 0
+        params = [BRAND] + list(chunk)
+        while True:                              # drain this chunk in 5000s
+            cur.execute(f"DELETE TOP ({DELETE_BATCH}) FROM {table} "
+                        f"WHERE brand=%s AND {colexpr} IN ({ph})", params)
+            rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+            conn.commit()
+            total += rc
+            if rc:
+                log(f"      {table}: deleted {total} rows so far...")
+            if rc < DELETE_BATCH:
+                break
     return total
 
 
@@ -881,8 +897,7 @@ def apply_current_removals(cur, conn, plan, ckpt):
     for table in ("style_info", "style_metrics"):
         if done.get(table):
             continue
-        n = _delete_by_values(cur, table, "handle", plan["purge_handles"], lower=True)
-        conn.commit()
+        n = _delete_by_values(cur, conn, table, "handle", plan["purge_handles"], lower=True)
         done[table] = True
         save_checkpoint(ckpt)
         log(f"   {table}: removed {n} rows for {len(plan['purge_handles'])} "
@@ -891,10 +906,11 @@ def apply_current_removals(cur, conn, plan, ckpt):
     if not done.get("variant_metrics"):
         cols = _table_columns(cur, "variant_metrics")
         if "handle" in cols and plan["vm_handles"]:
-            n = _delete_by_values(cur, "variant_metrics", "handle", plan["vm_handles"], lower=True)
+            n = _delete_by_values(cur, conn, "variant_metrics", "handle",
+                                  plan["vm_handles"], lower=True)
             how = f"{len(plan['vm_handles'])} handles"
         elif plan["removed_skus"]:
-            n = _delete_by_values(cur, "variant_metrics", "sku_shopify",
+            n = _delete_by_values(cur, conn, "variant_metrics", "sku_shopify",
                                   plan["removed_skus"], lower=False)
             how = f"{len(plan['removed_skus'])} sku_shopify"
         else:
