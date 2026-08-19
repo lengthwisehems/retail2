@@ -401,22 +401,34 @@ def main() -> None:
                            database=SQL_DATABASE, timeout=600, login_timeout=60)
     cur = conn.cursor(as_dict=True)
     corrected_pks = {"lookup": set(), "style_info": set()}
+    unique_keys = load_unique_keys(cur, list(tabs))
+    log("Loaded unique indexes: " + "; ".join(
+        f"{t}=[{', '.join('('+'+'.join(k)+')' for k in ks)}]"
+        for t, ks in unique_keys.items() if ks))
+    # Per-phase/table commits: each committed step persists so a later failure
+    # never discards it. Re-running is safe - the plan is keyed by PK and is
+    # idempotent (already-applied updates re-set the same values; already-removed
+    # rows match nothing). Only the currently-running step rolls back on error.
     try:
         if DO_INSERT_MISSING:
             log("Phase 1: inserting missing rows...")
             do_inserts(cur, inserts)
+            conn.commit()
         if DO_CORRECTIONS:
             log("Phase 2: applying corrections...")
-            apply_corrections(cur, plan_updates, plan_removes, corrected_pks)
+            apply_corrections(cur, conn, plan_updates, plan_removes,
+                              corrected_pks, unique_keys)
         if DO_DEDUPE:
             log("Phase 3: dedupe (keep corrected)...")
             dedupe(cur, "lookup", ["brand", "sku_shopify"], "lookup_id", corrected_pks["lookup"])
+            conn.commit()
             dedupe(cur, "style_info", ["brand", "product_name"], "style_info_id", corrected_pks["style_info"])
-        conn.commit()
-        log("Committed.")
+            conn.commit()
+        log("Done - all phases committed.")
     except Exception:
         conn.rollback()
-        log("ERROR — rolled back, database unchanged.")
+        log("ERROR - current step rolled back. Earlier committed steps are kept; "
+            "re-run to resume (the plan is idempotent).")
         raise
     finally:
         conn.close()
@@ -521,24 +533,39 @@ def _out_date(out) -> dt.datetime:
 # ===========================================================================
 # Correction execution
 # ===========================================================================
-# Unique indexes in denim_analytics. A correction that changes one of these key
-# columns to a value another row already has (e.g. a sci-notation sku fixed to
-# match its correct twin) would violate the index, so the conflicting duplicate
-# is deleted first - keeping the row being corrected (matches the dedupe rule).
-UNIQUE_KEYS = {
-    "lookup":          [("brand", "sku_shopify")],
-    "style_info":      [("brand", "style_id"), ("brand", "product_name")],
-    "style_metrics":   [("brand", "style_id", "captured_datetime")],
-    "variant_metrics": [("brand", "sku_shopify", "captured_datetime")],
-}
+# A correction that changes a unique-key column to a value another row already
+# has (e.g. a sci-notation sku fixed to match its correct twin) would violate
+# the index, so the conflicting duplicate is deleted first - keeping the row
+# being corrected (matches the dedupe rule). The unique indexes are read from
+# the database at runtime (load_unique_keys) so every index is covered, not just
+# the ones documented in the schema file.
+def load_unique_keys(cur, tables) -> Dict[str, List[Tuple[str, ...]]]:
+    out: Dict[str, List[Tuple[str, ...]]] = {t: [] for t in tables}
+    cur.execute("""
+        SELECT o.name AS tbl, i.name AS idx, c.name AS col, ic.key_ordinal AS ord
+        FROM sys.indexes i
+        JOIN sys.index_columns ic ON ic.object_id = i.object_id
+             AND ic.index_id = i.index_id AND ic.is_included_column = 0
+        JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+        JOIN sys.objects o ON o.object_id = i.object_id
+        WHERE i.is_unique = 1 AND i.is_primary_key = 0
+        ORDER BY o.name, i.name, ic.key_ordinal
+    """)
+    per_index: Dict[Tuple[str, str], List[str]] = {}
+    for r in cur.fetchall():
+        if r["tbl"] in out:
+            per_index.setdefault((r["tbl"], r["idx"]), []).append(r["col"])
+    for (tbl, _idx), colnames in per_index.items():
+        out[tbl].append(tuple(colnames))
+    return out
 
 
-def _clear_conflicts(cur, sheet, pk_col, pk, cols) -> int:
+def _clear_conflicts(cur, sheet, pk_col, pk, cols, unique_keys) -> int:
     """Delete any OTHER row that already holds the unique-key value this update
     is about to set (same variant/style), so the UPDATE can't hit the index.
     Runs a query only when the update actually changes a key column."""
     deleted = 0
-    for key in UNIQUE_KEYS.get(sheet, []):
+    for key in unique_keys.get(sheet, []):
         if not any(c in cols and c != "brand" for c in key):
             continue
         conds = [f"Y.[{pk_col}] <> X.[{pk_col}]"]
@@ -555,25 +582,40 @@ def _clear_conflicts(cur, sheet, pk_col, pk, cols) -> int:
     return deleted
 
 
-def apply_corrections(cur, plan_updates, plan_removes, corrected_pks):
+COMMIT_EVERY = 5000   # commit + log progress every N rows within a big table
+
+
+def apply_corrections(cur, conn, plan_updates, plan_removes, corrected_pks, unique_keys):
     for sheet, removes in plan_removes.items():
+        n = 0
         for key in removes:
             cur.execute(f"DELETE FROM {sheet} WHERE {PK[sheet]}=%s", (key,))
+            n += 1
+            if n % COMMIT_EVERY == 0:
+                conn.commit()
+                log(f"   {sheet}: removed {n}/{len(removes)}...")
         if removes:
-            log(f"   {sheet}: removed {len(removes)}")
+            conn.commit()
+            log(f"   {sheet}: removed {len(removes)} (committed)")
     for sheet, ups in plan_updates.items():
-        conflicts = 0
+        n = conflicts = 0
         for key, cols in ups:
-            conflicts += _clear_conflicts(cur, sheet, PK[sheet], key, cols)
+            conflicts += _clear_conflicts(cur, sheet, PK[sheet], key, cols, unique_keys)
             assigns = ", ".join(f"[{c}]=%s" for c in cols)
-            vals = list(cols.values())
             cur.execute(f"UPDATE {sheet} SET {assigns} WHERE {PK[sheet]}=%s",
-                        vals + [key])
+                        list(cols.values()) + [key])
             if sheet in corrected_pks:
                 corrected_pks[sheet].add(key)
+            n += 1
+            if n % COMMIT_EVERY == 0:
+                conn.commit()
+                log(f"   {sheet}: updated {n}/{len(ups)}"
+                    + (f" (merged {conflicts} dup)" if conflicts else "") + "...")
         if ups:
+            conn.commit()
             log(f"   {sheet}: updated {len(ups)}"
-                + (f", merged {conflicts} duplicate row(s)" if conflicts else ""))
+                + (f", merged {conflicts} duplicate row(s)" if conflicts else "")
+                + " (committed)")
 
 
 def dedupe(cur, table, key_cols, pk, corrected_pks):
