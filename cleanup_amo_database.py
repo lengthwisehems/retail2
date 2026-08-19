@@ -57,7 +57,9 @@ from typing import Dict, List, Optional, Tuple
 DRY_RUN = True
 DO_INSERT_MISSING = False   # these styles only have ~3 days of data and don't
                             # classify usefully - not worth adding; skip inserts.
-DO_CORRECTIONS    = True
+                            # When False the AMO_OUTPUT_DIR folder is never read.
+DO_CORRECTIONS    = True    # apply the 8/13 correction workbook (CORR_WORKBOOK)
+DO_REMOVE_CURRENT = True    # apply current-state removals from REMOVAL_WORKBOOK
 DO_DEDUPE         = True
 
 # Resume support: a live run commits per phase/table and every COMMIT_EVERY rows,
@@ -72,9 +74,17 @@ RESET_PROGRESS = False
 
 BRAND = "AMO"
 
+# Corrections + the original per-PK removes come from this 8/13 workbook (it has
+# the NEW columns and the curated corrections). Its removes were already applied
+# in an earlier run and are idempotent (re-running matches nothing).
 CORR_WORKBOOK  = r"AMO_DB_Values_2026-08-13_15-14-03_Claude.xlsx"
+# Current-state removals: a fresh export (lookup/style_info/style_metrics tabs)
+# whose ACTION column flags what still needs removing NOW - this catches rows the
+# live scraper re-added after 8/13 with brand-new PKs the old workbook can't see.
+# Any ACTION that is non-blank and not "keep" means remove.
+REMOVAL_WORKBOOK = r"AMO_DB_Values_2026-08-19_16-10-19.xlsx"
 SCRAPER_PATH   = r"amo_inventory.py"
-AMO_OUTPUT_DIR = r"AMO_Output"   # see header: must cover every missing style
+AMO_OUTPUT_DIR = r"AMO_Output"   # only read when DO_INSERT_MISSING = True
 
 SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
 SQL_DATABASE = os.environ.get("SQL_DATABASE", "denim_analytics")
@@ -135,6 +145,7 @@ def log(msg: str = "") -> None:
 # resume never skips an uncommitted row.
 def _empty_ckpt() -> dict:
     return {"inserts_done": False, "removes": {}, "updates": {},
+            "current_removes": {},   # per-table done flags for REMOVAL_WORKBOOK
             "dedupe_done": {}}   # keyed per table+key, e.g. "lookup|brand+sku_brand"
 
 
@@ -399,30 +410,38 @@ def main() -> None:
 
     g = load_scraper(SCRAPER_PATH)
     log(f"Loaded scraper rules from {resolve(SCRAPER_PATH)}")
-    output_idx = build_output_index(AMO_OUTPUT_DIR)
 
     tabs = {sheet: load_tab(CORR_WORKBOOK, sheet)
             for sheet in ("lookup", "style_info", "style_metrics", "variant_metrics")}
     for sheet, rows in tabs.items():
         log(f"{sheet}: {len(rows)} rows loaded")
 
-    # --- determine missing styles (in lookup Keep, not in style_info) ------
-    si_handles = {s(d.get("handle")).lower() for d in tabs["style_info"]}
-    missing_handles = sorted(
-        {s(d.get("handle")).lower() for d in tabs["lookup"]
-         if s(d.get("ACTION")).lower() != "remove" and s(d.get("handle"))} - si_handles)
-    missing = {h: output_idx[h] for h in missing_handles if h in output_idx}
-    no_data = [h for h in missing_handles if h not in output_idx]
-    log(f"Missing styles: {len(missing_handles)} "
-        f"(with output data: {len(missing)}, no data: {len(no_data)})")
-    if no_data:
-        log("   NO OUTPUT DATA for: " + ", ".join(no_data[:15]))
+    # --- missing styles + output folder: ONLY when actually inserting ------
+    # If nothing is being inserted, the output folder is irrelevant, so it is
+    # never read (and no "missing styles" work happens).
+    if DO_INSERT_MISSING:
+        output_idx = build_output_index(AMO_OUTPUT_DIR)
+        si_handles = {s(d.get("handle")).lower() for d in tabs["style_info"]}
+        missing_handles = sorted(
+            {s(d.get("handle")).lower() for d in tabs["lookup"]
+             if s(d.get("ACTION")).lower() != "remove" and s(d.get("handle"))} - si_handles)
+        missing = {h: output_idx[h] for h in missing_handles if h in output_idx}
+        no_data = [h for h in missing_handles if h not in output_idx]
+        log(f"Missing styles: {len(missing_handles)} "
+            f"(with output data: {len(missing)}, no data: {len(no_data)})")
+        if no_data:
+            log("   NO OUTPUT DATA for: " + ", ".join(no_data[:15]))
+    else:
+        output_idx, missing = {}, {}
+        log("DO_INSERT_MISSING = False - output folder not read, no rows inserted.")
 
-    # The derivation map always includes the missing styles so that lookup /
-    # style_metrics "Use amo_inventory.py" cells for those handles resolve, even
-    # when DO_INSERT_MISSING is off (their rows are still corrected in place).
+    # Derivation covers the corrected style_info rows (+ any missing styles when
+    # inserting) so "Use amo_inventory.py" cells resolve.
     deriver = Deriver(g, tabs["style_info"], missing, tabs["lookup"])
     log(f"Derivation map: {len(deriver.by_handle)} handles")
+
+    # --- plan current-state removals (from the fresh REMOVAL_WORKBOOK) -----
+    cur_removals = plan_current_removals() if DO_REMOVE_CURRENT else None
 
     # --- plan corrections --------------------------------------------------
     plan_updates: Dict[str, List[Tuple[object, Dict[str, str]]]] = {t: [] for t in tabs}
@@ -453,6 +472,15 @@ def main() -> None:
         log(f"Phase 2 {sheet:16} remove={len(plan_removes[sheet]):>5} "
             f"update_rows={len(plan_updates[sheet]):>5} field_writes={nf}"
             + ("" if DO_CORRECTIONS else "  (DO_CORRECTIONS = False)"))
+    if DO_REMOVE_CURRENT and cur_removals:
+        c = cur_removals
+        log(f"Phase 2.5 REMOVE (current-state, from {os.path.basename(resolve(REMOVAL_WORKBOOK))}):")
+        log(f"   lookup: {len(c['lookup_pks'])} flagged rows by PK "
+            f"({len(c['removed_skus'])} sku_shopify -> variant_metrics)")
+        log(f"   style_info + style_metrics: purge {len(c['purge_handles'])} handles entirely")
+        log(f"   variant_metrics: delete variants of {len(c['vm_handles'])} fully-removed handles")
+    elif DO_REMOVE_CURRENT:
+        log("Phase 2.5 REMOVE: REMOVAL_WORKBOOK not found - skipped")
     log("Phase 3 dedupe: lookup + style_info (keep corrected) — runs on live DB"
         + ("" if DO_DEDUPE else "  (DO_DEDUPE = False)"))
 
@@ -464,6 +492,13 @@ def main() -> None:
                 log(f"   {r['handle']:34} {r.get('style_name',''):22} | "
                     f"{r.get('jean_style',''):24} | {r.get('rise_label',''):5} | "
                     f"{r.get('inseam_label',''):8} | {r.get('inseam_style','')}")
+        if DO_REMOVE_CURRENT and cur_removals:
+            log("Handles purged from style_info/style_metrics: "
+                + ", ".join(cur_removals["purge_handles"][:40])
+                + (" ..." if len(cur_removals["purge_handles"]) > 40 else ""))
+            log("Handles fully removed (also lookup + variant_metrics): "
+                + ", ".join(cur_removals["vm_handles"][:40])
+                + (" ..." if len(cur_removals["vm_handles"]) > 40 else ""))
         log("DRY RUN complete — nothing written.")
         return
 
@@ -507,6 +542,9 @@ def main() -> None:
                 conn.commit()
                 ckpt["inserts_done"] = True
                 save_checkpoint(ckpt)
+        if DO_REMOVE_CURRENT and cur_removals:
+            log("Phase 2.5: current-state removals (fresh REMOVAL_WORKBOOK)...")
+            apply_current_removals(cur, conn, cur_removals, ckpt)
         if DO_CORRECTIONS:
             log("Phase 2: applying corrections...")
             apply_corrections(cur, conn, plan_updates, plan_removes,
@@ -737,6 +775,134 @@ def apply_corrections(cur, conn, plan_updates, plan_removes, corrected_pks,
         log(f"   {sheet}: updated {len(ups)}"
             + (f", merged {conflicts} duplicate row(s)" if conflicts else "")
             + " (committed)")
+
+
+# ===========================================================================
+# Current-state removals (from the fresh REMOVAL_WORKBOOK)
+# ===========================================================================
+# The 8/13 correction workbook removes by PK, but the live scraper re-added
+# unwanted rows after 8/13 with brand-new PKs it can't see. This reads a FRESH
+# export and removes what its ACTION column flags now (any ACTION that is not
+# blank and not "keep"):
+#   * lookup          - delete each flagged row by PK. Its handle/sku_shopify
+#                       mark the variant as fully removed.
+#   * style_info /     - a flag means the whole STYLE should not be there, so
+#     style_metrics      EVERY row for that handle is purged (catches old+new
+#                        duplicate rows, not just the flagged PK).
+#   * variant_metrics - variants of the fully-removed handles (lookup-flagged)
+#                       are deleted. Handles flagged only at the style level keep
+#                       their lookup + variant_metrics rows (the accepted
+#                       "missing style" state - variants exist, no style record).
+def is_remove_action(v) -> bool:
+    a = norm(v)
+    return a != "" and a != "keep"
+
+
+def plan_current_removals() -> Optional[dict]:
+    path = resolve(REMOVAL_WORKBOOK)
+    if not os.path.exists(path):
+        log(f"WARNING: REMOVAL_WORKBOOK not found ({path}); current-state removals skipped.")
+        return None
+    tabs = {}
+    for sheet in ("lookup", "style_info", "style_metrics"):
+        try:
+            tabs[sheet] = load_tab(path, sheet)
+        except Exception as exc:
+            log(f"(REMOVAL_WORKBOOK: no '{sheet}' tab: {exc})")
+            tabs[sheet] = []
+
+    lookup_pks: List[object] = []
+    removed_skus, vm_handles = set(), set()
+    for r in tabs["lookup"]:
+        if is_remove_action(r.get("ACTION")):
+            pk = r.get("lookup_id")
+            if pk not in (None, ""):
+                lookup_pks.append(pk)
+            sk = s(r.get("sku_shopify"))
+            if sk:
+                removed_skus.add(sk)
+            h = norm(r.get("handle"))
+            if h:
+                vm_handles.add(h)   # lookup-flagged -> fully removed handle
+
+    purge_handles = set(vm_handles)   # fully-removed handles purge at style level too
+    for sheet in ("style_info", "style_metrics"):
+        for r in tabs[sheet]:
+            if is_remove_action(r.get("ACTION")):
+                h = norm(r.get("handle"))
+                if h:
+                    purge_handles.add(h)
+
+    log(f"REMOVAL_WORKBOOK: lookup flagged={len(lookup_pks)}, "
+        f"style-level purge handles={len(purge_handles)}, "
+        f"fully-removed handles={len(vm_handles)}")
+    return {"lookup_pks": lookup_pks,
+            "removed_skus": sorted(removed_skus),
+            "purge_handles": sorted(purge_handles),
+            "vm_handles": sorted(vm_handles)}
+
+
+def _table_columns(cur, table) -> set:
+    cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME=%s AND TABLE_SCHEMA='dbo'", (table,))
+    return {r["COLUMN_NAME"].lower() for r in cur.fetchall()}
+
+
+def _delete_by_values(cur, table, col, values, lower) -> int:
+    """DELETE ... WHERE brand=AMO AND col IN (values), chunked for the param cap."""
+    total = 0
+    vals = list(values)
+    colexpr = f"LOWER([{col}])" if lower else f"[{col}]"
+    for i in range(0, len(vals), 500):
+        chunk = vals[i:i + 500]
+        ph = ", ".join("%s" for _ in chunk)
+        cur.execute(f"DELETE FROM {table} WHERE brand=%s AND {colexpr} IN ({ph})",
+                    [BRAND] + list(chunk))
+        rc = cur.rowcount
+        total += rc if (rc and rc > 0) else 0
+    return total
+
+
+def apply_current_removals(cur, conn, plan, ckpt):
+    done = ckpt.setdefault("current_removes", {})
+
+    if not done.get("lookup"):
+        pks = plan["lookup_pks"]
+        for i, pk in enumerate(pks, 1):
+            cur.execute("DELETE FROM lookup WHERE brand=%s AND lookup_id=%s", (BRAND, pk))
+            if i % COMMIT_EVERY == 0:
+                conn.commit()
+                log(f"   lookup: removed {i}/{len(pks)}...")
+        conn.commit()
+        done["lookup"] = True
+        save_checkpoint(ckpt)
+        log(f"   lookup: removed {len(pks)} flagged rows (committed)")
+
+    for table in ("style_info", "style_metrics"):
+        if done.get(table):
+            continue
+        n = _delete_by_values(cur, table, "handle", plan["purge_handles"], lower=True)
+        conn.commit()
+        done[table] = True
+        save_checkpoint(ckpt)
+        log(f"   {table}: removed {n} rows for {len(plan['purge_handles'])} "
+            f"purged handles (committed)")
+
+    if not done.get("variant_metrics"):
+        cols = _table_columns(cur, "variant_metrics")
+        if "handle" in cols and plan["vm_handles"]:
+            n = _delete_by_values(cur, "variant_metrics", "handle", plan["vm_handles"], lower=True)
+            how = f"{len(plan['vm_handles'])} handles"
+        elif plan["removed_skus"]:
+            n = _delete_by_values(cur, "variant_metrics", "sku_shopify",
+                                  plan["removed_skus"], lower=False)
+            how = f"{len(plan['removed_skus'])} sku_shopify"
+        else:
+            n, how = 0, "nothing to match"
+        conn.commit()
+        done["variant_metrics"] = True
+        save_checkpoint(ckpt)
+        log(f"   variant_metrics: removed {n} rows (by {how}) (committed)")
 
 
 def dedupe(cur, table, key_cols, pk, corrected_pks):
