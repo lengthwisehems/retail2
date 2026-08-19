@@ -90,6 +90,21 @@ DERIVED_FIELDS = {"style_name", "jean_style", "rise_label",
 PK = {"lookup": "lookup_id", "style_info": "style_info_id",
       "style_metrics": "style_metric_id", "variant_metrics": "variant_metric_id"}
 
+# Phase 3 dedupe: which duplicate-identity keys to collapse, per table. A row is
+# a duplicate of another when it matches on EVERY column in a key. The corrected
+# row is kept (else the highest pk). Rows with a BLANK value in any key column
+# are never collapsed on that key (a missing value is not an identity match), so
+# empty sku_brand / inseam_label can't wrongly merge unrelated rows.
+#   lookup         -> (brand+sku_shopify) and (brand+sku_brand)
+#   style_info     -> (brand+product_name+inseam_label) and (brand+style_id+inseam_label)
+#   style_metrics  -> none (one row per daily capture; no duplicates expected)
+#   variant_metrics-> none (same)
+DEDUPE_KEYS = {
+    "lookup":     [["brand", "sku_shopify"], ["brand", "sku_brand"]],
+    "style_info": [["brand", "product_name", "inseam_label"],
+                   ["brand", "style_id", "inseam_label"]],
+}
+
 
 # ===========================================================================
 # Central-time logging
@@ -120,7 +135,7 @@ def log(msg: str = "") -> None:
 # resume never skips an uncommitted row.
 def _empty_ckpt() -> dict:
     return {"inserts_done": False, "removes": {}, "updates": {},
-            "dedupe_done": {"lookup": False, "style_info": False}}
+            "dedupe_done": {}}   # keyed per table+key, e.g. "lookup|brand+sku_brand"
 
 
 def load_checkpoint() -> dict:
@@ -498,20 +513,16 @@ def main() -> None:
                               corrected_pks, unique_keys, ckpt)
         if DO_DEDUPE:
             log("Phase 3: dedupe (keep corrected)...")
-            if ckpt["dedupe_done"].get("lookup"):
-                log("   lookup: already deduped (checkpoint) - skipping.")
-            else:
-                dedupe(cur, "lookup", ["brand", "sku_shopify"], "lookup_id", corrected_pks["lookup"])
-                conn.commit()
-                ckpt["dedupe_done"]["lookup"] = True
-                save_checkpoint(ckpt)
-            if ckpt["dedupe_done"].get("style_info"):
-                log("   style_info: already deduped (checkpoint) - skipping.")
-            else:
-                dedupe(cur, "style_info", ["brand", "product_name"], "style_info_id", corrected_pks["style_info"])
-                conn.commit()
-                ckpt["dedupe_done"]["style_info"] = True
-                save_checkpoint(ckpt)
+            for table, keysets in DEDUPE_KEYS.items():
+                for kc in keysets:
+                    tag = f"{table}|{'+'.join(kc)}"
+                    if ckpt["dedupe_done"].get(tag):
+                        log(f"   {tag}: already deduped (checkpoint) - skipping.")
+                        continue
+                    dedupe(cur, table, kc, PK[table], corrected_pks[table])
+                    conn.commit()
+                    ckpt["dedupe_done"][tag] = True
+                    save_checkpoint(ckpt)
         clear_checkpoint()
         log("Done - all phases committed. Checkpoint cleared.")
     except Exception:
@@ -730,12 +741,15 @@ def apply_corrections(cur, conn, plan_updates, plan_removes, corrected_pks,
 
 def dedupe(cur, table, key_cols, pk, corrected_pks):
     """Delete duplicate rows per key group, keeping a corrected row if present,
-    else the highest pk."""
+    else the highest pk. Groups with a blank value in any key column are skipped
+    (a missing value is not an identity - never collapse on it)."""
     cur.execute(f"SELECT {pk} AS pk, {', '.join(key_cols)} FROM {table} WHERE brand=%s",
                 (BRAND,))
     groups: Dict[tuple, List[int]] = {}
     for r in cur.fetchall():
         k = tuple(norm(r[c]) for c in key_cols)
+        if any(part == "" for part in k):      # blank key part -> not a match
+            continue
         groups.setdefault(k, []).append(r["pk"])
     deleted = 0
     for k, pks in groups.items():
@@ -746,7 +760,7 @@ def dedupe(cur, table, key_cols, pk, corrected_pks):
             if p != keep:
                 cur.execute(f"DELETE FROM {table} WHERE {pk}=%s", (p,))
                 deleted += 1
-    log(f"   {table}: deduped, removed {deleted} duplicate rows")
+    log(f"   {table} [{'+'.join(key_cols)}]: deduped, removed {deleted} duplicate rows")
 
 
 if __name__ == "__main__":
