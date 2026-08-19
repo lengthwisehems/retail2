@@ -43,6 +43,7 @@ from __future__ import annotations
 import csv
 import glob
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -58,6 +59,16 @@ DO_INSERT_MISSING = True
 DO_CORRECTIONS    = True
 DO_DEDUPE         = True
 
+# Resume support: a live run commits per phase/table and every COMMIT_EVERY rows,
+# and records how far it got in a small JSON checkpoint next to this script. If a
+# run dies partway (e.g. the WAN connection drops during the big variant_metrics
+# update, as it did at 40000/408893), just re-run - it reads the checkpoint and
+# skips everything already committed, picking up at the exact row it stopped on.
+# Set RESET_PROGRESS = True to ignore any checkpoint and start the plan from the
+# top (the underlying writes are idempotent, so this is always safe, just slower).
+# The checkpoint is deleted automatically once all phases finish.
+RESET_PROGRESS = False
+
 BRAND = "AMO"
 
 CORR_WORKBOOK  = r"AMO_DB_Values_2026-08-13_15-14-03_Claude.xlsx"
@@ -70,6 +81,7 @@ SQL_USERNAME = os.environ.get("SQL_USERNAME", "")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, f"cleanup_{BRAND.lower()}_checkpoint.json")
 
 DERIVED_FIELDS = {"style_name", "jean_style", "rise_label",
                   "inseam_label", "inseam_style"}
@@ -94,6 +106,50 @@ def log(msg: str = "") -> None:
     stamp = dt.datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
     for part in str(msg).split("\n"):
         print(f"[{stamp}] {part}")
+
+
+# ===========================================================================
+# Checkpoint (resume after a dropped connection / crash)
+# ===========================================================================
+# Shape: {"inserts_done": bool,
+#         "removes": {sheet: committed_count, ...},
+#         "updates": {sheet: committed_count, ...},
+#         "dedupe_done": {"lookup": bool, "style_info": bool}}
+# A count is written ONLY right after the commit that persisted those rows, so a
+# resume never skips an uncommitted row.
+def _empty_ckpt() -> dict:
+    return {"inserts_done": False, "removes": {}, "updates": {},
+            "dedupe_done": {"lookup": False, "style_info": False}}
+
+
+def load_checkpoint() -> dict:
+    if RESET_PROGRESS or not os.path.exists(CHECKPOINT_FILE):
+        return _empty_ckpt()
+    try:
+        with open(CHECKPOINT_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        base = _empty_ckpt()
+        base.update({k: data.get(k, base[k]) for k in base})
+        return base
+    except Exception as exc:
+        log(f"(could not read checkpoint {CHECKPOINT_FILE}: {exc} - starting fresh)")
+        return _empty_ckpt()
+
+
+def save_checkpoint(ckpt: dict) -> None:
+    try:
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as fh:
+            json.dump(ckpt, fh, indent=1)
+    except Exception as exc:
+        log(f"(WARNING: could not write checkpoint: {exc})")
+
+
+def clear_checkpoint() -> None:
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+    except Exception as exc:
+        log(f"(WARNING: could not remove checkpoint {CHECKPOINT_FILE}: {exc})")
 
 
 # ===========================================================================
@@ -400,35 +456,67 @@ def main() -> None:
     conn = pymssql.connect(server=SQL_SERVER, user=SQL_USERNAME, password=SQL_PASSWORD,
                            database=SQL_DATABASE, timeout=600, login_timeout=60)
     cur = conn.cursor(as_dict=True)
-    corrected_pks = {"lookup": set(), "style_info": set()}
+    # corrected_pks holds EVERY corrected row (upfront, from the plan) so the
+    # Phase 3 dedupe survivor logic is correct on a resume too - it must not
+    # depend on which rows happened to be updated in this particular run.
+    corrected_pks = {
+        "lookup":     {key for key, _ in plan_updates.get("lookup", [])},
+        "style_info": {key for key, _ in plan_updates.get("style_info", [])},
+    }
     unique_keys = load_unique_keys(cur, list(tabs))
     log("Loaded unique indexes: " + "; ".join(
         f"{t}=[{', '.join('('+'+'.join(k)+')' for k in ks)}]"
         for t, ks in unique_keys.items() if ks))
+
+    ckpt = load_checkpoint()
+    if not RESET_PROGRESS and os.path.exists(CHECKPOINT_FILE):
+        log("Resuming from checkpoint: "
+            f"inserts_done={ckpt['inserts_done']}, "
+            f"removes={ckpt['removes']}, updates={ckpt['updates']}, "
+            f"dedupe_done={ckpt['dedupe_done']}")
+
     # Per-phase/table commits: each committed step persists so a later failure
     # never discards it. Re-running is safe - the plan is keyed by PK and is
     # idempotent (already-applied updates re-set the same values; already-removed
-    # rows match nothing). Only the currently-running step rolls back on error.
+    # rows match nothing). The checkpoint additionally lets a resume SKIP the rows
+    # already committed instead of re-sending them. Only the currently-running
+    # step rolls back on error.
     try:
         if DO_INSERT_MISSING:
-            log("Phase 1: inserting missing rows...")
-            do_inserts(cur, inserts)
-            conn.commit()
+            if ckpt["inserts_done"]:
+                log("Phase 1: inserts already done (checkpoint) - skipping.")
+            else:
+                log("Phase 1: inserting missing rows...")
+                do_inserts(cur, inserts)
+                conn.commit()
+                ckpt["inserts_done"] = True
+                save_checkpoint(ckpt)
         if DO_CORRECTIONS:
             log("Phase 2: applying corrections...")
             apply_corrections(cur, conn, plan_updates, plan_removes,
-                              corrected_pks, unique_keys)
+                              corrected_pks, unique_keys, ckpt)
         if DO_DEDUPE:
             log("Phase 3: dedupe (keep corrected)...")
-            dedupe(cur, "lookup", ["brand", "sku_shopify"], "lookup_id", corrected_pks["lookup"])
-            conn.commit()
-            dedupe(cur, "style_info", ["brand", "product_name"], "style_info_id", corrected_pks["style_info"])
-            conn.commit()
-        log("Done - all phases committed.")
+            if ckpt["dedupe_done"].get("lookup"):
+                log("   lookup: already deduped (checkpoint) - skipping.")
+            else:
+                dedupe(cur, "lookup", ["brand", "sku_shopify"], "lookup_id", corrected_pks["lookup"])
+                conn.commit()
+                ckpt["dedupe_done"]["lookup"] = True
+                save_checkpoint(ckpt)
+            if ckpt["dedupe_done"].get("style_info"):
+                log("   style_info: already deduped (checkpoint) - skipping.")
+            else:
+                dedupe(cur, "style_info", ["brand", "product_name"], "style_info_id", corrected_pks["style_info"])
+                conn.commit()
+                ckpt["dedupe_done"]["style_info"] = True
+                save_checkpoint(ckpt)
+        clear_checkpoint()
+        log("Done - all phases committed. Checkpoint cleared.")
     except Exception:
         conn.rollback()
         log("ERROR - current step rolled back. Earlier committed steps are kept; "
-            "re-run to resume (the plan is idempotent).")
+            "re-run to resume from the checkpoint (already-committed rows are skipped).")
         raise
     finally:
         conn.close()
@@ -585,37 +673,58 @@ def _clear_conflicts(cur, sheet, pk_col, pk, cols, unique_keys) -> int:
 COMMIT_EVERY = 5000   # commit + log progress every N rows within a big table
 
 
-def apply_corrections(cur, conn, plan_updates, plan_removes, corrected_pks, unique_keys):
+def apply_corrections(cur, conn, plan_updates, plan_removes, corrected_pks,
+                      unique_keys, ckpt):
+    # --- removes -----------------------------------------------------------
     for sheet, removes in plan_removes.items():
-        n = 0
-        for key in removes:
+        done = ckpt["removes"].get(sheet, 0)
+        if done >= len(removes):
+            if removes:
+                log(f"   {sheet}: removes already done ({done}/{len(removes)}) - skipping.")
+            continue
+        if done:
+            log(f"   {sheet}: resuming removes at {done}/{len(removes)}.")
+        n = done
+        for key in removes[done:]:
             cur.execute(f"DELETE FROM {sheet} WHERE {PK[sheet]}=%s", (key,))
             n += 1
             if n % COMMIT_EVERY == 0:
                 conn.commit()
+                ckpt["removes"][sheet] = n
+                save_checkpoint(ckpt)
                 log(f"   {sheet}: removed {n}/{len(removes)}...")
-        if removes:
-            conn.commit()
-            log(f"   {sheet}: removed {len(removes)} (committed)")
+        conn.commit()
+        ckpt["removes"][sheet] = n
+        save_checkpoint(ckpt)
+        log(f"   {sheet}: removed {len(removes)} (committed)")
+    # --- updates -----------------------------------------------------------
     for sheet, ups in plan_updates.items():
-        n = conflicts = 0
-        for key, cols in ups:
+        done = ckpt["updates"].get(sheet, 0)
+        if done >= len(ups):
+            if ups:
+                log(f"   {sheet}: updates already done ({done}/{len(ups)}) - skipping.")
+            continue
+        if done:
+            log(f"   {sheet}: resuming updates at {done}/{len(ups)}.")
+        n, conflicts = done, 0
+        for key, cols in ups[done:]:
             conflicts += _clear_conflicts(cur, sheet, PK[sheet], key, cols, unique_keys)
             assigns = ", ".join(f"[{c}]=%s" for c in cols)
             cur.execute(f"UPDATE {sheet} SET {assigns} WHERE {PK[sheet]}=%s",
                         list(cols.values()) + [key])
-            if sheet in corrected_pks:
-                corrected_pks[sheet].add(key)
             n += 1
             if n % COMMIT_EVERY == 0:
                 conn.commit()
+                ckpt["updates"][sheet] = n
+                save_checkpoint(ckpt)
                 log(f"   {sheet}: updated {n}/{len(ups)}"
                     + (f" (merged {conflicts} dup)" if conflicts else "") + "...")
-        if ups:
-            conn.commit()
-            log(f"   {sheet}: updated {len(ups)}"
-                + (f", merged {conflicts} duplicate row(s)" if conflicts else "")
-                + " (committed)")
+        conn.commit()
+        ckpt["updates"][sheet] = n
+        save_checkpoint(ckpt)
+        log(f"   {sheet}: updated {len(ups)}"
+            + (f", merged {conflicts} duplicate row(s)" if conflicts else "")
+            + " (committed)")
 
 
 def dedupe(cur, table, key_cols, pk, corrected_pks):
