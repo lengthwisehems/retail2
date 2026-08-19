@@ -55,7 +55,8 @@ from typing import Dict, List, Optional, Tuple
 # CONFIG
 # ===========================================================================
 DRY_RUN = True
-DO_INSERT_MISSING = True
+DO_INSERT_MISSING = False   # these styles only have ~3 days of data and don't
+                            # classify usefully - not worth adding; skip inserts.
 DO_CORRECTIONS    = True
 DO_DEDUPE         = True
 
