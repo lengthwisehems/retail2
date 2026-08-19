@@ -521,6 +521,40 @@ def _out_date(out) -> dt.datetime:
 # ===========================================================================
 # Correction execution
 # ===========================================================================
+# Unique indexes in denim_analytics. A correction that changes one of these key
+# columns to a value another row already has (e.g. a sci-notation sku fixed to
+# match its correct twin) would violate the index, so the conflicting duplicate
+# is deleted first - keeping the row being corrected (matches the dedupe rule).
+UNIQUE_KEYS = {
+    "lookup":          [("brand", "sku_shopify")],
+    "style_info":      [("brand", "style_id"), ("brand", "product_name")],
+    "style_metrics":   [("brand", "style_id", "captured_datetime")],
+    "variant_metrics": [("brand", "sku_shopify", "captured_datetime")],
+}
+
+
+def _clear_conflicts(cur, sheet, pk_col, pk, cols) -> int:
+    """Delete any OTHER row that already holds the unique-key value this update
+    is about to set (same variant/style), so the UPDATE can't hit the index.
+    Runs a query only when the update actually changes a key column."""
+    deleted = 0
+    for key in UNIQUE_KEYS.get(sheet, []):
+        if not any(c in cols and c != "brand" for c in key):
+            continue
+        conds = [f"Y.[{pk_col}] <> X.[{pk_col}]"]
+        params = [pk]
+        for c in key:
+            if c in cols:
+                conds.append(f"Y.[{c}] = %s")
+                params.append(cols[c])
+            else:
+                conds.append(f"Y.[{c}] = X.[{c}]")
+        cur.execute(f"DELETE Y FROM {sheet} Y JOIN {sheet} X "
+                    f"ON X.[{pk_col}] = %s WHERE {' AND '.join(conds)}", params)
+        deleted += cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+    return deleted
+
+
 def apply_corrections(cur, plan_updates, plan_removes, corrected_pks):
     for sheet, removes in plan_removes.items():
         for key in removes:
@@ -528,7 +562,9 @@ def apply_corrections(cur, plan_updates, plan_removes, corrected_pks):
         if removes:
             log(f"   {sheet}: removed {len(removes)}")
     for sheet, ups in plan_updates.items():
+        conflicts = 0
         for key, cols in ups:
+            conflicts += _clear_conflicts(cur, sheet, PK[sheet], key, cols)
             assigns = ", ".join(f"[{c}]=%s" for c in cols)
             vals = list(cols.values())
             cur.execute(f"UPDATE {sheet} SET {assigns} WHERE {PK[sheet]}=%s",
@@ -536,7 +572,8 @@ def apply_corrections(cur, plan_updates, plan_removes, corrected_pks):
             if sheet in corrected_pks:
                 corrected_pks[sheet].add(key)
         if ups:
-            log(f"   {sheet}: updated {len(ups)}")
+            log(f"   {sheet}: updated {len(ups)}"
+                + (f", merged {conflicts} duplicate row(s)" if conflicts else ""))
 
 
 def dedupe(cur, table, key_cols, pk, corrected_pks):
