@@ -853,10 +853,8 @@ DELETE_BATCH = 5000   # rows per DELETE TOP(...) so no single statement times ou
 
 def _delete_by_values(cur, conn, table, col, values, lower) -> int:
     """DELETE ... WHERE brand=AMO AND col IN (values), in bounded TOP(N) batches
-    with a commit per batch. A big single-statement delete over the WAN (many
-    daily captures per variant) times out at 600s; deleting 5000 at a time keeps
-    each statement short and each transaction small. Safe to re-run - already
-    deleted rows simply aren't there. Returns total rows deleted."""
+    with a commit per batch. Use for UNINDEXED columns (e.g. handle) on smaller
+    tables: it's one scan for the whole list. Returns total rows deleted."""
     vals = list(values)
     if not vals:
         return 0
@@ -876,6 +874,30 @@ def _delete_by_values(cur, conn, table, col, values, lower) -> int:
                 log(f"      {table}: deleted {total} rows so far...")
             if rc < DELETE_BATCH:
                 break
+    return total
+
+
+def _delete_each_value(cur, conn, table, col, values) -> int:
+    """Delete rows for each value ONE AT A TIME (col = value), TOP(N) batched
+    with a commit per batch. Equality on an INDEXED column (variant_metrics has a
+    unique index led by brand+sku_shopify) seeks straight to the rows; an IN-list
+    with TOP gets mis-planned as a full scan of the 475k-row table and times out
+    at 600s. Safe to re-run - already-deleted rows just aren't there."""
+    total = 0
+    vals = list(values)
+    for j, v in enumerate(vals, 1):
+        sub = 0
+        while True:
+            cur.execute(f"DELETE TOP ({DELETE_BATCH}) FROM {table} "
+                        f"WHERE brand=%s AND [{col}]=%s", (BRAND, v))
+            rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+            conn.commit()
+            total += rc
+            sub += rc
+            if rc < DELETE_BATCH:
+                break
+        log(f"      {table}: {col} {j}/{len(vals)} done "
+            f"(+{sub}, {total} total)...")
     return total
 
 
@@ -905,14 +927,17 @@ def apply_current_removals(cur, conn, plan, ckpt):
 
     if not done.get("variant_metrics"):
         cols = _table_columns(cur, "variant_metrics")
-        if "handle" in cols and plan["vm_handles"]:
+        # sku_shopify is the indexed link (unique index brand+sku_shopify+...),
+        # so delete per sku with equality -> index seek. handle is not indexed
+        # here (and this table has no handle column anyway).
+        if plan["removed_skus"]:
+            n = _delete_each_value(cur, conn, "variant_metrics", "sku_shopify",
+                                   plan["removed_skus"])
+            how = f"{len(plan['removed_skus'])} sku_shopify"
+        elif "handle" in cols and plan["vm_handles"]:
             n = _delete_by_values(cur, conn, "variant_metrics", "handle",
                                   plan["vm_handles"], lower=True)
             how = f"{len(plan['vm_handles'])} handles"
-        elif plan["removed_skus"]:
-            n = _delete_by_values(cur, conn, "variant_metrics", "sku_shopify",
-                                  plan["removed_skus"], lower=False)
-            how = f"{len(plan['removed_skus'])} sku_shopify"
         else:
             n, how = 0, "nothing to match"
         conn.commit()
