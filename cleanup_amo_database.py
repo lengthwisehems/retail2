@@ -100,6 +100,14 @@ DERIVED_FIELDS = {"style_name", "jean_style", "rise_label",
 PK = {"lookup": "lookup_id", "style_info": "style_info_id",
       "style_metrics": "style_metric_id", "variant_metrics": "variant_metric_id"}
 
+# pymssql sends Python str params as NVARCHAR, but the string columns (brand,
+# sku_shopify, handle, product_name, ...) are VARCHAR. varchar_col = nvarchar_param
+# converts the COLUMN, which is non-SARGable and DISCARDS the index -> a full
+# table scan that times out on variant_metrics (475k+ rows). Wrapping the
+# parameter in CAST(%s AS varchar(...)) keeps the comparison varchar=varchar so
+# the index seeks. Only string params need this; int PKs are already fine.
+VC = "CAST(%s AS varchar(255))"
+
 # Phase 3 dedupe: which duplicate-identity keys to collapse, per table. A row is
 # a duplicate of another when it matches on EVERY column in a key. The corrected
 # row is kept (else the highest pk). Rows with a BLANK value in any key column
@@ -710,7 +718,7 @@ def _clear_conflicts(cur, sheet, pk_col, pk, cols, unique_keys) -> int:
         params = [pk]
         for c in key:
             if c in cols:
-                conds.append(f"Y.[{c}] = %s")
+                conds.append(f"Y.[{c}] = {VC}")   # varchar cast -> keep index seek
                 params.append(cols[c])
             else:
                 conds.append(f"Y.[{c}] = X.[{c}]")
@@ -862,11 +870,11 @@ def _delete_by_values(cur, conn, table, col, values, lower) -> int:
     total = 0
     for i in range(0, len(vals), 500):          # param-cap chunks of the IN list
         chunk = vals[i:i + 500]
-        ph = ", ".join("%s" for _ in chunk)
+        ph = ", ".join(VC for _ in chunk)
         params = [BRAND] + list(chunk)
         while True:                              # drain this chunk in 5000s
             cur.execute(f"DELETE TOP ({DELETE_BATCH}) FROM {table} "
-                        f"WHERE brand=%s AND {colexpr} IN ({ph})", params)
+                        f"WHERE brand={VC} AND {colexpr} IN ({ph})", params)
             rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
             conn.commit()
             total += rc
@@ -889,7 +897,7 @@ def _delete_each_value(cur, conn, table, col, values) -> int:
         sub = 0
         while True:
             cur.execute(f"DELETE TOP ({DELETE_BATCH}) FROM {table} "
-                        f"WHERE brand=%s AND [{col}]=%s", (BRAND, v))
+                        f"WHERE brand={VC} AND [{col}]={VC}", (BRAND, v))
             rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
             conn.commit()
             total += rc
@@ -907,7 +915,7 @@ def apply_current_removals(cur, conn, plan, ckpt):
     if not done.get("lookup"):
         pks = plan["lookup_pks"]
         for i, pk in enumerate(pks, 1):
-            cur.execute("DELETE FROM lookup WHERE brand=%s AND lookup_id=%s", (BRAND, pk))
+            cur.execute(f"DELETE FROM lookup WHERE brand={VC} AND lookup_id=%s", (BRAND, pk))
             if i % COMMIT_EVERY == 0:
                 conn.commit()
                 log(f"   lookup: removed {i}/{len(pks)}...")
@@ -950,8 +958,8 @@ def dedupe(cur, table, key_cols, pk, corrected_pks):
     """Delete duplicate rows per key group, keeping a corrected row if present,
     else the highest pk. Groups with a blank value in any key column are skipped
     (a missing value is not an identity - never collapse on it)."""
-    cur.execute(f"SELECT {pk} AS pk, {', '.join(key_cols)} FROM {table} WHERE brand=%s",
-                (BRAND,))
+    cur.execute(f"SELECT {pk} AS pk, {', '.join(key_cols)} FROM {table} "
+                f"WHERE brand={VC}", (BRAND,))
     groups: Dict[tuple, List[int]] = {}
     for r in cur.fetchall():
         k = tuple(norm(r[c]) for c in key_cols)

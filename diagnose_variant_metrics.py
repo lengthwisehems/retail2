@@ -165,32 +165,41 @@ def main():
     else:
         log("   No other sessions hold an open transaction.")
 
-    # -- 5) pick target skus and COUNT one ----------------------------------
-    section("5) ROW COUNTS for target skus (and how long COUNT takes)")
+    # -- 5) prove the nvarchar-vs-varchar cause -----------------------------
+    # brand/sku_shopify are varchar. pymssql sends str params as NVARCHAR, which
+    # makes SQL Server convert the COLUMN (non-SARGable) and scan. Casting the
+    # param to varchar restores the index seek. Get a real target sku with the
+    # CAST form (fast), then compare a CAST count to a non-cast count.
+    section("5) CONFIRM: cast (varchar) vs non-cast (nvarchar) seek")
+    VC = "CAST(%s AS varchar(255))"
     skus = [str(x) for x in TARGET_SKUS if str(x).strip()]
     if not skus:
-        rows, _, _ = timed(cur, "sample skus",
-            "SELECT TOP 5 sku_shopify, COUNT(*) AS n FROM variant_metrics "
-            "WHERE brand=%s GROUP BY sku_shopify ORDER BY COUNT(*) DESC", (BRAND,))
+        rows, _, _ = timed(cur, "one sku (cast)",
+            f"SELECT TOP 1 sku_shopify FROM variant_metrics WHERE brand={VC}", (BRAND,))
         skus = [str(r["sku_shopify"]) for r in (rows or [])]
-        for r in rows or []:
-            log(f"   sku {r['sku_shopify']}: {r['n']} rows")
     target = skus[0] if skus else None
     if target:
-        rows, cnt_s, _ = timed(cur, f"COUNT sku={target}",
-            "SELECT COUNT(*) AS n FROM variant_metrics WHERE brand=%s AND sku_shopify=%s",
-            (BRAND, target))
+        log(f"target sku = {target}")
+        rows, cast_s, _ = timed(cur, "COUNT (CAST varchar)",
+            f"SELECT COUNT(*) AS n FROM variant_metrics "
+            f"WHERE brand={VC} AND sku_shopify={VC}", (BRAND, target))
         if rows:
-            log(f"   -> sku {target} has {rows[0]['n']} rows; COUNT took {cnt_s:.1f}s")
-            log("      (fast COUNT + slow DELETE => locking/log; slow COUNT => scan)")
+            log(f"   -> {rows[0]['n']} rows, {cast_s:.1f}s  (should be ~instant)")
+        # The non-cast form is what was timing out; bounded by the 90s timeout.
+        _, raw_s, raw_exc = timed(cur, "COUNT (raw nvarchar)",
+            "SELECT COUNT(*) AS n FROM variant_metrics "
+            "WHERE brand=%s AND sku_shopify=%s", (BRAND, target))
+        if raw_exc is not None:
+            log(f"   -> raw nvarchar form FAILED/timed out ({raw_s:.1f}s) = the bug")
+        else:
+            log(f"   -> raw nvarchar form took {raw_s:.1f}s")
 
-    # -- 6) time a real DELETE, then ROLLBACK (non-destructive) -------------
-    section("6) TIMED DELETE TOP (100) then ROLLBACK (nothing is kept)")
+    # -- 6) time a real DELETE (CAST), then ROLLBACK (non-destructive) ------
+    section("6) TIMED DELETE TOP (100) with CAST, then ROLLBACK (nothing kept)")
     if target:
-        log(f"Deleting up to 100 rows for sku {target} inside a transaction...")
-        _, del_s, exc = timed(cur, f"DELETE TOP(100) sku={target}",
-            "DELETE TOP (100) FROM variant_metrics WHERE brand=%s AND sku_shopify=%s",
-            (BRAND, target))
+        _, del_s, exc = timed(cur, "DELETE TOP(100) (CAST)",
+            f"DELETE TOP (100) FROM variant_metrics "
+            f"WHERE brand={VC} AND sku_shopify={VC}", (BRAND, target))
         if exc is None:
             log(f"   DELETE affected {cur.rowcount} rows in {del_s:.1f}s")
         try:
@@ -198,12 +207,6 @@ def main():
             log("   ROLLED BACK - no rows were actually removed.")
         except Exception as e:
             log(f"   (rollback issue: {e})")
-        if exc is not None and "1222" in str(exc):
-            log("   -> Error 1222 = LOCK TIMEOUT: something is BLOCKING the delete "
-                "(a zombie transaction). That's the root cause.")
-        elif del_s >= QUERY_TIMEOUT - 5:
-            log("   -> Delete hit the query timeout with no lock error: the plan is "
-                "SCANNING (type mismatch) or the tier is throttled.")
     conn.close()
     section("DONE - paste this whole output back.")
 
