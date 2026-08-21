@@ -76,6 +76,15 @@ SQL_PASSWORD = HARDCODED_PASSWORD or os.environ.get("SQL_PASSWORD", "")
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 FETCH_CHUNK = 2000   # rows per fetchmany batch (for progress reporting)
 
+# pymssql sends Python str params as NVARCHAR, but [brand] is VARCHAR. The
+# comparison varchar_col = nvarchar_param converts the COLUMN (non-SARGable),
+# which throws away the index and scans the ENTIRE multi-brand table just to find
+# one brand - then the dedupe adds a ROW_NUMBER sort on top, so variant_metrics
+# times out. Casting the parameter to varchar keeps the brand filter an index
+# seek. (This is why it worked before the dedupe: a plain streaming scan finished
+# in time, but scan + big sort does not.)
+VC = "CAST(%s AS varchar(255))"
+
 
 # ===========================================================================
 # Central-time logging (every line is timestamped)
@@ -160,7 +169,7 @@ def fetch_table(cur, tbl: str, progress: bool):
 
     total = None
     if progress:
-        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = %s", (BRAND,))
+        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = {VC}", (BRAND,))
         total = cur.fetchone()[0]
         if MAX_ROWS_PER_TABLE:
             total = min(total, int(MAX_ROWS_PER_TABLE))
@@ -168,7 +177,7 @@ def fetch_table(cur, tbl: str, progress: bool):
     else:
         log(f"{tbl}: fetching...")
 
-    cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = %s ORDER BY 1", (BRAND,))
+    cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = {VC} ORDER BY 1", (BRAND,))
     cols = [d[0] for d in cur.description]
 
     if not progress:
@@ -203,7 +212,7 @@ def _fetch_deduped(cur, tbl, rule, top):
         f"  SELECT {collist}, ROW_NUMBER() OVER ("
         f"    PARTITION BY {partition} "
         f"    ORDER BY [{date_col}] ASC, [{pk}] ASC) AS _rn "
-        f"  FROM [dbo].[{tbl}] WHERE [brand] = %s) "
+        f"  FROM [dbo].[{tbl}] WHERE [brand] = {VC}) "
         f"SELECT {top}{collist} FROM ranked WHERE _rn = 1", (BRAND,))
     cols = [d[0] for d in cur.description]
     rows = cur.fetchall()
