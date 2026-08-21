@@ -47,6 +47,16 @@ TABLES = {
 # Tables that get 10%-increment progress logging (the big, slow ones).
 PROGRESS_TABLES = {"style_metrics", "variant_metrics"}
 
+# Force an index for the brand filter. variant_metrics holds ~24M rows across ALL
+# brands, and one brand is a tiny slice (AMO ~1.7%), so the optimizer scans the
+# whole 24M-row table to find them (a plain COUNT took 213s). Forcing the
+# brand-led index makes it SEEK the brand's rows instead (the same COUNT: 28s).
+# Only tables listed here get a hint; map table -> index name. Leave a table out
+# to let the optimizer choose. (These are the actual index names in the DB.)
+INDEX_HINTS = {
+    "variant_metrics": "ix_vm_brand_dt",   # (brand, captured_datetime)
+}
+
 WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
@@ -91,6 +101,12 @@ FETCH_CHUNK = 2000   # rows per fetchmany batch (for progress reporting)
 # seek. (This is why it worked before the dedupe: a plain streaming scan finished
 # in time, but scan + big sort does not.)
 VC = "CAST(%s AS varchar(255))"
+
+
+def hint(tbl: str) -> str:
+    """' WITH (INDEX(name))' for tables in INDEX_HINTS, else ''."""
+    idx = INDEX_HINTS.get(tbl.lower())
+    return f" WITH (INDEX({idx}))" if idx else ""
 
 
 # ===========================================================================
@@ -174,9 +190,10 @@ def fetch_table(cur, tbl: str, progress: bool):
     if rule:
         return _fetch_deduped(cur, tbl, rule, top)
 
+    h = hint(tbl)
     total = None
     if progress:
-        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}] WHERE brand = {VC}", (BRAND,))
+        cur.execute(f"SELECT COUNT(*) FROM [dbo].[{tbl}]{h} WHERE brand = {VC}", (BRAND,))
         total = cur.fetchone()[0]
         if MAX_ROWS_PER_TABLE:
             total = min(total, int(MAX_ROWS_PER_TABLE))
@@ -184,7 +201,10 @@ def fetch_table(cur, tbl: str, progress: bool):
     else:
         log(f"{tbl}: fetching...")
 
-    cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}] WHERE brand = {VC} ORDER BY 1", (BRAND,))
+    # No ORDER BY when a nonclustered index is forced - ordering by the pk would
+    # add a sort of every row on top of the seek. Output order isn't relied on.
+    order = "" if h else " ORDER BY 1"
+    cur.execute(f"SELECT {top}* FROM [dbo].[{tbl}]{h} WHERE brand = {VC}{order}", (BRAND,))
     cols = [d[0] for d in cur.description]
 
     if not progress:
@@ -219,7 +239,7 @@ def _fetch_deduped(cur, tbl, rule, top):
         f"  SELECT {collist}, ROW_NUMBER() OVER ("
         f"    PARTITION BY {partition} "
         f"    ORDER BY [{date_col}] ASC, [{pk}] ASC) AS _rn "
-        f"  FROM [dbo].[{tbl}] WHERE [brand] = {VC}) "
+        f"  FROM [dbo].[{tbl}]{hint(tbl)} WHERE [brand] = {VC}) "
         f"SELECT {top}{collist} FROM ranked WHERE _rn = 1", (BRAND,))
     cols = [d[0] for d in cur.description]
     rows = cur.fetchall()
