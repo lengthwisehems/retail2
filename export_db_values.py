@@ -32,7 +32,7 @@ from pathlib import Path
 # ===========================================================================
 # CONFIGURE
 # ===========================================================================
-BRAND = "TRIARCHY"
+BRAND = "AMO"
 
 # True  = include this table in the export
 # False = skip it
@@ -87,7 +87,7 @@ SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
 SQL_DATABASE = os.environ.get("SQL_DATABASE", "denim_analytics")
 HARDCODED_USERNAME = ""
 HARDCODED_PASSWORD = ""
-SQL_USERNAME = HARDCODED_USERNAME or os.environ.get("SQL_USERNAME", "")
+SQL_USERNAME = HARDCODED_USERNAME or os.environ.get("SQL_USERNAME", "carrieboromisa")
 SQL_PASSWORD = HARDCODED_PASSWORD or os.environ.get("SQL_PASSWORD", "")
 
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
