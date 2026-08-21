@@ -85,7 +85,7 @@ STYLE_REMOVE_TERMS = [
     "High Rise", "High-Rise", "Inch", "Inset", "Jean", "Jeans", "Kick", "Long", "Low Rise",
     "Low-Rise", "Mid Rise", "Mid-Rise", "Ms.", "Pant", "Pants", "Pleated", "Pocket", "Poplin",
     "Retro", "Rolled Hem", "Rolled Up", "stretch", "Slouchy", "Stacked Waist", "Stacked",
-    "Stoned", "Super", "The", "Trouser", "Ultra", "Utility", "V-High Rise", "Vintage", "with", "seams",
+    "Stoned", "Super", "The", "Trouser", "Ultra", "Utility", "V-High Rise", "Vintage", "with", "seams", "tall"
 ]
 
 
@@ -648,6 +648,12 @@ def determine_inseam_label_single(product_title: str, size: str, jean_style: str
     """
     if contains_any(product_title, ["petite"]) or (size or "").strip().upper().endswith("P"):
         return "Petite"
+
+    if contains_any(product_title, ["long"]) or (size or "").strip().upper().endswith("L"):
+        return "Long"
+
+    if contains_any(product_title, ["Tall"]) or (size or "").strip().upper().endswith("T"):
+        return "Long"
     try:
         n = float(inseam) if inseam else None
     except (TypeError, ValueError):
