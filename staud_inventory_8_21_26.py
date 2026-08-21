@@ -637,6 +637,21 @@ INSEAM_LABEL_WIDE_STYLES = {
 INSEAM_LABEL_NARROW_STYLES = {"Taper", "Tapered", "Skinny", "Straight from Knee"}
 
 
+def size_length_suffix(size: str) -> str:
+    """
+    The trailing LENGTH letter of a size, e.g. "30L" -> "L", "27P" -> "P",
+    "33.5 T" -> "T". Returns "" when there is no length suffix.
+
+    A digit is required immediately before the letter: STAUD also sells
+    alpha-sized denim (XS/S/M/L/XL), where a trailing "L" is the size
+    itself, not a length. Without that guard, size "L" and "XL" read as
+    Long -- which mislabelled the alpha-sized NOAH JEAN styles, whose
+    sizes all share one inseam.
+    """
+    m = re.fullmatch(r".*\d\s*([A-Za-z])", (size or "").strip())
+    return m.group(1).upper() if m else ""
+
+
 def determine_inseam_label_single(product_title: str, size: str, jean_style: str, inseam: str) -> str:
     """
     Inseam Label rule for styles with only ONE inseam option (no genuine
@@ -645,14 +660,16 @@ def determine_inseam_label_single(product_title: str, size: str, jean_style: str
       2. Wide-leg-family jean style + inseam >= 33 -> Long
       3. Narrow-family jean style + inseam >= 30 -> Long
       4. Otherwise -> Regular
+    Size suffixes are read via size_length_suffix(), so an alpha size like
+    "L"/"XL" is not mistaken for a length.
     """
-    if contains_any(product_title, ["petite"]) or (size or "").strip().upper().endswith("P"):
+    if contains_any(product_title, ["petite"]) or size_length_suffix(size) == "P":
         return "Petite"
 
-    if contains_any(product_title, ["long"]) or (size or "").strip().upper().endswith("L"):
+    if contains_any(product_title, ["long"]) or size_length_suffix(size) == "L":
         return "Long"
 
-    if contains_any(product_title, ["Tall"]) or (size or "").strip().upper().endswith("T"):
+    if contains_any(product_title, ["Tall"]) or size_length_suffix(size) == "T":
         return "Long"
     try:
         n = float(inseam) if inseam else None
@@ -801,7 +818,8 @@ def apply_multi_inseam_rules(rows: List[Dict[str, Any]]) -> None:
 
     for r in rows:
         original_product = r["Product"] or ""
-        size_upper = (r["Size"] or "").strip().upper()
+        # Length suffix only -- an alpha size ("L", "XL") is not a length.
+        size_suffix = size_length_suffix(r["Size"])
         ranked = ranked_by_style.get(r["Style Id"], [])
         multi_inseam = len(ranked) > 1  # Step 2
         check = multi_inseam_check(r["Style Id"], r["Inseam"]) if (r["Inseam"] or "").strip() else ""
@@ -812,9 +830,9 @@ def apply_multi_inseam_rules(rows: List[Dict[str, Any]]) -> None:
 
         # ---- Step 3A: Product descriptor from Size ----
         descriptor = ""
-        if size_upper.endswith("P"):
+        if size_suffix == "P":
             descriptor = "PETITE"
-        elif size_upper.endswith("L") or size_upper.endswith("T"):
+        elif size_suffix in {"L", "T"}:
             descriptor = "LONG"
 
         # ---- Step 3B: Product descriptor from multi_inseam rank ----
@@ -837,15 +855,15 @@ def apply_multi_inseam_rules(rows: List[Dict[str, Any]]) -> None:
         # ORIGINAL title or the size suffix (i.e. as evaluated before Step 3
         # rewrote Product) keeps whatever Inseam Label it has.
         locked = (
-            title_is_petite or size_upper.endswith("P")
-            or title_is_long or size_upper.endswith("L")
-            or title_is_tall or size_upper.endswith("T")
+            title_is_petite or size_suffix == "P"
+            or title_is_long or size_suffix == "L"
+            or title_is_tall or size_suffix == "T"
         )
         if locked:
             continue
 
         # Part 4A
-        if contains_any(original_product, ["regular"]) or size_upper.endswith("R"):
+        if contains_any(original_product, ["regular"]) or size_suffix == "R":
             r["Inseam Label"] = "Regular"
 
         # Part 4B -- rank within the style overrides jean style / inseam value
