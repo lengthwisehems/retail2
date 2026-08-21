@@ -51,11 +51,18 @@ WRITE_JSON = True    # the Claude-readable file
 WRITE_XLSX = True    # the Excel review file
 MAX_ROWS_PER_TABLE = None   # e.g. 5000 to cap; None = no cap (pull everything)
 
+# DO_DEDUPE master switch:
+#   True  -> collapse the metrics tables per DEDUPE_RULES below (one row per
+#            unique record, keeping the OLDEST captured_datetime).
+#   False -> keep ALL values; every row is exported, no deduping at all.
+DO_DEDUPE = True
+
 # The metrics tables keep a row per daily capture, which makes the exports too
 # large to share. Collapse each to one row per unique record: rows sharing the
 # same key are deduped down to the one with the OLDEST captured_datetime. The
 # key itself is NOT added to the output, and no other column changes.
-# Set DEDUPE_RULES = {} to export every row.
+# (Only used when DO_DEDUPE = True; set DEDUPE_RULES = {} to keep a table's rows
+# even while other tables dedupe.)
 #   variant_metrics -> V_UNIQUE_KEY
 #   style_metrics   -> S_UNIQUE_KEY
 DEDUPE_RULES = {
@@ -163,7 +170,7 @@ def fetch_table(cur, tbl: str, progress: bool):
     # Deduped tables are collapsed IN SQL (ROW_NUMBER per key, oldest
     # captured_datetime) so only the survivors cross the wire - the full history
     # never leaves the server, which avoids the huge-fetch timeout.
-    rule = DEDUPE_RULES.get(tbl.lower())
+    rule = DEDUPE_RULES.get(tbl.lower()) if DO_DEDUPE else None
     if rule:
         return _fetch_deduped(cur, tbl, rule, top)
 
