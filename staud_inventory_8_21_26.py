@@ -28,7 +28,7 @@ HOST_ROTATION = [
     "https://staud-clothing.myshopify.com",
 ]
 
-COLLECTION_HANDLES = ["staud-jeans", "sale"]
+COLLECTION_HANDLES = ["staud-jeans", "sale","denim"]
 GRAPHQL_ENDPOINT = "https://staud-clothing.myshopify.com/api/unstable/graphql.json"
 GRAPHQL_TOKEN_ENV_VARS = [
     "X_SHOPIFY_STOREFRONT_ACCESS_TOKEN",
@@ -39,21 +39,36 @@ GRAPHQL_TOKEN_ENV_VARS = [
 HARDCODED_TOKENS = ["ff6b027455fec0e6fcaad09c69088b1e"]
 
 FILTER_HANDLE_SUBSTRINGS = [
-    "dress", "top", "sweater", "jacket", "shoe", "heel", "sandal", "ankle-boot",
+    "dress", "sweater", "jacket", "shoe", "heel", "sandal", "ankle-boot",
     "over-the-knee-boot", "platform", "pump", "wedge", "sling-back", "pullover",
     "romper", "bag", "blazer", "bodysuit", "capri", "carryall", "carry-all", "coat",
     "combat-boot", "skirt", "accessories", "rompers", "shorts", "ballet-flat", "hat",
-    "scarf", "scrunchie", "tank", "tee", "thong", "unitard",
+    "scarf", "scrunchie", "tank", "tee", "thong", "unitard", "culotte","short","vest","shirt",
+    "Bermuda", "Bermudas", "Blazer", "Blazers", "Blouse", "Blouses", "Bodysuit", "Bodysuits",
+    "Button-Up", "Capri", "Cardigan", "Cardigans", "Coat", "Coats", "Corset", "Corsets", "Crop-Top", 
+    "Crop-Tops", "croptop", "Denim-Short", "Denimshort", "Donation", "Dress", "Dresses",
+    "Handbag", "Heel", "Heels", "Hoodie", "Hoodies", "Jacket", "Jackets", "Jogger-Short", "Joggershort", "Jort", 
+    "Jumpsuit", "Jumpsuits", "Neck", "Onepiece", "One-Piece", "One-Pieces", "Outerwear", "Pant-Suit", "Pantsuits", 
+    "Purse", "Romper", "Rompers", "Sandel", "Sandle", "Shacket", "Shipping", "Shipping-Protection", "Shirt", "Shirts", 
+    "Shoe", "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Sleeve", "Sleeves", "Suit", "Suits", "Sweater", "Sweaters", "Sweatpant", 
+    "Sweatpants", "Sweatshirt", "Sweatshirts", "Swim", "TShirt", "T-Shirts", "Tank", "Tank-Tops", "Tee", "Tees", "Tops", "Tote",
 ]
-FILTER_TITLE_WORDS = {"short", "skirt", "capri", "romper", "jacket"}
+FILTER_TITLE_WORDS = {"short", "skirt", "capri", "romper", "jacket", "culotte","shirt","vest"}
 ALLOWED_PRODUCT_TYPE = "denim"
 FILTER_PRODUCT_TYPE_WORDS = {
-    "dresses", "tops", "sweaters", "jackets", "fashion core handbags", "shoes",
-    "fashion handbags", "pants", "core handbags", "skirts", "accessories", "rompers",
-    "shorts", "sweater",
+    "Accessories", "Accessory", "Bermuda", "Bermudas", "Blazer", "Blazers", "Blouse", "Blouses", "Bodysuit", "Bodysuits", 
+    "Button Up", "Button-Up", "Capri", "Cardigan", "Cardigans", "Clothing Top", "Clothing Tops", "Coat", "Coats", "Coats & Jackets", 
+    "Core Handbags", "Corset", "Corsets", "Crop Top", "Crop Tops", "Denim Short", "Denim Shorts", "Donation", "Dress", "Dresses", 
+    "Fashion Core Handbag", "Fashion Core Handbags", "Fashion Handbag", "Fashion Handbags", "Gift Wrap", "Goodies Accessories", 
+    "Goodies Accessory", "Handbag", "Heel", "Heels", "Hoodie", "Hoodies", "Jacket", "Jackets", "Jogger Short", "Jogger Shorts", "Jort", 
+    "Jumpsuit", "Jumpsuits", "Neck", "One Piece", "One Pieces", "One-Piece", "One-Pieces", "Outerwear", "Pant Suit", "Pant Suits", 
+    "Purse", "Romper", "Rompers", "Sandel", "Sandle", "Shacket", "Shipping", "Shipping Protection", "Shirt", "Shirts", "Shirts & Tops", 
+    "Shoe", "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Sleeve", "Sleeves", "Suit", "Suits", "Sweat", "Sweater", "Sweaters", "Sweatpant", 
+    "Sweatpants", "Sweats", "Sweatshirt", "Sweatshirts", "Swim", "T Shirt", "T Shirts", "Tank", "Tank Tops", "Tee", "Tees", "Top", "Tops", "Tote"
 }
 
 STYLE_REMOVE_TERMS = [
+    # Original list (kept — none of these conflict with the new spec below)
     "Accent Hardware", "Beaded", "Corduroy", "Cuff", "Cuffed", "Darted", "Destroyed", "Distressed",
     "Flap Pocket", "Flap", "Frayed Seam", "Front Yoke", "w/ Slit Hem", "Leather", "Lightweight",
     "low and loose", "patch", "petite", "Pintucked", "Raw Hem", "Seam", "Seamed Front Yoke",
@@ -62,14 +77,39 @@ STYLE_REMOVE_TERMS = [
     "W/Flap", "Welt Pocket", "With Cuff", "With Frayed Seam", "Zipper", "BELTED", "CROP", "CUTOFF",
     "FLAG", "FLIP", "KRYSTAL", "CRYSTAL", "PANEL", "PLAID", "RENAISSANCE", "RINSE", "RIPPED",
     "SADDLE", "SEQUIN", "SOTT", "SPARK", "SPARKLE", "SPLICED", "STUDDED", "TRASHED", "WAX",
-    "COATED", "FRONTIER", "LO", "SELVEDGE", "CRUSHED", "REPAIR", "SLICE", "PLUS", "ANKLE",
+    "COATED", "FRONTIER", "LO", "SELVEDGE", "CRUSHED", "REPAIR", "SLICE", "PLUS", "ANKLE", "crease",
+    # 2026-08-03 spec Step 3 additions (union with the above; matching is
+    # already case-insensitive via re.IGNORECASE, so casing here is
+    # cosmetic only)
+    "Cargo", "Chap", "Constructed", "Cropped", "Cut-out", "Drawstring", "Extra", "Fit",
+    "High Rise", "High-Rise", "Inch", "Inset", "Jean", "Jeans", "Kick", "Long", "Low Rise",
+    "Low-Rise", "Mid Rise", "Mid-Rise", "Ms.", "Pant", "Pants", "Pleated", "Pocket", "Poplin",
+    "Retro", "Rolled Hem", "Rolled Up", "stretch", "Slouchy", "Stacked Waist", "Stacked",
+    "Stoned", "Super", "The", "Trouser", "Ultra", "Utility", "V-High Rise", "Vintage", "with", "seams",
 ]
+
+
+def style_name(title: str) -> str:
+    """
+    Style Name derivation (2026-08-03 spec):
+      Step 1: everything before " | "
+      Step 2: "-" -> " " (e.g. "Wide-Leg" -> "Wide Leg")
+      Step 3: strip numbers, quotation marks, and all STYLE_REMOVE_TERMS
+    """
+    s = (title or "").split("|")[0]
+    s = s.replace("-", " ")
+    s = re.sub(r"\d+", " ", s)          # any numbers
+    s = s.replace('"', " ").replace("\u201c", " ").replace("\u201d", " ")  # quotation marks
+    for term in sorted(STYLE_REMOVE_TERMS, key=len, reverse=True):
+        s = re.sub(r"\b" + re.escape(term).replace(r"\ ", r"\s+") + r"\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.upper()
 
 CSV_HEADERS = [
     "Style Id", "Handle", "Published At", "Created At", "Product", "Style Name", "Product Type", "Tags", "Vendor",
     "Description", "Variant Title", "Color", "Size", "Rise", "Inseam", "Price", "Compare at Price",
     "Available for Sale", "Quantity Available", "Quantity of style", "SKU - Shopify", "SKU - Brand", "Barcode",
-    "Image URL", "SKU URL", "Jean Style", "Inseam Style", "Rise Label", "Color - Standardized", "Stretch",
+    "Image URL", "SKU URL", "Jean Style", "Inseam Style", "Inseam Label", "Rise Label", "Color - Standardized", "Stretch",
 ]
 
 GRAPHQL_COLLECTION_QUERY = """
@@ -457,14 +497,6 @@ def is_filtered(handle: str, title: str, product_type: str) -> bool:
     return False
 
 
-def style_name(title: str) -> str:
-    s = (title or "").split("|")[0]
-    for term in sorted(STYLE_REMOVE_TERMS, key=len, reverse=True):
-        s = re.sub(r"\b" + re.escape(term).replace(r"\ ", r"\s+") + r"\b", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s.upper()
-
-
 def parse_inseam(desc: str, option3: str) -> str:
     if option3:
         num = parse_number_with_fraction(option3)
@@ -591,6 +623,187 @@ def determine_inseam_style(title: str, handle: str, desc: str, tags: str, jean_s
     return ""
 
 
+# Jean Style groupings used by the Inseam Label rules. "Straight from
+# Knee/Thigh" and "Boyfriend" are included per the rule table even though
+# determine_jean_style() above doesn't currently produce them (it only
+# emits "Straight from Knee" and "Straight from Thigh" separately, and
+# never "Boyfriend") -- kept for forward-compatibility, effectively
+# unreachable today. "Taper" (table spelling) and "Tapered" (this
+# scraper's actual output) are both included defensively.
+INSEAM_LABEL_WIDE_STYLES = {
+    "Straight from Knee/Thigh", "Bootcut", "Barrel", "Wide Leg",
+    "Boyfriend", "Baggy", "Flare", "Straight from Thigh",
+}
+INSEAM_LABEL_NARROW_STYLES = {"Taper", "Tapered", "Skinny", "Straight from Knee"}
+
+
+def determine_inseam_label_single(product_title: str, size: str, jean_style: str, inseam: str) -> str:
+    """
+    Inseam Label rule for styles with only ONE inseam option (no genuine
+    Regular/Long split to detect). Per spec:
+      1. Product title contains "Petite", or size ends in "P" -> Petite
+      2. Wide-leg-family jean style + inseam >= 33 -> Long
+      3. Narrow-family jean style + inseam >= 30 -> Long
+      4. Otherwise -> Regular
+    """
+    if contains_any(product_title, ["petite"]) or (size or "").strip().upper().endswith("P"):
+        return "Petite"
+    try:
+        n = float(inseam) if inseam else None
+    except (TypeError, ValueError):
+        n = None
+    if n is not None:
+        if jean_style in INSEAM_LABEL_WIDE_STYLES and n >= 33:
+            return "Long"
+        if jean_style in INSEAM_LABEL_NARROW_STYLES and n >= 30:
+            return "Long"
+    return "Regular"
+
+
+def determine_inseam_label_multi(inseam_style: str, jean_style: str, inseam: str) -> str:
+    """
+    Inseam Label rule for styles with MULTIPLE distinct inseam options
+    (a genuine Regular/Long — or Petite/Regular/Long — split exists).
+    Returns "" (never guesses) when:
+      - inseam is missing/unparseable,
+      - jean_style isn't in either defined group, or
+      - the (inseam_style, jean_style-group) combination has no rule.
+        Narrow styles (Taper/Skinny/Straight from Knee) intentionally have
+        no "Ankle" row in the spec -- Carrie confirmed narrow styles should
+        only ever resolve to Cropped or Full Length, so this case is
+        expected to be unreachable in practice, not a gap to guess around.
+    """
+    try:
+        n = float(inseam) if inseam else None
+    except (TypeError, ValueError):
+        n = None
+    if n is None or not inseam_style:
+        return ""
+
+    if jean_style in INSEAM_LABEL_WIDE_STYLES:
+        if inseam_style == "Cropped":
+            if n <= 25: return "Petite"
+            if n <= 27: return "Regular"
+            return "Long"
+        if inseam_style == "Ankle":
+            if 25 < n < 28: return "Petite"
+            if 28 <= n < 30: return "Regular"
+            if n >= 30: return "Long"
+            return ""
+        if inseam_style == "Full Length":
+            if 28 <= n < 30: return "Petite"
+            if 30 <= n < 33: return "Regular"
+            if n >= 33: return "Long"
+            return ""
+        return ""
+
+    if jean_style in INSEAM_LABEL_NARROW_STYLES:
+        if inseam_style == "Cropped":
+            if n <= 26: return "Petite"
+            if n <= 27: return "Regular"
+            return "Long"
+        if inseam_style == "Full Length":
+            if 26 < n <= 27: return "Petite"
+            if 27 < n <= 29: return "Regular"
+            if n > 29: return "Long"
+            return ""
+        # Intentionally no "Ankle" rule for narrow styles -- see docstring.
+        return ""
+
+    return ""
+
+
+def apply_style_name_editing_rules(rows: List[Dict[str, Any]]) -> None:
+    """
+    Style Name editing rules, Step 4 (applied in order, 2026-08-03 spec).
+    Mutates `rows` in place.
+
+    Rule 1: consolidate near-duplicate Style Names -- e.g. the brand
+    slightly renamed a style over time so it no longer matches its
+    siblings. Within products sharing the same first Style-Name word,
+    if names disagree, adopt the MOST FREQUENT name for any product
+    whose Jean Style matches the dominant Jean Style of that most-
+    frequent name's group. Products with "MATERNITY" in the title are
+    exempt (their Style Name is never touched by this rule).
+
+    Rule 2: if a Style Name resolved to a single word:
+      a. look for other (post-Rule-1) Style Names starting with that
+         word whose Jean Style matches this product's -- if found,
+         adopt the most common such name;
+      b. else if no other Style Name starts with that word, append
+         the first word of this product's Jean Style;
+      c. else (Jean Style is blank) leave the single word as-is.
+      NOTE: if candidates exist in (a) but none share this product's
+      Jean Style, we leave the name as-is rather than falling through
+      to (b) -- the spec doesn't define that case, and guessing here
+      risked bolting an unrelated Jean Style word onto a real match
+      that just didn't clear the Jean Style bar.
+
+    Both rules operate once per PRODUCT (Style Id), then the resolved
+    name is propagated to every variant row of that product.
+    """
+    by_product_id: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_product_id[r["Style Id"]].append(r)
+    reps: Dict[str, Dict[str, Any]] = {pid: grp[0] for pid, grp in by_product_id.items()}
+
+    # Rule 1 — only considers MULTI-word names. Single-word names are
+    # Rule 2's job; if Rule 1 grouped by first word without this
+    # restriction, a genuine single-word style like "FELIX" would get
+    # swallowed into a merge with an unrelated "FELIX WIDE" simply for
+    # sharing a first word, before Rule 2 ever got a chance to run its
+    # own (different) single-word logic on it.
+    first_word_groups: Dict[str, List[str]] = defaultdict(list)
+    for pid, rep in reps.items():
+        sn = rep["Style Name"]
+        if sn and " " in sn:
+            first_word_groups[sn.split(" ")[0]].append(pid)
+
+    for fw, pids in first_word_groups.items():
+        names = [reps[pid]["Style Name"] for pid in pids]
+        if len(set(names)) <= 1:
+            continue  # already consistent, nothing to consolidate
+        most_common_name, _ = Counter(names).most_common(1)[0]
+        dominant_js_counts = Counter(
+            reps[pid]["Jean Style"] for pid in pids
+            if reps[pid]["Style Name"] == most_common_name and reps[pid]["Jean Style"]
+        )
+        dominant_js = dominant_js_counts.most_common(1)[0][0] if dominant_js_counts else None
+        for pid in pids:
+            rep = reps[pid]
+            if rep["Style Name"] == most_common_name:
+                continue
+            if "MATERNITY" in (rep["Product"] or "").upper():
+                continue
+            if dominant_js and rep["Jean Style"] == dominant_js:
+                rep["Style Name"] = most_common_name
+
+    # Rule 2 (recompute candidates AFTER Rule 1's consolidation)
+    all_names_after_rule1 = [rep["Style Name"] for rep in reps.values() if rep["Style Name"]]
+    for pid, rep in reps.items():
+        sn = (rep["Style Name"] or "").strip()
+        if not sn or " " in sn:
+            continue  # not a single word
+        candidates = [n for n in all_names_after_rule1 if n != sn and n.split(" ")[0] == sn]
+        if candidates:
+            candidate_pids = [p for p in reps
+                              if reps[p]["Style Name"] in candidates
+                              and reps[p]["Jean Style"] == rep["Jean Style"]]
+            if candidate_pids:
+                matched_names = Counter(reps[p]["Style Name"] for p in candidate_pids)
+                rep["Style Name"] = matched_names.most_common(1)[0][0]
+            # else: candidates exist but none share this Jean Style --
+            # leave as-is (see note above).
+        elif rep["Jean Style"]:
+            rep["Style Name"] = f"{sn} {rep['Jean Style'].split(' ')[0]}".upper()
+        # else: Jean Style blank -> leave the single word as-is.
+
+    for pid, grp in by_product_id.items():
+        resolved = reps[pid]["Style Name"]
+        for r in grp:
+            r["Style Name"] = resolved
+
+
 def determine_color_standardized(tags: str, color: str) -> str:
     t = normalize_text(f"{tags} {color}")
     if "animal print" in t or "leopard" in t or "snake" in t: return "Animal Print"
@@ -702,11 +915,14 @@ def main() -> None:
                 "SKU URL": product.get("onlineStoreUrl") or f"https://staud.clothing/products/{handle}",
                 "Jean Style": jean_style,
                 "Inseam Style": inseam_style,
+                "Inseam Label": "",  # computed later, after Inseam Style gaps are filled
                 "Rise Label": rise_label,
                 "Color - Standardized": determine_color_standardized(tags, option1),
                 "Stretch": determine_stretch(description),
             }
             rows.append(row)
+
+    apply_style_name_editing_rules(rows)
 
     # style-level infer for missing rise/inseam style
     by_style: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -728,6 +944,20 @@ def main() -> None:
         key = (r["Style Name"], r["Size"])
         if r["Rise"] and key not in by_style_size_rise:
             by_style_size_rise[key] = r["Rise"]
+
+    # Determine, per style, how many DISTINCT inseam values genuinely
+    # exist -- this decides which Inseam Label rule set applies (single-
+    # inseam styles use title/size/jean-style heuristics; multi-inseam
+    # styles use the Inseam Style + Inseam-value table).
+    style_inseam_values: Dict[str, set] = defaultdict(set)
+    for r in rows:
+        try:
+            v = float(r["Inseam"]) if r["Inseam"] else None
+        except (TypeError, ValueError):
+            v = None
+        if v is not None:
+            style_inseam_values[r["Style Name"]].add(v)
+
     for r in rows:
         if not r["Rise"]:
             r["Rise"] = by_style_size_rise.get((r["Style Name"], r["Size"]), "")
@@ -745,6 +975,10 @@ def main() -> None:
                     r["Inseam Style"] = "Ankle"
         if not r["Compare at Price"]:
             r["Compare at Price"] = r["Price"]
+        if len(style_inseam_values.get(r["Style Name"], set())) > 1:
+            r["Inseam Label"] = determine_inseam_label_multi(r["Inseam Style"], r["Jean Style"], r["Inseam"])
+        else:
+            r["Inseam Label"] = determine_inseam_label_single(r["Product"], r["Size"], r["Jean Style"], r["Inseam"])
 
     # dedupe
     deduped: List[Dict[str, Any]] = []
