@@ -221,29 +221,78 @@ def fetch_table(cur, tbl: str, progress: bool):
     return cols, rows
 
 
+DEDUPE_PAGE = 20000   # rows per keyset page in the streamed dedupe
+
+
+def _dedupe_key(row, key_idx):
+    """Build the group key the way SQL's case-insensitive collation would."""
+    out = []
+    for i in key_idx:
+        v = row[i]
+        if v is None:
+            out.append("")
+        elif isinstance(v, str):
+            out.append(v.strip().lower())
+        else:
+            out.append(str(v))
+    return tuple(out)
+
+
 def _fetch_deduped(cur, tbl, rule, top):
-    """Server-side dedupe: keep one row per key with the oldest date column."""
+    """Dedupe by STREAMING the brand's rows in bounded, index-seeking pages and
+    keeping one row per key IN PYTHON - the oldest captured_datetime.
+
+    Why not a server-side ROW_NUMBER: that must sort every one of the brand's
+    rows in tempdb, and for a big brand (millions of variant_metrics rows) the
+    sort alone blows the 600s query timeout even when the read is fast. Paging by
+    the (brand, captured_datetime, pk) index instead means each query is small
+    and fast, and because pages arrive in ascending captured_datetime order the
+    FIRST time we see a key is already its oldest row - so we just keep the first.
+    """
     key_cols, date_col = rule
-    # real column list, in order (so the output matches a plain SELECT *)
     cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
                 "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = 'dbo' "
                 "ORDER BY ORDINAL_POSITION", (tbl,))
     allcols = [r[0] for r in cur.fetchall()]
     pk = allcols[0]
     collist = ", ".join(f"[{c}]" for c in allcols)
-    partition = ", ".join(f"[{c}]" for c in key_cols)
-    log(f"{tbl}: fetching (deduped in SQL on {len(key_cols)}-col key, "
-        f"oldest {date_col})...")
-    cur.execute(
-        f"WITH ranked AS ("
-        f"  SELECT {collist}, ROW_NUMBER() OVER ("
-        f"    PARTITION BY {partition} "
-        f"    ORDER BY [{date_col}] ASC, [{pk}] ASC) AS _rn "
-        f"  FROM [dbo].[{tbl}]{hint(tbl)} WHERE [brand] = {VC}) "
-        f"SELECT {top}{collist} FROM ranked WHERE _rn = 1", (BRAND,))
-    cols = [d[0] for d in cur.description]
-    rows = cur.fetchall()
-    return cols, rows
+    key_idx = [allcols.index(c) for c in key_cols]
+    date_i = allcols.index(date_col)
+    pk_i = allcols.index(pk)
+    h = hint(tbl)
+    cap = int(MAX_ROWS_PER_TABLE) if MAX_ROWS_PER_TABLE else None
+    log(f"{tbl}: fetching (streamed dedupe on {len(key_cols)}-col key, "
+        f"oldest {date_col}, {DEDUPE_PAGE}-row pages)...")
+
+    survivors: dict = {}
+    last_dt = last_pk = None
+    pulled = 0
+    while True:
+        if last_dt is None:
+            where, params = f"[brand] = {VC}", [BRAND]
+        else:
+            where = (f"[brand] = {VC} AND ([{date_col}] > %s "
+                     f"OR ([{date_col}] = %s AND [{pk}] > %s))")
+            params = [BRAND, last_dt, last_dt, last_pk]
+        cur.execute(
+            f"SELECT TOP ({DEDUPE_PAGE}) {collist} FROM [dbo].[{tbl}]{h} "
+            f"WHERE {where} ORDER BY [{date_col}] ASC, [{pk}] ASC", params)
+        rows = cur.fetchall()
+        if not rows:
+            break
+        for row in rows:
+            survivors.setdefault(_dedupe_key(row, key_idx), row)
+        last_dt, last_pk = rows[-1][date_i], rows[-1][pk_i]
+        pulled += len(rows)
+        log(f"   {tbl}: streamed {pulled} rows, {len(survivors)} unique so far...")
+        if len(rows) < DEDUPE_PAGE:
+            break
+        if cap and len(survivors) >= cap:
+            break
+    result = list(survivors.values())
+    if cap:
+        result = result[:cap]
+    return allcols, result
 
 
 # ===========================================================================
