@@ -48,6 +48,19 @@ CONSTRUCTOR_EXTRA_PARAMS: Dict[str, str] = {}
 # in Constructor changes.
 ONLINE_LOCATION_NAME = "AG Jeans"
 
+# Constructor facets whose per-item value is not returned in item data. We
+# resolve them by querying the browse endpoint filtered to each facet value and
+# tagging the matching products (one request per value). Add/remove names here.
+CONSTRUCTOR_FACET_TAG_FIELDS = [
+    "sizeOption",
+    "gender",
+    "country_code_of_origin",
+    "cut",
+    "influencer",
+    "category",
+    "variants_availability",
+]
+
 # ---------------------------------------------------------------------------
 # GraphQL output ordering / skip rules
 # ---------------------------------------------------------------------------
@@ -100,12 +113,20 @@ CONSTRUCTOR_COLUMN_ORDER: Tuple[str, ...] = (
     "product.title.v3",
     "product.title.v4",
     "product.productType",
+    "product.category",
+    "product.gender",
+    "product.cut",
+    "product.influencer",
+    "product.country_code_of_origin",
+    "product.variants_availability",
+    "product.sizeOption",
     "product.sort",
     "product.labels",
     "product.matchedTerms",
     "product.tags_all",
     "product.description",
     "product.color",
+    "product.color_name",
     "product.rise",
     "product.closure",
     "product.onlineStoreUrl",
@@ -118,6 +139,7 @@ CONSTRUCTOR_COLUMN_ORDER: Tuple[str, ...] = (
     "variant.id",
     "variant.sku",
     "variant.size",
+    "variant.bottoms_size",
     "source",
     "product.material",
     "product.fabric",
@@ -617,6 +639,126 @@ def backfill_oos_constructor_rows(
     return constructor_rows
 
 
+def _constructor_facet_options(
+    session: requests.Session, handle: str
+) -> Dict[str, List[str]]:
+    """Return {facet_name: [option values]} including hidden facets."""
+    params = [
+        ("c", "cio-ui-plp-1.6.2"),
+        ("key", CONSTRUCTOR_API_KEY),
+        ("i", CONSTRUCTOR_CLIENT_ID),
+        ("s", CONSTRUCTOR_SESSION),
+        ("num_results_per_page", "1"),
+        ("fmt_options[show_hidden_facets]", "true"),
+    ]
+    resp = session.get(
+        f"{CONSTRUCTOR_BROWSE_ENDPOINT}/{handle}", params=params, timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    facets = (resp.json().get("response") or {}).get("facets") or []
+    out: Dict[str, List[str]] = {}
+    for facet in facets:
+        name = facet.get("name")
+        values = [o.get("value") for o in (facet.get("options") or []) if o.get("value") is not None]
+        if name:
+            out[name] = values
+    return out
+
+
+def fetch_constructor_facet_map(
+    session: requests.Session,
+    collection_url: str,
+    facet_names: Sequence[str],
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, str]]:
+    """Resolve normally-unexposed facet values per product by filtering the
+    browse endpoint to each facet value and recording the matching product ids.
+
+    Returns {product_id: {facet_name: "value1, value2"}}.
+    """
+    handle = collection_handle_from_url(collection_url)
+    if not handle:
+        return {}
+    try:
+        facet_options = _constructor_facet_options(session, handle)
+    except requests.RequestException as exc:
+        logger.warning("Facet options fetch failed for %s -> %s", handle, exc)
+        return {}
+
+    result: Dict[str, Dict[str, Set[str]]] = {}
+    base = [
+        ("c", "cio-ui-plp-1.6.2"),
+        ("key", CONSTRUCTOR_API_KEY),
+        ("i", CONSTRUCTOR_CLIENT_ID),
+        ("s", CONSTRUCTOR_SESSION),
+        ("num_results_per_page", "100"),
+        ("fmt_options[show_hidden_facets]", "true"),
+    ]
+    for facet in facet_names:
+        values = facet_options.get(facet) or []
+        for value in values:
+            page = 1
+            while True:
+                params = base + [("page", str(page)), (f"filters[{facet}]", value)]
+                try:
+                    resp = session.get(
+                        f"{CONSTRUCTOR_BROWSE_ENDPOINT}/{handle}",
+                        params=params,
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                except requests.RequestException as exc:
+                    logger.warning("Facet tag %s=%s failed -> %s", facet, value, exc)
+                    break
+                response = resp.json().get("response") or {}
+                results = response.get("results") or []
+                if not results:
+                    break
+                for item in results:
+                    pid = str((item.get("data") or {}).get("id") or "")
+                    if pid:
+                        result.setdefault(pid, {}).setdefault(facet, set()).add(str(value))
+                total = int(response.get("total_num_results") or 0)
+                if page * 100 >= total:
+                    break
+                page += 1
+        logger.info("Facet '%s': %s values tagged", facet, len(values))
+
+    # Flatten sets to comma-joined strings.
+    flat: Dict[str, Dict[str, str]] = {}
+    for pid, facets in result.items():
+        flat[pid] = {name: ", ".join(sorted(vals)) for name, vals in facets.items()}
+    return flat
+
+
+def enrich_constructor_rows(
+    constructor_rows: List[Dict[str, str]],
+    graphql_rows: List[Dict[str, str]],
+    facet_map: Dict[str, Dict[str, str]],
+) -> None:
+    """Add the requested facet-derived columns to each Constructor row:
+    color_name (from the GraphQL Color option, by handle), bottoms_size (the
+    variant's own size), and the filter-tagged facets (by product id)."""
+    # handle -> color name, from the GraphQL "Color" option (variant.option2).
+    handle_color: Dict[str, str] = {}
+    for g in graphql_rows:
+        handle = g.get("product.handle", "")
+        color = g.get("variant.option2", "")
+        if handle and color and handle not in handle_color:
+            handle_color[handle] = color
+
+    for row in constructor_rows:
+        handle = row.get("product.handle", "")
+        pid = str(row.get("product.id", ""))
+        row["product.color_name"] = handle_color.get(handle, "")
+        row["variant.bottoms_size"] = row.get("variant.size", "")
+        for facet, value in facet_map.get(pid, {}).items():
+            row[f"product.{facet}"] = value
+        # Ensure every requested facet column exists even when unmatched.
+        for facet in CONSTRUCTOR_FACET_TAG_FIELDS:
+            row.setdefault(f"product.{facet}", "")
+
+
 # ---------------------------------------------------------------------------
 # GraphQL (with introspection pass first)
 # ---------------------------------------------------------------------------
@@ -1075,6 +1217,15 @@ def main() -> None:
 
     # Constructor omits sold-out variants; re-add them from GraphQL.
     constructor_rows = backfill_oos_constructor_rows(constructor_rows, graphql_rows, logger)
+
+    # Resolve normally-unexposed facet fields (color_name, gender, category, ...)
+    # and add them as columns.
+    facet_map: Dict[str, Dict[str, str]] = {}
+    for collection_url in COLLECTION_URL:
+        facet_map.update(
+            fetch_constructor_facet_map(session, collection_url, CONSTRUCTOR_FACET_TAG_FIELDS, logger)
+        )
+    enrich_constructor_rows(constructor_rows, graphql_rows, facet_map)
 
     output = write_workbook(constructor_rows, graphql_rows, logger)
 
