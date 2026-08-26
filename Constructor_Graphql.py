@@ -114,9 +114,11 @@ CONSTRUCTOR_COLUMN_ORDER: Tuple[str, ...] = (
     "product.notifyBIS",
     "variant.quantityAvailable.Instore",
     "variant.quantityAvailable.Online",
+    "variant.available",
     "variant.id",
     "variant.sku",
     "variant.size",
+    "source",
     "product.material",
     "product.fabric",
     "product.mill",
@@ -538,6 +540,81 @@ def fetch_constructor_rows(session: requests.Session, logger: logging.Logger) ->
             logger.warning("Constructor fetch failed for %s -> %s", collection_url, exc)
     logger.info("Constructor rows collected: %s", len(all_rows))
     return all_rows
+
+
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def backfill_oos_constructor_rows(
+    constructor_rows: List[Dict[str, str]],
+    graphql_rows: List[Dict[str, str]],
+    logger: logging.Logger,
+) -> List[Dict[str, str]]:
+    """Constructor only indexes variants that are in stock at some location, so
+    sold-out variants never come back from its API. Re-add them from the
+    GraphQL rows already fetched this run: any variant that is out of stock
+    (quantityAvailable <= 0) or not available for sale and is missing from the
+    Constructor results. A variant absent from Constructor has no stock at any
+    location, so both inventory columns are 0.
+
+    Product-level Constructor enrichment (color, rise, fabric, ...) is reused by
+    handle when the product itself is still in Constructor; otherwise only the
+    fields GraphQL provides are populated. Every row is tagged via `source`.
+    """
+    existing_skus = {r.get("variant.sku", "") for r in constructor_rows if r.get("variant.sku")}
+
+    # Product-level Constructor template per handle (drop variant-level fields).
+    templates: Dict[str, Dict[str, str]] = {}
+    for r in constructor_rows:
+        handle = r.get("product.handle", "")
+        if handle and handle not in templates:
+            templates[handle] = {k: v for k, v in r.items() if not k.startswith("variant.")}
+
+    # Tag native rows and give them an availability flag.
+    for r in constructor_rows:
+        r.setdefault("source", "constructor")
+        if "variant.available" not in r:
+            instore = _to_int(r.get("variant.quantityAvailable.Instore")) or 0
+            online = _to_int(r.get("variant.quantityAvailable.Online")) or 0
+            r["variant.available"] = "True" if (instore + online) > 0 else "False"
+
+    added: List[Dict[str, str]] = []
+    seen_backfill: Set[str] = set()
+    for g in graphql_rows:
+        sku = g.get("variant.sku", "")
+        if not sku or sku in existing_skus or sku in seen_backfill:
+            continue
+        qty = _to_int(g.get("variant.quantityAvailable"))
+        available_flag = str(g.get("variant.available", "")).strip().lower()
+        is_oos = (qty is not None and qty <= 0) or available_flag in {"false", "no", "0"}
+        if not is_oos:
+            continue
+
+        handle = g.get("product.handle", "")
+        row = dict(templates.get(handle, {}))
+        row.setdefault("product.handle", handle)
+        row.setdefault("product.id", g.get("product.id", ""))
+        row.setdefault("product.title", g.get("product.title", ""))
+        row.setdefault("product.onlineStoreUrl", g.get("product.onlineStoreUrl", ""))
+        row["variant.id"] = g.get("variant.id", "")
+        row["variant.sku"] = sku
+        row["variant.size"] = size_from_sku(sku) or g.get("variant.option1", "")
+        row["variant.price"] = g.get("variant.price", "")
+        row["variant.compare_at_price"] = g.get("variant.compare_at_price", "")
+        row["variant.quantityAvailable.Instore"] = "0"
+        row["variant.quantityAvailable.Online"] = "0"
+        row["variant.available"] = "False"
+        row["source"] = "graphql_oos"
+        added.append(row)
+        seen_backfill.add(sku)
+
+    constructor_rows.extend(added)
+    logger.info("Constructor OOS backfill from GraphQL: +%s rows", len(added))
+    return constructor_rows
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1072,9 @@ def main() -> None:
 
     constructor_rows = fetch_constructor_rows(session, logger)
     graphql_rows = fetch_graphql_rows(session, logger)
+
+    # Constructor omits sold-out variants; re-add them from GraphQL.
+    constructor_rows = backfill_oos_constructor_rows(constructor_rows, graphql_rows, logger)
 
     output = write_workbook(constructor_rows, graphql_rows, logger)
 
