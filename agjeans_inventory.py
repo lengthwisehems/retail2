@@ -149,6 +149,11 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "With Frayed Seam", "With", "Wool", "Zip", "Zipper",
 ]
 
+# Handle phrases that are their own style name, so the words inside them are
+# not treated as repeats of the same word appearing loose elsewhere in the
+# handle ("ex-boyfriend" is distinct from a later bare "boyfriend").
+PROTECTED_COMPOUNDS: List[str] = ["ex boyfriend"]
+
 # ---------------------------------------------------------------------------
 # Product build (PT1) keyword lists — Steps 5-10
 # ---------------------------------------------------------------------------
@@ -755,12 +760,30 @@ def clean_handle_for_style_name(handle: str) -> str:
         text = re.sub(r"\bboot\s+cut\b", "Bootcut", text, flags=re.IGNORECASE)
         text = re.sub(r"\bboot\b(?!cut)", "Bootcut", text, flags=re.IGNORECASE)
 
-    # Keep only the last occurrence of any repeated word
+    # Keep only the last occurrence of any repeated word, except that words
+    # belonging to a protected compound ("ex boyfriend" is its own style, not
+    # a repeat of "boyfriend") are always kept and suppress the loose copies.
     words = text.split()
+    protected_idx: set[int] = set()
+    protected_words: set[str] = set()
+    lowered = [w.lower() for w in words]
+    for compound in PROTECTED_COMPOUNDS:
+        parts = compound.lower().split()
+        for i in range(len(lowered) - len(parts) + 1):
+            if lowered[i:i + len(parts)] == parts:
+                for j in range(i, i + len(parts)):
+                    protected_idx.add(j)
+                    protected_words.add(lowered[j])
+
     keep = []
     for i, word in enumerate(words):
         key = word.lower()
-        if any(w.lower() == key for w in words[i + 1:]):
+        if i in protected_idx:
+            keep.append(word)
+            continue
+        if key in protected_words:
+            continue
+        if any(w == key for w in lowered[i + 1:]):
             continue
         keep.append(word)
     return re.sub(r"\s+", " ", " ".join(keep)).strip()
@@ -845,23 +868,23 @@ def jean_style_from_source(source: str, leg_opening, *, is_description=False) ->
 # ---------------------------------------------------------------------------
 # Inseam Label / Inseam Style
 # ---------------------------------------------------------------------------
-def determine_inseam_label(product_base: str, description: str, size: str,
-                           jean_style: str, inseam) -> str:
+def determine_inseam_label(product_base: str, description: str, size: str) -> str:
+    """Keyword-driven only.
+
+    The measurement rule ("Inseam is 30 or more") fills Inseam *Style*, not
+    Inseam Label — inseam alone cannot separate the two here, since Long and
+    Regular both occur at 32" and 33". Long comes from the Product or the
+    description wording; everything else is Regular.
+    """
     if re.search(r"\bpetite\b", product_base, re.IGNORECASE) or \
             re.fullmatch(r"\d+\s*P", (size or "").strip(), re.IGNORECASE):
         return "Petite"
     if re.search(r"\b(extended|long|tall)\b", product_base, re.IGNORECASE):
         return "Long"
     if contains_any(description, ["longer inseam", "extra long inseam",
+                                  "extra-long inseam",
                                   "ideal for taller frames", "longest inseam"]):
         return "Long"
-    ins = to_float(inseam)
-    if ins is not None:
-        if jean_style in NON_TAPER_STYLES and ins >= 33:
-            return "Long"
-        # Strictly greater than 30 — an inseam of exactly 30 stays Regular.
-        if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and ins > 30:
-            return "Long"
     return "Regular"
 
 
@@ -1377,8 +1400,7 @@ def main() -> None:
             instore_qty = sum(int(x.get("available") or 0)
                               for x in inventory_list if isinstance(x, dict))
 
-            inseam_label = determine_inseam_label(product_base, description,
-                                                  size, jean_style, inseam)
+            inseam_label = determine_inseam_label(product_base, description, size)
             color_std = classify_color_standardized(color, description, tags)
             color_simple = classify_color_simplified(color_std, description, tags)
 
