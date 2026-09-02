@@ -119,7 +119,7 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
     "Frontier", "Graffitimetalik", "Hardware", "Heel", "Hem", "Heyday",
     "High Rise", "high waist", "High Waisted", "High-Rise", "high-waist",
     "high-waisted", "Hover cuff", "Hover", "Inch", "Inset",
-    "Jean W/ Slit Hem", "Jean", "Krushed", "Krystal", "Leather",
+    "Jean W/ Slit Hem", "Jean", "Krushed", "Krystal", "Leather", "Leg",
     "Lightweight", "Lil", "Linen", "linnen", "Lo", "Long", "low and loose",
     "Low Rise", "Low Slung", "Low Waised", "low waist", "low waisted",
     "Low-Rise", "low-slung", "low-waist", "low-waisted", "Mid Rise",
@@ -659,25 +659,47 @@ def first_keyword(pt1: str, keywords: Sequence[str]) -> str:
 
 
 def all_keywords(pt1: str, keywords: Sequence[str]) -> str:
-    """Join every match, longest keywords first so 'Paneled' beats 'Panel'."""
-    found: List[str] = []
+    """Join every match in keyword-list order.
+
+    Matching runs longest-first so a longer keyword claims its span before a
+    shorter one nested inside it ('Paneled' wins over 'Panel'), but the output
+    is emitted in the order the keywords appear in the list, not the order they
+    appear in PT1 — so 'Slim Slouchy' stays in list order. Casing is taken from
+    PT1 so 'Wide Leg' keeps the source capitalization.
+    """
     used_spans: List[Tuple[int, int]] = []
+    hits: Dict[int, str] = {}
+    order = {kw: i for i, kw in enumerate(keywords)}
     for kw in sorted(keywords, key=len, reverse=True):
         pattern = r"\b" + re.escape(kw).replace(r"\ ", r"\s+") + r"\b"
         for m in re.finditer(pattern, pt1, flags=re.IGNORECASE):
             if any(m.start() < e and s < m.end() for s, e in used_spans):
                 continue
             used_spans.append((m.start(), m.end()))
-            found.append((m.start(), m.group(0)))
+            hits[order[kw]] = m.group(0)
             break
-    return " ".join(text for _, text in sorted(found))
+    return " ".join(hits[i] for i in sorted(hits))
 
 
-def build_product_title(title: str, v2: str, v3: str) -> Tuple[str, str, str]:
+def handle_descriptor(handle: str) -> str:
+    """Handle minus its trailing style code, as Title Case words."""
+    if not handle:
+        return ""
+    base = handle.rsplit("-", 1)[0] if "-" in handle else handle
+    return " ".join(w.capitalize() for w in base.replace("-", " ").split())
+
+
+def build_product_title(title: str, v2: str, v3: str,
+                        handle: str = "") -> Tuple[str, str, str]:
     """Steps 1-12. Returns (final title, PT1, jean-style keywords)."""
     title_clean = clean_title_step1(title)
     v2_clean = clean_title_v(v2)
     v3_clean = clean_title_v(v3)
+    if not v2_clean and not v3_clean:
+        # No Constructor record for this handle — fall back to the handle so
+        # the rise/style words still make it into PT1.
+        v3_clean = title_clean
+        v2_clean = clean_title_v(handle_descriptor(handle))
     pt1 = build_pt1(title_clean, v2_clean, v3_clean)
 
     rise_kw = first_keyword(pt1, PT_RISE_KEYWORDS)
@@ -837,7 +859,8 @@ def determine_inseam_label(product_base: str, description: str, size: str,
     if ins is not None:
         if jean_style in NON_TAPER_STYLES and ins >= 33:
             return "Long"
-        if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and ins >= 30:
+        # Strictly greater than 30 — an inseam of exactly 30 stays Regular.
+        if jean_style in {"Skinny", "Tapered", "Straight from Knee"} and ins > 30:
             return "Long"
     return "Regular"
 
@@ -954,8 +977,11 @@ def tags_inseam_style(tags: str) -> str:
     return ""
 
 
-def determine_rise_label(product_base: str, description: str) -> str:
-    for src in (product_base, description):
+def determine_rise_label(product_base: str, description: str,
+                         handle: str = "") -> str:
+    # Handle sits between Product and Description: when Constructor has no
+    # subtitle the rise only survives in the handle (e.g. sydney-*-high-rise-*).
+    for src in (product_base, handle.replace("-", " "), description):
         n = normalize_text(src)
         if not n:
             continue
@@ -1318,7 +1344,7 @@ def main() -> None:
         description = pdp.get("description") or graphql_desc
 
         product_base, _pt1, _jkw = build_product_title(product_title, title_v2,
-                                                       title_v3)
+                                                       title_v3, handle)
         style_name = build_style_name(handle)
         style_id = strip_gid(product.get("id") or "", "gid://shopify/Product/")
         image_url = pick_image_url(product, cdata)
@@ -1331,7 +1357,7 @@ def main() -> None:
         jean_style = (jean_style_from_source(product_base, leg_opening)
                       or jean_style_from_source(handle.replace("-", " "),
                                                 leg_opening))
-        rise_label = determine_rise_label(product_base, description)
+        rise_label = determine_rise_label(product_base, description, handle)
         hem_style = determine_hem_style(description, tags)
 
         for variant in ((product.get("variants") or {}).get("nodes") or []):
