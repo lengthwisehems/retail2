@@ -155,6 +155,44 @@ STYLE_NAME_REMOVE_PHRASES: List[str] = [
 PROTECTED_COMPOUNDS: List[str] = ["ex boyfriend"]
 
 # ---------------------------------------------------------------------------
+# Rise Label phrase lists — description (fallback 1) and tags (fallback 2)
+# ---------------------------------------------------------------------------
+RISE_DESC_ULTRA_LOW: List[str] = [
+    "Rise: Super Low", "Rise: Ultra Low", "Rise - Super Low",
+    "Rise - Ultra Low", "super low rise", "super low-rise", "ultra low rise",
+    "ultra low-rise", "super low waist", "super low-waist", "ultra low waist",
+    "ultra low-waist",
+]
+RISE_DESC_ULTRA_HIGH: List[str] = [
+    "Rise: Super High", "Rise: Ultra High", "Rise - Super High",
+    "Rise - Ultra High", "super high rise", "super high-rise",
+    "ultra high rise", "ultra high-rise", "super high waist",
+    "super high-waist", "ultra high waist", "ultra high-waist",
+]
+RISE_DESC_MID: List[str] = [
+    "Rise: Mid", "Rise - Mid", "Mid-Rise", "Mid Rise", "Mid waist",
+]
+RISE_DESC_LOW: List[str] = [
+    "Rise: Low", "Rise - Low", "Low-Rise", "Low Rise", "hip-hugging fit",
+    "sit comfortably on your hips", "low on the hip", "low on the waist",
+    "Low waist", "low slung",
+]
+RISE_DESC_HIGH: List[str] = [
+    "Rise: High", "Rise - High", "High-Rise", "High Rise", "High Waist",
+    "High-Waist", "High Waisted", "High-Waisted", "high on the hip",
+    "high on the waist",
+]
+RISE_TAG_RULES: List[Tuple[str, List[str]]] = [
+    ("Ultra Low",  ["Rise: Super Low", "Rise: Super-Low", "Rise: Ultra Low",
+                    "Rise: Ultra-Low"]),
+    ("Ultra High", ["Rise: Super High", "Rise: Super-High",
+                    "Rise: Ultra Rise", "Rise: Ultra-High"]),
+    ("High",       ["Rise: High", "Rise: High Rise", "Rise: High-Rise"]),
+    ("Mid",        ["Rise: Mid", "Rise: Mid Rise", "Rise: Mid-Rise"]),
+    ("Low",        ["Rise: Low", "Rise: Low Rise", "Rise: Low-Rise"]),
+]
+
+# ---------------------------------------------------------------------------
 # Product build (PT1) keyword lists — Steps 5-10
 # ---------------------------------------------------------------------------
 PT_RISE_KEYWORDS: List[str] = [
@@ -603,14 +641,21 @@ def clean_title_v(title: str) -> str:
     t = sanitize_text(title)
     if not t:
         return ""
-    if "-Rise Boot Cut" in t:
-        return re.sub(r"\s+", " ", t.replace("-Rise Boot Cut", " Rise Bootcut")).strip()
-    if "-Rise Boot" in t:
-        return re.sub(r"\s+", " ", t.replace("-Rise Boot", " Rise Bootcut")).strip()
-    if "Boot Cut" in t:
-        return re.sub(r"\s+", " ", t.replace("Boot Cut", "Bootcut")).strip()
-    if re.search(r"Boot", t) and not re.search(r"Bootcut", t):
-        return re.sub(r"\s+", " ", re.sub(r"Boot", "Bootcut", t)).strip()
+    # "Boot" must match as a whole word in rules 1-4, otherwise a subtitle that
+    # already reads "Low-Rise Bootcut" matches the "-Rise Boot" rule and becomes
+    # "Low Rise Bootcutcut", which no longer matches the Bootcut keyword search.
+    if re.search(r"-Rise\s+Boot\s+Cut\b", t, re.IGNORECASE):
+        return re.sub(r"\s+", " ", re.sub(r"-Rise\s+Boot\s+Cut\b", " Rise Bootcut",
+                                          t, flags=re.IGNORECASE)).strip()
+    if re.search(r"-Rise\s+Boot\b", t, re.IGNORECASE):
+        return re.sub(r"\s+", " ", re.sub(r"-Rise\s+Boot\b", " Rise Bootcut",
+                                          t, flags=re.IGNORECASE)).strip()
+    if re.search(r"\bBoot\s+Cut\b", t, re.IGNORECASE):
+        return re.sub(r"\s+", " ", re.sub(r"\bBoot\s+Cut\b", "Bootcut", t,
+                                          flags=re.IGNORECASE)).strip()
+    if re.search(r"\bBoot\b", t, re.IGNORECASE):
+        return re.sub(r"\s+", " ", re.sub(r"\bBoot\b", "Bootcut", t,
+                                          flags=re.IGNORECASE)).strip()
     if "AG-ed" in t:
         return re.sub(r"\s+", " ", t.replace("AG-ed", "AGed")).strip()
     if "-" in t:
@@ -888,7 +933,8 @@ def determine_inseam_label(product_base: str, description: str, size: str) -> st
     return "Regular"
 
 
-def measurement_inseam_style(jean_style: str, inseam, rise, label: str) -> str:
+def measurement_inseam_style(jean_style: str, inseam, rise, label: str,
+                             style_name: str = "") -> str:
     ins = to_float(inseam)
     if ins is None:
         return ""
@@ -924,6 +970,10 @@ def measurement_inseam_style(jean_style: str, inseam, rise, label: str) -> str:
             if ins < 29:
                 if ir is None:
                     return ""
+                # Mercer Barrel reaches full length earlier than the rest of
+                # the non-taper group at this inseam.
+                if style_name.strip().lower() == "mercer barrel" and ir >= 39:
+                    return "Full Length"
                 if ir < 37.5:
                     return "Cropped"
                 return "Ankle" if ir < 40 else "Full Length"
@@ -959,9 +1009,11 @@ def measurement_inseam_style(jean_style: str, inseam, rise, label: str) -> str:
                 return "Ankle" if ir < 38.75 else "Full Length"
             return "Full Length"
         if label == "Long":
+            if ins >= 30 or (ir is not None and ir >= 41):
+                return "Full Length"
             if ins < 27:
                 return "Cropped"
-            return "Ankle" if ins < 30 else "Full Length"
+            return "Ankle"
     return ""
 
 
@@ -1000,11 +1052,49 @@ def tags_inseam_style(tags: str) -> str:
     return ""
 
 
+def rise_label_from_description(description: str, rise) -> str:
+    """Fallback 1 — explicit description phrases."""
+    if contains_any(description, RISE_DESC_ULTRA_LOW):
+        return "Ultra Low"
+    if contains_any(description, RISE_DESC_ULTRA_HIGH):
+        return "Ultra High"
+    has_mid = contains_any(description, RISE_DESC_MID)
+    has_high = contains_any(description, RISE_DESC_HIGH)
+    if has_mid and has_high:
+        # Both present — defer to the measured Rise.
+        r = to_float(rise)
+        if r is not None:
+            return "High" if r >= 12 else "Mid"
+    if has_mid:
+        return "Mid"
+    if contains_any(description, RISE_DESC_LOW):
+        return "Low"
+    if has_high:
+        return "High"
+    return ""
+
+
+def rise_labels_from_tags(tags: str) -> List[str]:
+    """Fallback 2 — distinct rise labels present in the Rise: tags."""
+    found: List[str] = []
+    for raw in (tags or "").split(","):
+        entry = raw.strip()
+        if not entry.lower().startswith("rise"):
+            continue
+        n = normalize_text(entry)
+        for label, phrases in RISE_TAG_RULES:
+            if any(normalize_text(p) in n for p in phrases):
+                if label not in found:
+                    found.append(label)
+                break
+    return found
+
+
 def determine_rise_label(product_base: str, description: str,
-                         handle: str = "") -> str:
+                         handle: str = "", rise=None) -> str:
     # Handle sits between Product and Description: when Constructor has no
     # subtitle the rise only survives in the handle (e.g. sydney-*-high-rise-*).
-    for src in (product_base, handle.replace("-", " "), description):
+    for src in (product_base, handle.replace("-", " ")):
         n = normalize_text(src)
         if not n:
             continue
@@ -1014,7 +1104,7 @@ def determine_rise_label(product_base: str, description: str,
             return "Low"
         if "high rise" in n or re.search(r"(^|\s)high(\s|$)", n):
             return "High"
-    return ""
+    return rise_label_from_description(description, rise)
 
 
 def determine_stretch_from_description(description: str) -> str:
@@ -1297,7 +1387,8 @@ def apply_inseam_style(rows: List[dict]) -> None:
         if row["Inseam Style"]:
             continue
         style = measurement_inseam_style(row["Jean Style"], row["Inseam"],
-                                         row["Rise"], row["Inseam Label"])
+                                         row["Rise"], row["Inseam Label"],
+                                         row["Style Name"])
         if not style:
             style = keyword_inseam_style(row["Description"])
         if not style:
@@ -1328,6 +1419,60 @@ def apply_inseam_style(rows: List[dict]) -> None:
                 matches.append(sib["Inseam Style"])
         if matches:
             row["Inseam Style"] = Counter(matches).most_common(1)[0][0]
+
+
+def apply_rise_label_fallbacks(rows: List[dict]) -> None:
+    """Rise Label fallback 2 (tags) then fallback 3 (matching Style Name)."""
+    def closest_sibling_label(row: dict, within: Optional[float]) -> str:
+        mine = to_float(row["Rise"])
+        if mine is None:
+            return ""
+        best: Optional[Tuple[float, str]] = None
+        for other in rows:
+            if other is row or not other["Rise Label"]:
+                continue
+            if other["Style Name"] != row["Style Name"]:
+                continue
+            theirs = to_float(other["Rise"])
+            if theirs is None:
+                continue
+            gap = abs(theirs - mine)
+            if within is not None and gap > within:
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, other["Rise Label"])
+        return best[1] if best else ""
+
+    # Fallback 2 — tags
+    for row in rows:
+        if row["Rise Label"]:
+            continue
+        labels = rise_labels_from_tags(row["Tags"])
+        if not labels:
+            continue
+        if len(labels) == 1:
+            row["Rise Label"] = labels[0]
+            continue
+        # Multiple rise tags: use the same-Style-Name item whose Rise is
+        # closest, and only when it is within 1 inch.
+        row["Rise Label"] = closest_sibling_label(row, 1.0)
+
+    # Fallback 3 — matching Style Name
+    by_style: Dict[str, List[dict]] = {}
+    for row in rows:
+        if row["Style Name"] and row["Rise Label"]:
+            by_style.setdefault(row["Style Name"], []).append(row)
+    for row in rows:
+        if row["Rise Label"]:
+            continue
+        sibs = by_style.get(row["Style Name"]) or []
+        if not sibs:
+            continue
+        labels = {s["Rise Label"] for s in sibs}
+        if len(labels) == 1:
+            row["Rise Label"] = next(iter(labels))
+            continue
+        row["Rise Label"] = closest_sibling_label(row, None)
 
 
 def main() -> None:
@@ -1380,7 +1525,7 @@ def main() -> None:
         jean_style = (jean_style_from_source(product_base, leg_opening)
                       or jean_style_from_source(handle.replace("-", " "),
                                                 leg_opening))
-        rise_label = determine_rise_label(product_base, description, handle)
+        rise_label = determine_rise_label(product_base, description, handle, rise)
         hem_style = determine_hem_style(description, tags)
 
         for variant in ((product.get("variants") or {}).get("nodes") or []):
@@ -1471,16 +1616,7 @@ def main() -> None:
     apply_style_name_rules(rows)
     apply_inseam_style(rows)
 
-    # Rise Label fallback across rows sharing a Style Name
-    by_style_name: Dict[str, List[dict]] = {}
-    for row in rows:
-        by_style_name.setdefault(row["Style Name"], []).append(row)
-    for row in rows:
-        if not row["Rise Label"]:
-            peers = [r["Rise Label"] for r in by_style_name.get(row["Style Name"], [])
-                     if r.get("Rise Label")]
-            if peers:
-                row["Rise Label"] = Counter(peers).most_common(1)[0][0]
+    apply_rise_label_fallbacks(rows)
 
     # Fabric Source fallback within a style
     style_fabric: Dict[str, str] = {}
