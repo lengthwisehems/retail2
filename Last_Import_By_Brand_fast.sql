@@ -12,30 +12,27 @@
 -- forces a full clustered scan of all ~24M wide rows -> ~20 minutes.
 --
 -- HOW THIS IS FAST
---   1. Walk the DISTINCT brands by seeking the index brand-to-brand (a
---      recursive "index skip scan" - ~30 tiny seeks, not a 24M-row scan).
+--   1. Get the brand list from dbo.lookup, which is tiny compared to
+--      variant_metrics (every brand that has variant_metrics rows also has
+--      lookup rows). DISTINCT over that small table is instant. (We do NOT do
+--      SELECT DISTINCT brand FROM variant_metrics - that scans all ~24M rows.)
 --   2. For each brand, seek its single latest row via ix_vm_brand_dt
 --      (ORDER BY captured_datetime DESC -> backward index seek -> TOP 1) and
 --      read imported_at from that row.
--- Total work = ~30 brands x a couple of index seeks each = seconds.
+-- Total work = ~30 brands x one index seek each = seconds.
 --
--- NOTE ON imported_at: this reports the imported_at OF the newest-captured row
--- rather than a table-wide MAX(imported_at). For "did this brand's last scrape
--- import," those are the same thing - each import writes rows whose
--- captured_datetime and imported_at both advance together. If you ever need a
--- true independent MAX(imported_at), the clean fix is a supporting index:
---   CREATE NONCLUSTERED INDEX ix_vm_brand_imported
---       ON dbo.variant_metrics (brand, imported_at DESC);
--- after which the ORIGINAL query would also run in seconds.
+-- NOTES
+--  * imported_at reported here is the imported_at OF the newest-captured row,
+--    not a table-wide MAX(imported_at). For "did this brand's last scrape
+--    import," they're the same - each import advances both timestamps together.
+--    For a true independent MAX(imported_at), add a supporting index:
+--        CREATE NONCLUSTERED INDEX ix_vm_brand_imported
+--            ON dbo.variant_metrics (brand, imported_at DESC);
+--    after which even the ORIGINAL query runs in seconds.
+--  * CROSS APPLY drops any brand with zero variant_metrics rows. Swap to
+--    OUTER APPLY if you want such brands listed with NULLs.
 -- ═══════════════════════════════════════════════════════════════
 
-WITH brands AS (
-    SELECT MIN(brand) AS brand FROM dbo.variant_metrics
-    UNION ALL
-    SELECT (SELECT MIN(v.brand) FROM dbo.variant_metrics v WHERE v.brand > brands.brand)
-    FROM brands
-    WHERE brands.brand IS NOT NULL
-)
 SELECT
     b.brand,
     x.last_captured_datetime,
@@ -46,15 +43,13 @@ SELECT
         WHEN DATEDIFF(HOUR, x.last_imported_at, GETUTCDATE()) > 15 THEN 'CHECK - later than expected'
         ELSE 'OK'
     END                                                         AS status
-FROM brands b
+FROM (SELECT DISTINCT brand FROM dbo.lookup) b
 CROSS APPLY (
     SELECT TOP 1
         v.captured_datetime AS last_captured_datetime,
         v.imported_at       AS last_imported_at
-    FROM dbo.variant_metrics v
+    FROM dbo.variant_metrics AS v WITH (INDEX(ix_vm_brand_dt))
     WHERE v.brand = b.brand
     ORDER BY v.captured_datetime DESC          -- backward seek on ix_vm_brand_dt
 ) x
-WHERE b.brand IS NOT NULL
-ORDER BY x.last_imported_at ASC               -- oldest / most-concerning first
-OPTION (MAXRECURSION 1000);
+ORDER BY x.last_imported_at ASC;              -- oldest / most-concerning first
