@@ -1572,7 +1572,7 @@ def main() -> None:
                 "Tags": tags,
                 "Vendor": product.get("vendor") or "",
                 "Description": description,
-                "Variant Title": f"{product_title} - {variant.get('title') or ''}".strip(" -"),
+                "Variant Title": f"{style_name} - {variant.get('title') or ''}".strip(" -"),
                 "Color": color,
                 "Size": size,
                 "Rise": rise,
