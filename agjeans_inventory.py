@@ -1475,6 +1475,18 @@ def apply_rise_label_fallbacks(rows: List[dict]) -> None:
         row["Rise Label"] = closest_sibling_label(row, None)
 
 
+def apply_variant_titles(rows: List[dict]) -> None:
+    """Variant Title is Style Name + the variant's own title.
+
+    This has to run after apply_style_name_rules: a one-word Style Name only
+    gains its Jean Style word there, so building the title inside the product
+    loop would capture "Analeigh" rather than the final "Analeigh Straight".
+    """
+    for row in rows:
+        variant_title = row.pop("_variant_title", "")
+        row["Variant Title"] = f"{row['Style Name']} - {variant_title}".strip(" -")
+
+
 def main() -> None:
     configure_logging()
     session = SESSION
@@ -1572,7 +1584,9 @@ def main() -> None:
                 "Tags": tags,
                 "Vendor": product.get("vendor") or "",
                 "Description": description,
-                "Variant Title": f"{style_name} - {variant.get('title') or ''}".strip(" -"),
+                # Filled in post-processing from the final Style Name.
+                "Variant Title": "",
+                "_variant_title": variant.get("title") or "",
                 "Color": color,
                 "Size": size,
                 "Rise": rise,
@@ -1617,6 +1631,7 @@ def main() -> None:
     apply_inseam_style(rows)
 
     apply_rise_label_fallbacks(rows)
+    apply_variant_titles(rows)
 
     # Fabric Source fallback within a style
     style_fabric: Dict[str, str] = {}
