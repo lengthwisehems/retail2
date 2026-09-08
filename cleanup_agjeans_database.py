@@ -498,22 +498,48 @@ def apply_add(cur, conn, add_rows, ckpt):
         log("   add: already done (checkpoint)")
         return
     for r in add_rows:
-        rec = {"brand": BRAND, "is_manual_override": "1",
-               "source_file_name": "AGJEANS_cleanup_add"}
-        now = dt.datetime.now(_TZ).replace(tzinfo=None)
-        rec["captured_date"] = now; rec["captured_datetime"] = now
-        rec["style_id"] = s(r.get("style_id"))
-        rec["handle"] = s(r.get("handle"))
+        rec = {"brand": BRAND, "is_manual_override": "1"}
+        # 1) plain columns the row already carries (sku_url, hem_style, tags,
+        #    style_id, handle, product_name, ...) exactly as filled in H..AM
+        for col in TABLE_COLS["style_info"]:
+            v = r.get(col)
+            if not is_blank(v):
+                rec[col] = s(v)
+        rec["style_id"] = s(r.get("style_id")) or rec.get("style_id", "")
+        rec["handle"] = s(r.get("handle")) or rec.get("handle", "")
+        # 2) NEW literals override the plain values
         for k in list(r.keys()):
             if isinstance(k, str) and k.lower().startswith("new "):
                 col = re.sub(r"\s+", "_", k[4:].strip().lower())
                 if col in TABLE_COLS["style_info"] and not is_blank(r.get(k)):
                     rec[col] = s(r.get(k))
+        rec["is_manual_override"] = "1"
+        # 3) created_at / captured_date / captured_datetime / source_file_name
+        #    from the existing style_metrics row for this style_id (its newest
+        #    capture); fall back to now / a marker if the style isn't there.
+        sid = rec.get("style_id", "")
+        cur.execute(f"SELECT TOP 1 published_at, created_at, captured_date, "
+                    f"captured_datetime, source_file_name FROM style_metrics "
+                    f"WHERE brand={VC} AND style_id={VC} "
+                    f"ORDER BY captured_datetime DESC", (BRAND, sid))
+        sm = cur.fetchone()
+        now = dt.datetime.now(_TZ).replace(tzinfo=None)
+        if sm:
+            pub, cre, cdate, cdt, sfn = sm
+            rec.setdefault("created_at", s(pub) or s(cre))   # published_at -> created_at
+            rec["captured_date"] = cdate if cdate is not None else now
+            rec["captured_datetime"] = cdt if cdt is not None else now
+            rec["source_file_name"] = s(sfn) or "AGJEANS_cleanup_add"
+        else:
+            rec.setdefault("captured_date", now)
+            rec.setdefault("captured_datetime", now)
+            rec.setdefault("source_file_name", "AGJEANS_cleanup_add")
         cols = [c for c in rec if not is_blank(rec[c])]
         ph = ", ".join("%s" for _ in cols)
         cur.execute(f"INSERT INTO style_info ({', '.join('['+c+']' for c in cols)}) "
                     f"VALUES ({ph})", [rec[c] for c in cols])
-        log(f"   add: inserted style_info {rec.get('product_name')}")
+        log(f"   add: inserted style_info {rec.get('product_name')} "
+            f"(sku_url set: {'sku_url' in rec}, from style_metrics: {bool(sm)})")
     conn.commit()
     ckpt["add_done"] = True
     save_checkpoint(ckpt)
