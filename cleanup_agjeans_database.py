@@ -53,6 +53,7 @@ from typing import Dict, List, Optional, Tuple
 DRY_RUN = True
 DO_REMOVE      = True
 DO_ADD         = True
+DO_PRE_DEDUPE  = True    # collapse duplicate style_info rows per handle FIRST
 DO_CORRECTIONS = True
 DO_DEDUPE      = True
 DO_DERIVED     = True    # apply/preview "USE agjeans_inventory TO FILL" cells
@@ -167,7 +168,8 @@ def key_field_for(col: str) -> str:
 # Checkpoint
 # ===========================================================================
 def _empty_ckpt() -> dict:
-    return {"removals": {}, "add_done": False, "corrections": {}, "dedupe_done": {}}
+    return {"removals": {}, "add_done": False, "pre_dedupe_done": False,
+            "corrections": {}, "dedupe_done": {}}
 
 
 def load_checkpoint() -> dict:
@@ -545,6 +547,53 @@ def apply_add(cur, conn, add_rows, ckpt):
     save_checkpoint(ckpt)
 
 
+def compute_keep_pn(si_rows) -> Dict[str, str]:
+    """handle -> the ONE product_name to keep. Correcting several style_info rows
+    of a handle to the same product_name would violate uq_style_info_product
+    (brand, product_name, inseam_label), so we collapse each handle to one row
+    FIRST. Keep the already-correct row (blank NEW product_name); if every
+    duplicate has a NEW product_name, keep one. Verified: no handle has >1
+    distinct inseam_label, so this never merges legitimately different rows."""
+    byh: Dict[str, list] = {}
+    for r in si_rows:
+        if norm(r.get("ACTION")) in ("remove", "add"):
+            continue
+        h = norm(r.get("handle"))
+        if h:
+            byh.setdefault(h, []).append(r)
+    keep: Dict[str, str] = {}
+    for h, rows in byh.items():
+        if len(rows) < 2:
+            continue
+        blanks = [r for r in rows if is_blank(r.get("NEW product_name"))]
+        chosen = blanks[0] if blanks else rows[0]
+        pn = s(chosen.get("product_name"))
+        if pn:
+            keep[h] = pn
+    return keep
+
+
+def apply_pre_dedupe(cur, conn, keep_pn, ckpt):
+    if ckpt.get("pre_dedupe_done"):
+        log("   pre-dedupe: already done (checkpoint)")
+        return
+    total = 0
+    items = sorted(keep_pn.items())
+    for i, (h, pn) in enumerate(items, 1):
+        cur.execute(f"DELETE FROM style_info WHERE brand={VC} AND handle={VC} "
+                    f"AND product_name <> {VC}", (BRAND, h, pn))
+        rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+        total += rc
+        if i % COMMIT_EVERY == 0:
+            conn.commit()
+            log(f"   pre-dedupe: {i}/{len(items)} handles, {total} dup rows removed...")
+    conn.commit()
+    ckpt["pre_dedupe_done"] = True
+    save_checkpoint(ckpt)
+    log(f"   pre-dedupe: collapsed {len(items)} handles, removed {total} "
+        f"duplicate style_info rows")
+
+
 def apply_corrections(cur, conn, corrections, deriver, ckpt):
     done = ckpt.setdefault("corrections", {})
     start = int(done.get("_i", 0))
@@ -625,6 +674,9 @@ def main() -> None:
         log(f"   {t:16} {n}")
     log(f"Remove: {len(plan['remove_handles'])} handles + {len(plan['remove_skus'])} skus")
     log(f"Add: {len(plan['add_rows'])} style_info row(s)")
+    if DO_PRE_DEDUPE:
+        log(f"Pre-dedupe: {len(compute_keep_pn(plan['si_rows']))} handles collapse to "
+            f"one style_info row before correcting (avoids uq_style_info_product)")
 
     deriver = None
     if DO_DERIVED and n_der:
@@ -683,6 +735,9 @@ def main() -> None:
         if DO_ADD:
             log("Phase 2: add missing style_info...")
             apply_add(cur, conn, plan["add_rows"], ckpt)
+        if DO_PRE_DEDUPE:
+            log("Phase 2.5: collapse duplicate style_info rows per handle...")
+            apply_pre_dedupe(cur, conn, compute_keep_pn(plan["si_rows"]), ckpt)
         if DO_CORRECTIONS:
             log("Phase 3: corrections (value + key matched)...")
             apply_corrections(cur, conn, corrections, deriver, ckpt)
