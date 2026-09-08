@@ -594,42 +594,32 @@ def apply_pre_dedupe(cur, conn, keep_pn, ckpt):
         f"duplicate style_info rows")
 
 
-def _resolve_si_conflict(cur, changed_col, new_val, match_val, handle):
-    """Resolve a would-be uq_style_info_product collision before the update.
-
-    Returns (deleted, skip). For the row(s) about to be updated (by handle), find
-    any OTHER row that already holds the resulting (product_name, inseam_label):
-      * same style_id  -> a genuine re-listed duplicate; delete it, keep ours.
-      * different style_id -> two DISTINCT styles that merely map to the same
-        name; do NOT merge - return skip so the update is left off and the row
-        keeps its own (still-unique) name for you to rename.
+def _resolve_si_conflict(cur, changed_col, new_val, match_val, handle) -> bool:
+    """Return True if this update should be SKIPPED to avoid a
+    uq_style_info_product collision. A true duplicate is same style_id AND same
+    handle - and those are already collapsed by the per-handle pre-dedupe. So any
+    remaining conflict is with a DIFFERENT handle: a distinct style that merely
+    maps to the same (product_name, inseam_label). We do NOT merge those - skip
+    the update, leaving the row its own unique name to be reworked in the workbook.
     """
     other = "inseam_label" if changed_col == "product_name" else "product_name"
     mclause, mparams = _match_clause(changed_col, match_val)
-    cur.execute(f"SELECT [{other}], style_id FROM style_info "
+    cur.execute(f"SELECT DISTINCT [{other}] FROM style_info "
                 f"WHERE brand={VC} AND {mclause} AND handle={VC}",
                 [BRAND] + mparams + [handle])
-    zrows = cur.fetchall()
-    deleted = 0
-    skip = False
-    for oval, zsid in zrows:
+    for (oval,) in cur.fetchall():
         oclause, oparams = _match_clause(other, oval)
-        cur.execute(f"SELECT style_info_id, style_id FROM style_info "
+        cur.execute(f"SELECT TOP 1 1 FROM style_info "
                     f"WHERE brand={VC} AND [{changed_col}]={VC} AND {oclause} "
                     f"AND handle<>{VC}", [BRAND, s(new_val)] + oparams + [handle])
-        for pk, ysid in cur.fetchall():
-            if s(ysid) == s(zsid):
-                cur.execute("DELETE FROM style_info WHERE style_info_id=%s", (pk,))
-                deleted += 1
-            else:
-                skip = True
-    return deleted, skip
+        if cur.fetchone():
+            return True
+    return False
 
 
 def apply_corrections(cur, conn, corrections, deriver, ckpt):
     done = ckpt.setdefault("corrections", {})
     start = int(done.get("_i", 0))
-    merged = 0
     conflicts: List[tuple] = []
     changed = derived_used = derived_miss = 0
     for i, c in enumerate(corrections):
@@ -653,10 +643,8 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
             # SKIP the update when a DIFFERENT style_id already holds the target
             # (two distinct styles - don't merge; leave this row's unique name).
             if c.table == "style_info" and c.change_field in ("product_name", "inseam_label"):
-                d, skip = _resolve_si_conflict(cur, c.change_field, s(new_val),
-                                               c.match_val, c.key_val)
-                merged += d
-                if skip:
+                if _resolve_si_conflict(cur, c.change_field, s(new_val),
+                                        c.match_val, c.key_val):
                     conflicts.append((c.change_field, s(new_val), c.key_val))
                     continue
             sets = [f"[{c.change_field}] = {VC}"]
@@ -675,13 +663,13 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
             log(f"   corrections: {i+1}/{len(corrections)} ({changed} rows changed)...")
     conn.commit(); done["_i"] = len(corrections); save_checkpoint(ckpt)
     log(f"   corrections: {len(corrections)} spec cells - {changed} DB rows changed; "
-        f"derived used {derived_used}, unresolved {derived_miss}; "
-        f"merged {merged} same-style_id duplicate(s)")
+        f"derived used {derived_used}, unresolved {derived_miss}")
     if conflicts:
         uniq = sorted(set(conflicts))
-        log(f"   NOTE: {len(uniq)} style_info correction(s) SKIPPED - a DIFFERENT "
-            f"style_id already holds that (product_name, inseam_label). These are "
-            f"distinct styles; rename them in the workbook so they don't repeat:")
+        log(f"   NOTE: {len(uniq)} style_info correction(s) SKIPPED - another handle "
+            f"(a DISTINCT style) already holds that (product_name, inseam_label). "
+            f"These aren't duplicates (different handle); rework the name in the "
+            f"workbook so it doesn't repeat, then re-run:")
         for cf, nv, kv in uniq[:20]:
             log(f"      handle {kv} -> {cf}={nv!r} (left unchanged)")
 
