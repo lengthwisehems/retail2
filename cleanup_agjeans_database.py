@@ -594,9 +594,31 @@ def apply_pre_dedupe(cur, conn, keep_pn, ckpt):
         f"duplicate style_info rows")
 
 
+def _clear_si_conflict(cur, changed_col, new_val, match_val, handle) -> int:
+    """Delete any OTHER style_info row (a re-listed duplicate handle) that already
+    holds the (product_name, inseam_label) key this update is about to create,
+    keeping the row being updated. changed_col is the column being set; the other
+    key column keeps the updated row's current value."""
+    other = "inseam_label" if changed_col == "product_name" else "product_name"
+    if is_blank(match_val):
+        zc = f"(Z.[{changed_col}] IS NULL OR LTRIM(RTRIM(Z.[{changed_col}])) = '')"
+        zp = []
+    else:
+        zc = f"Z.[{changed_col}] = {VC}"
+        zp = [s(match_val)]
+    sql = (f"DELETE Y FROM style_info Y JOIN style_info Z ON Z.brand = Y.brand "
+           f"WHERE Y.brand = {VC} AND {zc} AND Z.handle = {VC} "
+           f"AND Y.[{changed_col}] = {VC} "
+           f"AND ISNULL(Y.[{other}], '') = ISNULL(Z.[{other}], '') "
+           f"AND Y.handle <> Z.handle")
+    cur.execute(sql, [BRAND] + zp + [handle, s(new_val)])
+    return cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+
+
 def apply_corrections(cur, conn, corrections, deriver, ckpt):
     done = ckpt.setdefault("corrections", {})
     start = int(done.get("_i", 0))
+    merged = 0
     changed = derived_used = derived_miss = 0
     for i, c in enumerate(corrections):
         if i < start:
@@ -614,6 +636,13 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
                 else:
                     derived_used += 1
         if not is_blank(new_val) and norm(new_val) != norm(c.match_val):
+            # style_info has a unique index (brand, product_name, inseam_label).
+            # A product_name/inseam_label change can land on a value ANOTHER row
+            # (a re-listed duplicate handle) already holds -> delete that
+            # conflicting row first, keeping the row we're about to update.
+            if c.table == "style_info" and c.change_field in ("product_name", "inseam_label"):
+                merged += _clear_si_conflict(cur, c.change_field, s(new_val),
+                                             c.match_val, c.key_val)
             sets = [f"[{c.change_field}] = {VC}"]
             params = [s(new_val)]
             if c.table == "style_info":
@@ -630,7 +659,8 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
             log(f"   corrections: {i+1}/{len(corrections)} ({changed} rows changed)...")
     conn.commit(); done["_i"] = len(corrections); save_checkpoint(ckpt)
     log(f"   corrections: {len(corrections)} spec cells - {changed} DB rows changed; "
-        f"derived used {derived_used}, unresolved {derived_miss}")
+        f"derived used {derived_used}, unresolved {derived_miss}; "
+        f"merged {merged} cross-handle duplicate style_info row(s)")
 
 
 def dedupe(cur, conn, table, key_cols, pk):
