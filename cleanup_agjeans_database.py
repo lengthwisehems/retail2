@@ -69,8 +69,36 @@ BRAND = "AGJEANS"
 
 CORRECTIONS_CSV = r"AG_corrections_not_using_ID_claude.csv"
 REVIEW_CSV      = r"AGJEANS_DB_Values_20260904_124324_Claude.csv"   # ACTION=REMOVE
-SCRAPER_PATH    = r"agjeans_inventory.py"     # pinned 74af9d5 (for DO_DERIVED)
-OUTPUT_DIR      = r"AGJEANS_Output"           # scraper CSVs (for the insert)
+# Stage 2 source of truth for "USE agjeans_inventory TO FILL" values and the
+# Farrah insert: a FRESH, CLEAN output CSV produced by running agjeans_inventory.py
+# @ 74af9d5. It must be a real scrape (needs the Constructor subtitle) - the
+# derived Product / Variant Title cannot be rebuilt from an old export offline,
+# only style_name/jean_style/etc. can. Point this at a folder of AGJEANS_*.csv
+# scraper outputs; the newest, richest row per handle/sku is used.
+DERIVE_DIR      = r"AGJEANS_clean_output"
+
+# field being changed -> column in the clean scraper output CSV
+DERIVE_COL = {
+    "product_name": "Product",
+    "style_name":   "Style Name",
+    "jean_style":   "Jean Style",
+    "inseam_label": "Inseam Label",
+    "inseam_style": "Inseam Style",
+    "variant_title": "Variant Title",
+}
+# style_info column <- clean-output column, for the one missing insert
+INSERT_MAP = {
+    "style_id": "Style Id", "product_name": "Product", "handle": "Handle",
+    "sku_url": "SKU URL", "color": "Color", "style_name": "Style Name",
+    "color_simplified": "Color - Simplified", "color_standardized": "Color - Standardized",
+    "product_type": "Product Type", "hem_style": "Hem Style",
+    "inseam_label": "Inseam Label", "inseam_style": "Inseam Style",
+    "jean_style": "Jean Style", "rise_label": "Rise Label", "stretch": "Stretch",
+    "fabric_source": "Fabric Source", "inseam": "Inseam", "knee": "Knee",
+    "leg_opening": "Leg Opening", "rise": "Rise", "description": "Description",
+    "image_url": "Image URL", "tags": "Tags", "vendor": "Vendor",
+    "created_at": "Published At",
+}
 
 # The single missing style_info row (given by you); its description/measurements
 # come from the AGJEANS_2025-10-09_00-19-47 output file when DO_INSERT_MISSING.
@@ -335,6 +363,12 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
     log(f"   corrections: {len(corrections)} spec rows done - {changed} DB rows "
         f"changed; {derived_skipped} derived cells "
         f"{'applied' if DO_DERIVED else 'skipped (DO_DERIVED off)'}")
+    if DO_DERIVED and deriver is not None and deriver.misses:
+        uniq = sorted(set((f, k) for f, _kf, k in deriver.misses))
+        log(f"   NOTE: {len(uniq)} derived cell(s) had no value in the clean output "
+            f"(discontinued handles?) and were left unchanged:")
+        for f, k in uniq[:20]:
+            log(f"      {f}: {k}")
 
 
 def _advance(cur, conn, ckpt, done, i, changed):
@@ -499,15 +533,127 @@ def main() -> None:
 
 
 # ===========================================================================
-# Stage 2 stubs (derivation + insert) - wired once validated
+# Stage 2: derivation source = a fresh, clean agjeans_inventory.py output CSV
 # ===========================================================================
-def build_deriver():
-    raise SystemExit("DO_DERIVED / DO_INSERT_MISSING are stage 2 and not wired yet. "
-                     "Run stage 1 first (leave both False).")
+class Deriver:
+    """Serves the correct value for a 'USE agjeans_inventory TO FILL' cell by
+    reading a fresh, clean scraper-output CSV (74af9d5). Style-level fields are
+    looked up by handle; variant_title by sku_shopify. The newest, richest row
+    per handle/sku wins when several output files are present."""
+
+    def __init__(self, by_handle: dict, by_sku: dict):
+        self.by_handle = by_handle
+        self.by_sku = by_sku
+        self.misses: List[Tuple[str, str, str]] = []
+
+    def get(self, field: str, key_val, key_field: str) -> str:
+        col = DERIVE_COL.get(field)
+        if not col:
+            return ""
+        if key_field == "sku_shopify":
+            row = self.by_sku.get(s(key_val))
+        else:
+            row = self.by_handle.get(norm(key_val))
+        if not row or is_blank(row.get(col)):
+            self.misses.append((field, key_field, s(key_val)))
+            return ""
+        return s(row.get(col))
+
+    def style_row(self, handle: str) -> Optional[dict]:
+        return self.by_handle.get(norm(handle))
+
+
+def build_deriver() -> Deriver:
+    import glob
+    d = resolve(DERIVE_DIR)
+    files = []
+    if os.path.isdir(d):
+        files = sorted(glob.glob(os.path.join(d, "*.csv")))
+    elif os.path.isfile(d):
+        files = [d]
+    if not files:
+        sys.exit(f"ERROR: no clean scraper-output CSV found at {d}. Run "
+                 f"agjeans_inventory.py (74af9d5) and put its output there.")
+    by_handle: Dict[str, Tuple[str, dict]] = {}
+    by_sku: Dict[str, dict] = {}
+    for f in files:
+        m = re.search(r"(\d{8}[_-]\d{6}|\d{4}-\d{2}-\d{2})", os.path.basename(f))
+        stamp = (m.group(1) if m else "0")
+        hdr, rows = _read_csv(f)
+        idx = {h.strip(): i for i, h in enumerate(hdr)}
+        need = ("Handle", "SKU - Shopify")
+        if not all(n in idx for n in need):
+            log(f"(skip {os.path.basename(f)}: not a scraper-output CSV)")
+            continue
+        for r in rows:
+            row = {h: (r[i] if i < len(r) else "") for h, i in idx.items()}
+            h = norm(row.get("Handle"))
+            if h:
+                prev = by_handle.get(h)
+                if (prev is None or stamp > prev[0]
+                        or (stamp == prev[0]
+                            and len(row.get("Description", "")) > len(prev[1].get("Description", "")))):
+                    by_handle[h] = (stamp, row)
+            sku = s(row.get("SKU - Shopify"))
+            if sku:
+                by_sku[sku] = row
+    log(f"Deriver: {len(by_handle)} handles, {len(by_sku)} skus from "
+        f"{len(files)} clean output file(s)")
+    # verify the output carries the derived columns (a legacy export won't)
+    sample = next(iter(by_handle.values()), (None, {}))[1]
+    missing_cols = [c for c in ("Inseam Style", "Color - Standardized")
+                    if c not in sample]
+    if missing_cols:
+        log("   WARNING: output CSV is missing columns " + ", ".join(missing_cols)
+            + " - it looks like a legacy export, not a fresh 74af9d5 run.")
+    return Deriver({h: r for h, (_, r) in by_handle.items()}, by_sku)
+
+
+def _num(v) -> str:
+    t = s(v).replace("$", "").replace(",", "").strip()
+    return t if re.fullmatch(r"-?\d+(\.\d+)?", t or "") else ""
+
+
+def _date(v) -> str:
+    t = s(v)
+    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(t, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return ""
 
 
 def insert_missing(cur, conn, deriver, ckpt):
-    raise SystemExit("insert_missing is stage 2 and not wired yet.")
+    if ckpt.setdefault("corrections", {}).get("_insert_done"):
+        log("   insert: already done (checkpoint)")
+        return
+    row = deriver.style_row(MISSING_STYLE["handle"])
+    if not row:
+        log(f"   insert: handle not in clean output ({MISSING_STYLE['handle']}) - "
+            f"cannot insert; add a fresh scrape that includes it. SKIPPED.")
+        return
+    rec = {"brand": BRAND, "source_file_name": "AGJEANS_cleanup_insert"}
+    now = dt.datetime.now(_TZ).replace(tzinfo=None)
+    rec["captured_date"] = now
+    rec["captured_datetime"] = now
+    for col, src in INSERT_MAP.items():
+        val = row.get(src, "")
+        if col in ("inseam", "knee", "leg_opening", "rise", "back_rise"):
+            val = _num(val)
+        elif col == "created_at":
+            val = _date(val)
+        if not is_blank(val):
+            rec[col] = s(val)
+    cols = [c for c in rec if not is_blank(rec[c])]
+    ph = ", ".join("%s" for _ in cols)
+    cur.execute(f"INSERT INTO style_info ({', '.join('['+c+']' for c in cols)}) "
+                f"VALUES ({ph})", [rec[c] for c in cols])
+    conn.commit()
+    ckpt["corrections"]["_insert_done"] = True
+    save_checkpoint(ckpt)
+    log(f"   insert: added style_info for {rec.get('product_name')} "
+        f"(style_name={rec.get('style_name')}, jean_style={rec.get('jean_style')})")
 
 
 if __name__ == "__main__":
