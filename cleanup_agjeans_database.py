@@ -1,55 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-AGJEANS database cleanup - like the AMO cleanup, but corrections are matched by
-VALUE + handle/sku (never by *_id).
+AGJEANS database cleanup - the AMO cleanup, but rows are matched by VALUE
+(current field value + handle / sku_shopify) instead of by *_id.
 
-Driven by AG_corrections_not_using_ID_claude.csv, whose columns read as a rule:
+SOURCE OF TRUTH: the review workbook AGJEANS_DB_Values_..._Claude.xlsx, one tab
+per table (style_info, lookup, style_metrics, variant_metrics). Each tab carries
+the current columns, an ACTION column, and "NEW <col>" columns:
 
-    On: <tables>   IF: <field> = <current value>   And IF: <key field> = <key>
-    Then Change: <field>  To: <new value | "USE agjeans_inventory TO FILL">
+    ACTION = KEEP / "Keep and Add To style_info"  -> apply the NEW cells
+    ACTION = REMOVE                               -> delete the row's item
+    ACTION = ADD                                  -> insert (Farrah style_info)
 
-So each row means, for every listed table that has those columns:
+For each "NEW <col>" cell:
+    blank                         -> leave the current value
+    a literal value               -> set it
+    "USE agjeans_inventory ..."   -> DERIVE it with agjeans_inventory.py's rules
+                                     (offline: build_product_title falls back to
+                                     the handle, exactly as the scraper does when
+                                     Constructor data is absent)
 
-    UPDATE <table>
-       SET <change field> = <new value>
+A correction becomes:
+    UPDATE <tab's table>
+       SET <col> = <new>, [is_manual_override = 1 for style_info]
      WHERE brand = 'AGJEANS'
-       AND <match field>  = <current value>     -- blank current => field IS blank
-       AND <key field>    = <key>               -- handle, or sku_shopify
+       AND <col> = <current value>     (blank current -> match where blank)
+       AND <handle | sku_shopify> = <the row's key>
+All string predicates are varchar-cast so they seek (variant_metrics is ~24M).
 
-Matching on the CURRENT value means a row already carrying the corrected value is
-left alone (idempotent), and only the intended rows change. All string compares
-are wrapped in CAST(... AS varchar) so the brand/handle/sku/value predicates use
-their indexes instead of scanning (variant_metrics is ~24M rows).
+PHASES: 1 REMOVE  2 ADD  3 CORRECT  4 DEDUPE (lookup & style_info, AMO keys).
+is_manual_override is set TRUE on every style_info row we correct or add.
 
-PHASES
-  1. REMOVE   the non-jean handles (from the review workbook's ACTION=REMOVE
-              rows) out of lookup / style_info / style_metrics, and their
-              variants out of variant_metrics (linked by sku_shopify).
-  2. CORRECT  apply the literal corrections. Rows whose "To" is
-              "USE agjeans_inventory TO FILL" are DERIVED - see DERIVE below;
-              until that stage is enabled they are counted and skipped, never
-              guessed.
-  3. DEDUPE   collapse duplicates the corrections create, keeping the oldest /
-              corrected row - same keys as AMO:
-                lookup      (brand+sku_shopify), (brand+sku_brand)
-                style_info  (brand+product_name+inseam_label),
-                            (brand+style_id+inseam_label)
-
-DERIVE (stage 2, DO_DERIVED): the 320 "USE agjeans_inventory TO FILL" cells and
-the one missing style_info insert (Farrah Skinny Ankle - WHITE) are computed with
-agjeans_inventory.py @ 74af9d5. Left off by default until validated.
-
-SAFETY: DRY_RUN=True prints the whole plan and writes nothing. Per-phase and
-per-N-row commits; a checkpoint lets a dropped run resume. Every log line is
-Central-time stamped. Ids/barcodes written as full-precision strings.
+SAFETY: DRY_RUN prints the plan (and a derivation preview) and writes nothing.
+Per-phase / per-N-row commits + checkpoint. Every log line is Central-time
+stamped. DO_DERIVED gates the "USE agjeans_inventory" cells so you can eyeball
+the derived values in a dry run before they are applied.
 """
 from __future__ import annotations
 
-import csv
+import importlib.util
 import json
 import os
 import re
 import sys
+import types
 import datetime as dt
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
@@ -59,54 +52,16 @@ from typing import Dict, List, Optional, Tuple
 # ===========================================================================
 DRY_RUN = True
 DO_REMOVE      = True
+DO_ADD         = True
 DO_CORRECTIONS = True
 DO_DEDUPE      = True
-DO_DERIVED     = False   # stage 2: apply "USE agjeans_inventory TO FILL" cells
-DO_INSERT_MISSING = False  # stage 2: insert the one missing Farrah style_info row
+DO_DERIVED     = True    # apply/preview "USE agjeans_inventory TO FILL" cells
 RESET_PROGRESS = False
 
 BRAND = "AGJEANS"
 
-CORRECTIONS_CSV = r"AG_corrections_not_using_ID_claude.csv"
-REVIEW_CSV      = r"AGJEANS_DB_Values_20260904_124324_Claude.csv"   # ACTION=REMOVE
-# Stage 2 source of truth for "USE agjeans_inventory TO FILL" values and the
-# Farrah insert: a FRESH, CLEAN output CSV produced by running agjeans_inventory.py
-# @ 74af9d5. It must be a real scrape (needs the Constructor subtitle) - the
-# derived Product / Variant Title cannot be rebuilt from an old export offline,
-# only style_name/jean_style/etc. can. Point this at a folder of AGJEANS_*.csv
-# scraper outputs; the newest, richest row per handle/sku is used.
-DERIVE_DIR      = r"AGJEANS_clean_output"
-
-# field being changed -> column in the clean scraper output CSV
-DERIVE_COL = {
-    "product_name": "Product",
-    "style_name":   "Style Name",
-    "jean_style":   "Jean Style",
-    "inseam_label": "Inseam Label",
-    "inseam_style": "Inseam Style",
-    "variant_title": "Variant Title",
-}
-# style_info column <- clean-output column, for the one missing insert
-INSERT_MAP = {
-    "style_id": "Style Id", "product_name": "Product", "handle": "Handle",
-    "sku_url": "SKU URL", "color": "Color", "style_name": "Style Name",
-    "color_simplified": "Color - Simplified", "color_standardized": "Color - Standardized",
-    "product_type": "Product Type", "hem_style": "Hem Style",
-    "inseam_label": "Inseam Label", "inseam_style": "Inseam Style",
-    "jean_style": "Jean Style", "rise_label": "Rise Label", "stretch": "Stretch",
-    "fabric_source": "Fabric Source", "inseam": "Inseam", "knee": "Knee",
-    "leg_opening": "Leg Opening", "rise": "Rise", "description": "Description",
-    "image_url": "Image URL", "tags": "Tags", "vendor": "Vendor",
-    "created_at": "Published At",
-}
-
-# The single missing style_info row (given by you); its description/measurements
-# come from the AGJEANS_2025-10-09_00-19-47 output file when DO_INSERT_MISSING.
-MISSING_STYLE = {
-    "style_id": "8522771202280",
-    "product_name": "Farrah Skinny Ankle - WHITE",
-    "handle": "farrah-skinny-ankle-mid-rise-skinny-ankle-cloud-soft-denim-hsd1777rhwht",
-}
+WORKBOOK     = r"AGJEANS_DB_Values_20260904_124324_Claude.xlsx"
+SCRAPER_PATH = r"agjeans_inventory.py"     # the 74af9d5 rules
 
 SQL_SERVER   = os.environ.get("SQL_SERVER",   "denim-sql.database.windows.net")
 SQL_DATABASE = os.environ.get("SQL_DATABASE", "denim_analytics")
@@ -119,30 +74,29 @@ COMMIT_EVERY = 2000
 DELETE_BATCH = 5000
 VC = "CAST(%s AS varchar(255))"
 
+TABS = ("style_info", "lookup", "style_metrics", "variant_metrics")
 PK = {"lookup": "lookup_id", "style_info": "style_info_id",
       "style_metrics": "style_metric_id", "variant_metrics": "variant_metric_id"}
 
-# "On:" text (lowercased) -> the DB tables it applies to.
-ON_TABLES = {
-    "lookup, style_info, and style_metrics": ["lookup", "style_info", "style_metrics"],
-    "style_info": ["style_info"],
-    "lookup and variant_metrics": ["lookup", "variant_metrics"],
-    "variant_metrics": ["variant_metrics"],
-}
+# fields whose NEW cell may say "USE agjeans_inventory TO FILL"
+DERIVED_FIELDS = {"product_name", "style_name", "jean_style", "rise_label",
+                  "inseam_label", "inseam_style", "variant_title"}
+# a change to one of these is a per-variant fix keyed by sku_shopify; else handle
+SKU_KEYED = {"variant_title", "quantity_available_online"}
 
-# Which columns each table actually has (so a correction only touches tables that
-# carry that column). Confirmed from the DB export.
+# columns each table actually has (a correction only touches tables that have it)
 TABLE_COLS = {
     "lookup": {"style_id", "product_name", "handle", "sku_url", "color",
                "style_name", "style_name_grouping", "variant_title", "size",
                "sku_shopify", "sku_brand", "barcode"},
-    "style_info": {"style_id", "product_name", "handle", "sku_url", "color",
-                   "style_name", "style_name_grouping", "color_simplified",
-                   "color_standardized", "gender", "hem_style", "inseam_label",
-                   "inseam_style", "jean_style", "product_line", "product_type",
-                   "rise_label", "stretch", "back_rise", "inseam", "knee",
-                   "leg_opening", "rise", "description", "image_url", "size_chart",
-                   "tags", "vendor", "country_produced", "fabric_source"},
+    "style_info": {"is_manual_override", "style_id", "product_name", "handle",
+                   "sku_url", "color", "style_name", "style_name_grouping",
+                   "color_simplified", "color_standardized", "gender", "hem_style",
+                   "inseam_label", "inseam_style", "jean_style", "product_line",
+                   "product_type", "rise_label", "stretch", "back_rise", "inseam",
+                   "knee", "leg_opening", "rise", "created_at", "description",
+                   "image_url", "size_chart", "tags", "vendor", "country_produced",
+                   "fabric_source"},
     "style_metrics": {"style_id", "product_name", "handle", "sku_url", "color",
                       "style_name", "style_name_grouping", "inseam", "inseam_label"},
     "variant_metrics": {"sku_shopify", "sku_brand", "barcode", "variant_title",
@@ -189,6 +143,10 @@ def s(v) -> str:
     return str(v).strip()
 
 
+def norm(v) -> str:
+    return re.sub(r"\s+", " ", s(v)).strip().lower()
+
+
 def is_blank(v) -> bool:
     return v is None or (isinstance(v, str) and v.strip() == "")
 
@@ -197,35 +155,19 @@ def is_use_scraper(v) -> bool:
     return isinstance(v, str) and "agjeans_inventory" in v.lower()
 
 
-def norm_field(name: str) -> str:
-    """Spec field label -> real DB column name."""
-    return re.sub(r"\s+", "_", s(name).strip().lower())
-
-
 def resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(SCRIPT_DIR, path)
 
 
-def _read_csv(path: str) -> Tuple[List[str], List[List[str]]]:
-    p = resolve(path)
-    if not os.path.exists(p):
-        sys.exit(f"ERROR: file not found: {p}")
-    # these workbooks are exported from Excel as cp1252 (has degree signs etc.)
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            with open(p, encoding=enc, newline="") as fh:
-                rows = list(csv.reader(fh))
-            return rows[0], [r for r in rows[1:] if any(c.strip() for c in r)]
-        except UnicodeDecodeError:
-            continue
-    sys.exit(f"ERROR: could not decode {p}")
+def key_field_for(col: str) -> str:
+    return "sku_shopify" if col in SKU_KEYED else "handle"
 
 
 # ===========================================================================
 # Checkpoint
 # ===========================================================================
 def _empty_ckpt() -> dict:
-    return {"removals": {}, "corrections": {}, "dedupe_done": {}}
+    return {"removals": {}, "add_done": False, "corrections": {}, "dedupe_done": {}}
 
 
 def load_checkpoint() -> dict:
@@ -259,128 +201,253 @@ def clear_checkpoint() -> None:
 
 
 # ===========================================================================
-# Load the correction spec
+# Workbook
+# ===========================================================================
+def load_tab(sheet: str) -> Tuple[List[str], List[dict]]:
+    from openpyxl import load_workbook
+    wb = load_workbook(resolve(WORKBOOK), data_only=True, read_only=True)
+    if sheet not in wb.sheetnames:
+        return [], []
+    ws = wb[sheet]
+    it = ws.iter_rows(values_only=True)
+    hdr = list(next(it))
+    cols = [h for h in hdr if h]
+    out = []
+    for r in it:
+        if all(v in (None, "") for v in r):
+            continue
+        out.append({hdr[i]: (r[i] if i < len(r) else None)
+                    for i in range(len(hdr)) if hdr[i]})
+    return cols, out
+
+
+# ===========================================================================
+# Derivation (agjeans_inventory.py rules, offline, handle fallback)
+# ===========================================================================
+def load_scraper():
+    """Import agjeans_inventory.py with requests/bs4 stubbed so it loads offline
+    (only the pure derivation functions are used)."""
+    p = resolve(SCRAPER_PATH)
+    if not os.path.exists(p):
+        sys.exit(f"ERROR: scraper not found at {p}")
+    req = types.ModuleType("requests")
+
+    class _S:
+        def __init__(self, *a, **k): self.headers = {}
+        def mount(self, *a, **k): pass
+    req.Session = lambda *a, **k: _S()
+    ad = types.ModuleType("requests.adapters")
+    ad.HTTPAdapter = type("H", (), {"__init__": lambda s, *a, **k: None})
+    req.adapters = ad
+    pk = types.ModuleType("requests.packages")
+    u3 = types.ModuleType("urllib3"); u3.disable_warnings = lambda *a, **k: None
+    uu = types.ModuleType("urllib3.util")
+    ur = types.ModuleType("urllib3.util.retry")
+    ur.Retry = type("R", (), {"__init__": lambda s, *a, **k: None})
+    uu.retry = ur; u3.util = uu; pk.urllib3 = u3; req.packages = pk
+    b = types.ModuleType("bs4"); b.BeautifulSoup = lambda *a, **k: None
+    for name, mod in (("requests", req), ("requests.adapters", ad),
+                      ("requests.packages", pk), ("requests.packages.urllib3", u3),
+                      ("urllib3", u3), ("urllib3.util", uu),
+                      ("urllib3.util.retry", ur), ("bs4", b)):
+        sys.modules.setdefault(name, mod)
+    spec = importlib.util.spec_from_file_location("agjeans_inventory", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+
+def _handle_title(handle: str) -> str:
+    """Title-ish text from the handle (drop the trailing style code), so
+    build_product_title keeps the leftover NAME instead of dropping it."""
+    base = handle.rsplit("-", 1)[0] if "-" in handle else handle
+    return base.replace("-", " ").strip()
+
+
+class Deriver:
+    """Runs agjeans_inventory.py's rules over the style_info rows, keyed by
+    handle, using the handle fallback for the product title (offline). Fills the
+    scraper work-row and runs its post-processing passes, then answers by handle
+    for style-level fields; variant_title is rebuilt as Style Name + the current
+    variant suffix."""
+
+    def __init__(self, g, si_rows: List[dict], sku2handle: Dict[str, str] = None):
+        self.g = g
+        self.by_handle: Dict[str, dict] = {}
+        self.sku2handle = sku2handle or {}
+        self._build(si_rows)
+
+    def _first_nonblank(self, rows, col):
+        for r in rows:
+            v = r.get(col)
+            if not is_blank(v):
+                return s(v)
+        return ""
+
+    def _build(self, si_rows):
+        g = self.g
+        # one representative (richest description) row per handle
+        rep: Dict[str, dict] = {}
+        for d in si_rows:
+            if norm(d.get("ACTION")) == "remove":
+                continue
+            h = norm(d.get("handle"))
+            if not h:
+                continue
+            prev = rep.get(h)
+            if prev is None or len(s(d.get("description"))) > len(s(prev.get("description"))):
+                rep[h] = d
+        work: List[dict] = []
+        handles: List[str] = []
+        for h, d in rep.items():
+            title = _handle_title(h)
+            desc = s(d.get("description"))
+            tags = s(d.get("tags"))
+            color = s(d.get("color"))
+            rise = s(d.get("rise")); knee = s(d.get("knee"))
+            inseam = s(d.get("inseam")); leg = s(d.get("leg_opening"))
+            size = s(d.get("size")) if "size" in d else ""
+            product_base = g.build_product_title(title, "", "", h)[0]
+            product_base = _titlecase(product_base)
+            style_name = g.build_style_name(h)
+            jean_style = (g.jean_style_from_source(product_base, leg)
+                          or g.jean_style_from_source(title, leg))
+            rise_label = g.determine_rise_label(product_base, desc, h, rise)
+            inseam_label = g.determine_inseam_label(product_base, desc, size)
+            product_display = f"{product_base} - {color.title()}" if color else product_base
+            row = {
+                "Handle": h, "Product": product_display, "Style Name": style_name,
+                "Jean Style": jean_style, "Inseam Style": "", "Rise Label": rise_label,
+                "Inseam Label": inseam_label, "Description": desc, "Tags": tags,
+                "Rise": rise, "Knee": knee, "Inseam": inseam, "Leg Opening": leg,
+                "_product_base": product_base, "_color": color,
+            }
+            work.append(row); handles.append(h)
+        # scraper post-processing passes (sibling/one-word rules)
+        for fn in ("apply_jean_style_by_style_name", "apply_style_name_rules",
+                   "apply_jean_style_by_style_name", "apply_inseam_style",
+                   "apply_rise_label_fallbacks"):
+            f = getattr(g, fn, None)
+            if f:
+                try:
+                    f(work)
+                except Exception as exc:
+                    log(f"(derivation pass {fn} skipped: {exc})")
+        for h, w in zip(handles, work):
+            # product_name = base + color (rebuild from FINAL nothing changes here)
+            self.by_handle[h] = {
+                "product_name": w["Product"],
+                "style_name": w["Style Name"],
+                "jean_style": w["Jean Style"],
+                "rise_label": w["Rise Label"],
+                "inseam_label": w["Inseam Label"],
+                "inseam_style": w["Inseam Style"],
+            }
+
+    def get(self, field: str, key_val, key_field: str, current) -> str:
+        if field == "variant_title":
+            # Variant Title = derived Style Name + the current variant suffix,
+            # mirroring the scraper's apply_variant_titles (Style Name + title).
+            h = norm(self.sku2handle.get(s(key_val), ""))
+            sn = self.by_handle.get(h, {}).get("style_name", "")
+            cur = s(current)
+            suffix = cur.split(" - ", 1)[1] if " - " in cur else cur
+            if not sn or not suffix:
+                return ""
+            return f"{sn} - {suffix}".strip(" -")
+        h = norm(key_val) if key_field == "handle" else None
+        if h and h in self.by_handle:
+            return self.by_handle[h].get(field, "")
+        return ""
+
+
+def _titlecase(t: str) -> str:
+    return " ".join(w if (w.isupper() and len(w) > 1) else w.capitalize()
+                    for w in t.split())
+
+
+# ===========================================================================
+# Build the plan from the workbook
 # ===========================================================================
 class Correction:
-    __slots__ = ("tables", "match_field", "match_val", "key_field", "key_val",
-                 "change_field", "new_val", "derive")
+    __slots__ = ("table", "change_field", "match_val", "key_field", "key_val",
+                 "new_val", "derive", "handle")
 
-    def __init__(self, tables, mf, mv, kf, kv, cf, nv):
-        self.tables = tables
-        self.match_field = mf
-        self.match_val = mv
-        self.key_field = kf
-        self.key_val = kv
-        self.change_field = cf
-        self.new_val = nv
-        self.derive = is_use_scraper(nv)
+    def __init__(self, table, cf, mv, kf, kv, nv, derive, handle):
+        self.table = table; self.change_field = cf; self.match_val = mv
+        self.key_field = kf; self.key_val = kv; self.new_val = nv
+        self.derive = derive; self.handle = handle
 
 
-def load_corrections() -> List[Correction]:
-    hdr, rows = _read_csv(CORRECTIONS_CSV)
-    out: List[Correction] = []
-    skipped = 0
-    for r in rows:
-        r = (r + [""] * 7)[:7]
-        on = s(r[0]).lower()
-        tables = ON_TABLES.get(on)
-        if not tables:
-            skipped += 1
+def build_plan():
+    corrections: List[Correction] = []
+    remove_handles = set()
+    remove_skus = set()
+    add_rows: List[dict] = []
+    si_rows_for_derive: List[dict] = []
+    sku2handle: Dict[str, str] = {}
+    for tab in TABS:
+        cols, rows = load_tab(tab)
+        if not rows:
             continue
-        out.append(Correction(
-            tables=tables,
-            mf=norm_field(r[1]), mv=r[2],           # keep raw current value
-            kf=norm_field(r[3]), kv=r[4],
-            cf=norm_field(r[5]), nv=r[6]))
-    if skipped:
-        log(f"(corrections: {skipped} rows had an unrecognized 'On:' and were skipped)")
-    return out
-
-
-def load_remove_handles() -> List[str]:
-    hdr, rows = _read_csv(REVIEW_CSV)
-    idx = {h.strip(): i for i, h in enumerate(hdr)}
-    hi, ai = idx.get("handle"), idx.get("ACTION")
-    if hi is None or ai is None:
-        log("(review workbook missing handle/ACTION - no removals)")
-        return []
-    handles = {s(r[hi]).lower() for r in rows
-               if len(r) > max(hi, ai) and "remove" in s(r[ai]).lower() and s(r[hi])}
-    return sorted(handles)
+        if tab == "style_info":
+            si_rows_for_derive = rows
+        if tab == "lookup":
+            for r in rows:
+                sk, h = s(r.get("sku_shopify")), s(r.get("handle"))
+                if sk and h:
+                    sku2handle[sk] = h
+        new_cols = [c for c in cols if isinstance(c, str) and c.lower().startswith("new ")]
+        for r in rows:
+            action = norm(r.get("ACTION"))
+            handle = s(r.get("handle"))
+            if action == "remove":
+                if tab == "variant_metrics":
+                    sk = s(r.get("sku_shopify"))
+                    if sk:
+                        remove_skus.add(sk)
+                elif handle:
+                    remove_handles.add(handle.lower())
+                continue
+            if action == "add":
+                if tab == "style_info":
+                    add_rows.append(r)
+                continue
+            # KEEP / "keep and add to style_info" -> apply NEW cells
+            for nc in new_cols:
+                col = nc[4:].strip()
+                col_db = re.sub(r"\s+", "_", col.lower())
+                if col_db not in TABLE_COLS.get(tab, set()):
+                    continue
+                nv = r.get(nc)
+                if is_blank(nv):
+                    continue
+                derive = is_use_scraper(nv)
+                if derive and col_db not in DERIVED_FIELDS:
+                    continue
+                if not derive and norm(nv) == norm(r.get(col_db)):
+                    continue    # NEW == current -> no change to make
+                kf = key_field_for(col_db)
+                kv = s(r.get(kf))
+                if not kv:
+                    continue
+                corrections.append(Correction(
+                    table=tab, cf=col_db, mv=r.get(col_db), kf=kf, kv=kv,
+                    nv=("" if derive else s(nv)), derive=derive, handle=handle))
+    return {"corrections": corrections, "remove_handles": sorted(remove_handles),
+            "remove_skus": sorted(remove_skus), "add_rows": add_rows,
+            "si_rows": si_rows_for_derive, "sku2handle": sku2handle}
 
 
 # ===========================================================================
-# Correction execution (value + key matched)
+# SQL helpers
 # ===========================================================================
 def _match_clause(field: str, val) -> Tuple[str, list]:
-    """SQL predicate + params for '<field> = <val>' with blank -> IS NULL/''."""
     if is_blank(val):
         return f"([{field}] IS NULL OR LTRIM(RTRIM([{field}])) = '')", []
     return f"[{field}] = {VC}", [s(val)]
 
 
-def apply_corrections(cur, conn, corrections, deriver, ckpt):
-    done = ckpt.setdefault("corrections", {})
-    total_ops = derived_skipped = changed = 0
-    start = int(done.get("_i", 0))
-    for i, c in enumerate(corrections):
-        if i < start:
-            continue
-        if c.derive:
-            if not DO_DERIVED or deriver is None:
-                derived_skipped += 1
-                _advance(cur, conn, ckpt, done, i, changed)
-                continue
-            new_val = deriver.get(c.change_field, c.key_val, c.key_field)
-            if is_blank(new_val):
-                derived_skipped += 1
-                _advance(cur, conn, ckpt, done, i, changed)
-                continue
-        else:
-            new_val = c.new_val
-        for tbl in c.tables:
-            cols = TABLE_COLS.get(tbl, set())
-            if c.change_field not in cols or c.match_field not in cols or c.key_field not in cols:
-                continue
-            mclause, mparams = _match_clause(c.match_field, c.match_val)
-            kclause, kparams = _match_clause(c.key_field, c.key_val)
-            sql = (f"UPDATE {tbl} SET [{c.change_field}] = {VC} "
-                   f"WHERE brand = {VC} AND {mclause} AND {kclause}")
-            params = [s(new_val), BRAND] + mparams + kparams
-            cur.execute(sql, params)
-            rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
-            changed += rc
-            total_ops += 1
-        if (i + 1) % COMMIT_EVERY == 0:
-            conn.commit()
-            done["_i"] = i + 1
-            save_checkpoint(ckpt)
-            log(f"   corrections: {i+1}/{len(corrections)} rows applied "
-                f"({changed} DB rows changed)...")
-    conn.commit()
-    done["_i"] = len(corrections)
-    save_checkpoint(ckpt)
-    log(f"   corrections: {len(corrections)} spec rows done - {changed} DB rows "
-        f"changed; {derived_skipped} derived cells "
-        f"{'applied' if DO_DERIVED else 'skipped (DO_DERIVED off)'}")
-    if DO_DERIVED and deriver is not None and deriver.misses:
-        uniq = sorted(set((f, k) for f, _kf, k in deriver.misses))
-        log(f"   NOTE: {len(uniq)} derived cell(s) had no value in the clean output "
-            f"(discontinued handles?) and were left unchanged:")
-        for f, k in uniq[:20]:
-            log(f"      {f}: {k}")
-
-
-def _advance(cur, conn, ckpt, done, i, changed):
-    if (i + 1) % COMMIT_EVERY == 0:
-        conn.commit()
-        done["_i"] = i + 1
-        save_checkpoint(ckpt)
-
-
-# ===========================================================================
-# Removals (whole handles, all tables)
-# ===========================================================================
 def _delete_each_value(cur, conn, table, col, values) -> int:
     total = 0
     for v in values:
@@ -388,30 +455,27 @@ def _delete_each_value(cur, conn, table, col, values) -> int:
             cur.execute(f"DELETE TOP ({DELETE_BATCH}) FROM {table} "
                         f"WHERE brand={VC} AND [{col}]={VC}", (BRAND, v))
             rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
-            conn.commit()
-            total += rc
+            conn.commit(); total += rc
             if rc < DELETE_BATCH:
                 break
     return total
 
 
-def apply_removals(cur, conn, handles, ckpt):
+# ===========================================================================
+# Phases
+# ===========================================================================
+def apply_removals(cur, conn, handles, skus, ckpt):
     done = ckpt.setdefault("removals", {})
-    if not handles:
-        log("   removals: none")
-        return
-    # variant_metrics has no handle column - resolve its variants via lookup FIRST
-    if not done.get("variant_metrics"):
-        skus = set()
+    if handles and not done.get("variant_metrics_by_handle"):
+        vm_skus = set(skus)
         for h in handles:
             cur.execute(f"SELECT sku_shopify FROM lookup WHERE brand={VC} AND handle={VC}",
                         (BRAND, h))
-            skus.update(s(r[0]) for r in cur.fetchall() if s(r[0]))
-        n = _delete_each_value(cur, conn, "variant_metrics", "sku_shopify", sorted(skus))
-        done["variant_metrics"] = True
+            vm_skus.update(s(r[0]) for r in cur.fetchall() if s(r[0]))
+        n = _delete_each_value(cur, conn, "variant_metrics", "sku_shopify", sorted(vm_skus))
+        done["variant_metrics_by_handle"] = True
         save_checkpoint(ckpt)
-        log(f"   variant_metrics: removed {n} rows for {len(skus)} skus "
-            f"of {len(handles)} handles (committed)")
+        log(f"   variant_metrics: removed {n} rows for {len(vm_skus)} skus (committed)")
     for tbl in ("lookup", "style_info", "style_metrics"):
         if done.get(tbl):
             continue
@@ -421,11 +485,69 @@ def apply_removals(cur, conn, handles, ckpt):
         log(f"   {tbl}: removed {n} rows for {len(handles)} handles (committed)")
 
 
-# ===========================================================================
-# Dedupe (keep oldest captured_datetime; blank key parts never merge)
-# ===========================================================================
-def norm(v) -> str:
-    return re.sub(r"\s+", " ", s(v)).strip().lower()
+def apply_add(cur, conn, add_rows, ckpt):
+    if ckpt.get("add_done"):
+        log("   add: already done (checkpoint)")
+        return
+    for r in add_rows:
+        rec = {"brand": BRAND, "is_manual_override": "1",
+               "source_file_name": "AGJEANS_cleanup_add"}
+        now = dt.datetime.now(_TZ).replace(tzinfo=None)
+        rec["captured_date"] = now; rec["captured_datetime"] = now
+        rec["style_id"] = s(r.get("style_id"))
+        rec["handle"] = s(r.get("handle"))
+        for k in list(r.keys()):
+            if isinstance(k, str) and k.lower().startswith("new "):
+                col = re.sub(r"\s+", "_", k[4:].strip().lower())
+                if col in TABLE_COLS["style_info"] and not is_blank(r.get(k)):
+                    rec[col] = s(r.get(k))
+        cols = [c for c in rec if not is_blank(rec[c])]
+        ph = ", ".join("%s" for _ in cols)
+        cur.execute(f"INSERT INTO style_info ({', '.join('['+c+']' for c in cols)}) "
+                    f"VALUES ({ph})", [rec[c] for c in cols])
+        log(f"   add: inserted style_info {rec.get('product_name')}")
+    conn.commit()
+    ckpt["add_done"] = True
+    save_checkpoint(ckpt)
+
+
+def apply_corrections(cur, conn, corrections, deriver, ckpt):
+    done = ckpt.setdefault("corrections", {})
+    start = int(done.get("_i", 0))
+    changed = derived_used = derived_miss = 0
+    for i, c in enumerate(corrections):
+        if i < start:
+            continue
+        new_val = c.new_val
+        if c.derive:
+            if deriver is None:
+                derived_miss += 1
+                new_val = None
+            else:
+                new_val = deriver.get(c.change_field, c.key_val, c.key_field, c.match_val)
+                if is_blank(new_val):
+                    derived_miss += 1
+                    new_val = None
+                else:
+                    derived_used += 1
+        if not is_blank(new_val) and norm(new_val) != norm(c.match_val):
+            sets = [f"[{c.change_field}] = {VC}"]
+            params = [s(new_val)]
+            if c.table == "style_info":
+                sets.append("[is_manual_override] = 1")
+            mclause, mparams = _match_clause(c.change_field, c.match_val)
+            kclause, kparams = _match_clause(c.key_field, c.key_val)
+            sql = (f"UPDATE {c.table} SET {', '.join(sets)} "
+                   f"WHERE brand = {VC} AND {mclause} AND {kclause}")
+            cur.execute(sql, params + [BRAND] + mparams + kparams)
+            rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+            changed += rc
+        if (i + 1) % COMMIT_EVERY == 0:
+            conn.commit(); done["_i"] = i + 1; save_checkpoint(ckpt)
+            log(f"   corrections: {i+1}/{len(corrections)} ({changed} rows changed)...")
+    conn.commit(); done["_i"] = len(corrections); save_checkpoint(ckpt)
+    log(f"   corrections: {len(corrections)} spec cells - {changed} DB rows changed; "
+        f"derived used {derived_used}, unresolved {derived_miss}")
 
 
 def dedupe(cur, conn, table, key_cols, pk):
@@ -441,9 +563,7 @@ def dedupe(cur, conn, table, key_cols, pk):
     for k, members in groups.items():
         if len(members) < 2:
             continue
-        # keep oldest captured_datetime (then lowest pk); delete the rest
         members.sort(key=lambda t: (t[1] is None, t[1], t[0]))
-        keep = members[0][0]
         for pkv, _ in members[1:]:
             cur.execute(f"DELETE FROM {table} WHERE {pk}=%s", (pkv,))
             deleted += 1
@@ -459,40 +579,56 @@ def main() -> None:
     log(f"AGJEANS DATABASE CLEANUP  ({'DRY RUN' if DRY_RUN else 'LIVE RUN'})")
     log("=" * 60)
 
-    corrections = load_corrections()
-    remove_handles = load_remove_handles() if DO_REMOVE else []
+    plan = build_plan()
+    corrections = plan["corrections"]
     n_lit = sum(1 for c in corrections if not c.derive)
     n_der = sum(1 for c in corrections if c.derive)
-    log(f"Corrections: {len(corrections)} spec rows ({n_lit} literal, {n_der} derived)")
-    per_on = {}
+    by_tab = {}
     for c in corrections:
-        per_on[tuple(c.tables)] = per_on.get(tuple(c.tables), 0) + 1
-    for tabs, n in per_on.items():
-        log(f"   -> {'+'.join(tabs):40} {n} rows")
-    log(f"Remove handles: {len(remove_handles)}"
-        + (": " + ", ".join(remove_handles) if remove_handles else ""))
-    log(f"Derived corrections: {n_der} "
-        f"({'WILL be applied' if DO_DERIVED else 'SKIPPED (DO_DERIVED off)'})")
-    log(f"Missing insert: {'ON' if DO_INSERT_MISSING else 'off'} "
-        f"({MISSING_STYLE['product_name']})")
+        by_tab[c.table] = by_tab.get(c.table, 0) + 1
+    log(f"Corrections: {len(corrections)} cells ({n_lit} literal, {n_der} derived)")
+    for t, n in by_tab.items():
+        log(f"   {t:16} {n}")
+    log(f"Remove: {len(plan['remove_handles'])} handles + {len(plan['remove_skus'])} skus")
+    log(f"Add: {len(plan['add_rows'])} style_info row(s)")
+
+    deriver = None
+    if DO_DERIVED and n_der:
+        g = load_scraper()
+        deriver = Deriver(g, plan["si_rows"], plan.get("sku2handle"))
+        log(f"Deriver: {len(deriver.by_handle)} handles from agjeans_inventory rules")
 
     if DRY_RUN:
-        log("DRY RUN - nothing written. Sample literal corrections:")
+        if deriver:
+            log("Derivation preview (handle -> product_name | style_name | jean_style | "
+                "rise_label | inseam_label | inseam_style):")
+            shown = 0
+            for c in corrections:
+                if not c.derive or c.key_field != "handle":
+                    continue
+                d = deriver.by_handle.get(norm(c.key_val), {})
+                log(f"   {c.key_val[:36]:36} {d.get('product_name','')[:42]:42} | "
+                    f"{d.get('style_name','')[:20]:20} | {d.get('jean_style','')}")
+                shown += 1
+                if shown >= 15:
+                    break
+            # Farrah ground-truth check
+            far = "farrah-skinny-ankle-mid-rise-skinny-ankle-cloud-soft-denim-hsd1777rhwht"
+            if far in deriver.by_handle:
+                log(f"   [Farrah check] derived product_name="
+                    f"{deriver.by_handle[far]['product_name']!r}")
+        log("Sample literal corrections:")
         shown = 0
         for c in corrections:
             if c.derive:
                 continue
-            log(f"   {'+'.join(c.tables):32} set {c.change_field}="
-                f"{c.new_val!r:36} where {c.match_field}={c.match_val!r} "
-                f"& {c.key_field}={c.key_val!r}")
+            log(f"   {c.table:14} set {c.change_field}={c.new_val[:34]!r} "
+                f"where {c.change_field}={s(c.match_val)[:22]!r} & {c.key_field}={c.key_val[:26]!r}")
             shown += 1
-            if shown >= 10:
+            if shown >= 8:
                 break
+        log("DRY RUN - nothing written.")
         return
-
-    deriver = None
-    if DO_DERIVED or DO_INSERT_MISSING:
-        deriver = build_deriver()   # stage 2
 
     import pymssql
     conn = pymssql.connect(server=SQL_SERVER, user=SQL_USERNAME, password=SQL_PASSWORD,
@@ -504,15 +640,15 @@ def main() -> None:
     try:
         if DO_REMOVE:
             log("Phase 1: removals...")
-            apply_removals(cur, conn, remove_handles, ckpt)
-        if DO_INSERT_MISSING:
-            log("Phase 1b: insert missing style (stage 2)...")
-            insert_missing(cur, conn, deriver, ckpt)
+            apply_removals(cur, conn, plan["remove_handles"], plan["remove_skus"], ckpt)
+        if DO_ADD:
+            log("Phase 2: add missing style_info...")
+            apply_add(cur, conn, plan["add_rows"], ckpt)
         if DO_CORRECTIONS:
-            log("Phase 2: corrections (value + key matched)...")
+            log("Phase 3: corrections (value + key matched)...")
             apply_corrections(cur, conn, corrections, deriver, ckpt)
         if DO_DEDUPE:
-            log("Phase 3: dedupe...")
+            log("Phase 4: dedupe...")
             for table, keysets in DEDUPE_KEYS.items():
                 for kc in keysets:
                     tag = f"{table}|{'+'.join(kc)}"
@@ -530,130 +666,6 @@ def main() -> None:
         raise
     finally:
         conn.close()
-
-
-# ===========================================================================
-# Stage 2: derivation source = a fresh, clean agjeans_inventory.py output CSV
-# ===========================================================================
-class Deriver:
-    """Serves the correct value for a 'USE agjeans_inventory TO FILL' cell by
-    reading a fresh, clean scraper-output CSV (74af9d5). Style-level fields are
-    looked up by handle; variant_title by sku_shopify. The newest, richest row
-    per handle/sku wins when several output files are present."""
-
-    def __init__(self, by_handle: dict, by_sku: dict):
-        self.by_handle = by_handle
-        self.by_sku = by_sku
-        self.misses: List[Tuple[str, str, str]] = []
-
-    def get(self, field: str, key_val, key_field: str) -> str:
-        col = DERIVE_COL.get(field)
-        if not col:
-            return ""
-        if key_field == "sku_shopify":
-            row = self.by_sku.get(s(key_val))
-        else:
-            row = self.by_handle.get(norm(key_val))
-        if not row or is_blank(row.get(col)):
-            self.misses.append((field, key_field, s(key_val)))
-            return ""
-        return s(row.get(col))
-
-    def style_row(self, handle: str) -> Optional[dict]:
-        return self.by_handle.get(norm(handle))
-
-
-def build_deriver() -> Deriver:
-    import glob
-    d = resolve(DERIVE_DIR)
-    files = []
-    if os.path.isdir(d):
-        files = sorted(glob.glob(os.path.join(d, "*.csv")))
-    elif os.path.isfile(d):
-        files = [d]
-    if not files:
-        sys.exit(f"ERROR: no clean scraper-output CSV found at {d}. Run "
-                 f"agjeans_inventory.py (74af9d5) and put its output there.")
-    by_handle: Dict[str, Tuple[str, dict]] = {}
-    by_sku: Dict[str, dict] = {}
-    for f in files:
-        m = re.search(r"(\d{8}[_-]\d{6}|\d{4}-\d{2}-\d{2})", os.path.basename(f))
-        stamp = (m.group(1) if m else "0")
-        hdr, rows = _read_csv(f)
-        idx = {h.strip(): i for i, h in enumerate(hdr)}
-        need = ("Handle", "SKU - Shopify")
-        if not all(n in idx for n in need):
-            log(f"(skip {os.path.basename(f)}: not a scraper-output CSV)")
-            continue
-        for r in rows:
-            row = {h: (r[i] if i < len(r) else "") for h, i in idx.items()}
-            h = norm(row.get("Handle"))
-            if h:
-                prev = by_handle.get(h)
-                if (prev is None or stamp > prev[0]
-                        or (stamp == prev[0]
-                            and len(row.get("Description", "")) > len(prev[1].get("Description", "")))):
-                    by_handle[h] = (stamp, row)
-            sku = s(row.get("SKU - Shopify"))
-            if sku:
-                by_sku[sku] = row
-    log(f"Deriver: {len(by_handle)} handles, {len(by_sku)} skus from "
-        f"{len(files)} clean output file(s)")
-    # verify the output carries the derived columns (a legacy export won't)
-    sample = next(iter(by_handle.values()), (None, {}))[1]
-    missing_cols = [c for c in ("Inseam Style", "Color - Standardized")
-                    if c not in sample]
-    if missing_cols:
-        log("   WARNING: output CSV is missing columns " + ", ".join(missing_cols)
-            + " - it looks like a legacy export, not a fresh 74af9d5 run.")
-    return Deriver({h: r for h, (_, r) in by_handle.items()}, by_sku)
-
-
-def _num(v) -> str:
-    t = s(v).replace("$", "").replace(",", "").strip()
-    return t if re.fullmatch(r"-?\d+(\.\d+)?", t or "") else ""
-
-
-def _date(v) -> str:
-    t = s(v)
-    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"):
-        try:
-            return dt.datetime.strptime(t, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    return ""
-
-
-def insert_missing(cur, conn, deriver, ckpt):
-    if ckpt.setdefault("corrections", {}).get("_insert_done"):
-        log("   insert: already done (checkpoint)")
-        return
-    row = deriver.style_row(MISSING_STYLE["handle"])
-    if not row:
-        log(f"   insert: handle not in clean output ({MISSING_STYLE['handle']}) - "
-            f"cannot insert; add a fresh scrape that includes it. SKIPPED.")
-        return
-    rec = {"brand": BRAND, "source_file_name": "AGJEANS_cleanup_insert"}
-    now = dt.datetime.now(_TZ).replace(tzinfo=None)
-    rec["captured_date"] = now
-    rec["captured_datetime"] = now
-    for col, src in INSERT_MAP.items():
-        val = row.get(src, "")
-        if col in ("inseam", "knee", "leg_opening", "rise", "back_rise"):
-            val = _num(val)
-        elif col == "created_at":
-            val = _date(val)
-        if not is_blank(val):
-            rec[col] = s(val)
-    cols = [c for c in rec if not is_blank(rec[c])]
-    ph = ", ".join("%s" for _ in cols)
-    cur.execute(f"INSERT INTO style_info ({', '.join('['+c+']' for c in cols)}) "
-                f"VALUES ({ph})", [rec[c] for c in cols])
-    conn.commit()
-    ckpt["corrections"]["_insert_done"] = True
-    save_checkpoint(ckpt)
-    log(f"   insert: added style_info for {rec.get('product_name')} "
-        f"(style_name={rec.get('style_name')}, jean_style={rec.get('jean_style')})")
 
 
 if __name__ == "__main__":
