@@ -310,10 +310,18 @@ class Deriver:
             product_base = g.build_product_title(title, "", "", h)[0]
             product_base = _titlecase(product_base)
             style_name = g.build_style_name(h)
-            jean_style = (g.jean_style_from_source(product_base, leg)
-                          or g.jean_style_from_source(title, leg))
-            rise_label = g.determine_rise_label(product_base, desc, h, rise)
-            inseam_label = g.determine_inseam_label(product_base, desc, size)
+            # Seed Jean Style / Rise / Inseam Label from the workbook's LITERAL
+            # correction when it has one, else derive. Style Name's one-word rule
+            # (apply_style_name_rules) appends the first word of Jean Style, so
+            # the FINAL Jean Style has to be in place before that pass runs.
+            def _lit(col, derived):
+                nv = d.get("NEW " + col)
+                return s(nv) if (not is_use_scraper(nv) and not is_blank(nv)) else derived
+            jean_style = _lit("jean_style",
+                              g.jean_style_from_source(product_base, leg)
+                              or g.jean_style_from_source(title, leg))
+            rise_label = _lit("rise_label", g.determine_rise_label(product_base, desc, h, rise))
+            inseam_label = _lit("inseam_label", g.determine_inseam_label(product_base, desc, size))
             product_display = f"{product_base} - {color.title()}" if color else product_base
             row = {
                 "Handle": h, "Product": product_display, "Style Name": style_name,
@@ -600,17 +608,22 @@ def main() -> None:
 
     if DRY_RUN:
         if deriver:
-            log("Derivation preview (handle -> product_name | style_name | jean_style | "
-                "rise_label | inseam_label | inseam_style):")
-            shown = 0
+            log("Derivation preview (first 15 UNIQUE handles -> product_name | "
+                "style_name | jean_style | rise_label | inseam_label | inseam_style):")
+            seen = set()
             for c in corrections:
                 if not c.derive or c.key_field != "handle":
                     continue
-                d = deriver.by_handle.get(norm(c.key_val), {})
-                log(f"   {c.key_val[:36]:36} {d.get('product_name','')[:42]:42} | "
-                    f"{d.get('style_name','')[:20]:20} | {d.get('jean_style','')}")
-                shown += 1
-                if shown >= 15:
+                h = norm(c.key_val)
+                if h in seen:
+                    continue
+                seen.add(h)
+                d = deriver.by_handle.get(h, {})
+                log(f"   {c.key_val[:34]:34} {d.get('product_name','')[:40]:40} | "
+                    f"{d.get('style_name','')[:18]:18} | {d.get('jean_style','')[:16]:16} | "
+                    f"{d.get('rise_label','')[:6]:6} | {d.get('inseam_label','')[:8]:8} | "
+                    f"{d.get('inseam_style','')}")
+                if len(seen) >= 15:
                     break
             # Farrah ground-truth check
             far = "farrah-skinny-ankle-mid-rise-skinny-ankle-cloud-soft-denim-hsd1777rhwht"
