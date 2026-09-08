@@ -500,6 +500,14 @@ def apply_add(cur, conn, add_rows, ckpt):
         log("   add: already done (checkpoint)")
         return
     for r in add_rows:
+        # idempotent: skip if this style is already in style_info (e.g. a prior
+        # run inserted it, or RESET_PROGRESS re-ran this phase)
+        sid0, h0 = s(r.get("style_id")), s(r.get("handle"))
+        cur.execute(f"SELECT COUNT(*) FROM style_info WHERE brand={VC} AND "
+                    f"style_id={VC} AND handle={VC}", (BRAND, sid0, h0))
+        if (cur.fetchone() or [0])[0]:
+            log(f"   add: {sid0} already in style_info - skipping insert")
+            continue
         rec = {"brand": BRAND, "is_manual_override": "1"}
         # 1) plain columns the row already carries (sku_url, hem_style, tags,
         #    style_id, handle, product_name, ...) exactly as filled in H..AM
