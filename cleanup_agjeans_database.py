@@ -156,6 +156,13 @@ def is_use_scraper(v) -> bool:
     return isinstance(v, str) and "agjeans_inventory" in v.lower()
 
 
+def _is_fill_qao(v) -> bool:
+    """NEW quantity_available_online = 'FILL WITH THE VALUE CURRENTLY IN QUANTITY
+    AVAILABLE' -> copy quantity_available into it (not a literal)."""
+    n = norm(v)
+    return "fill with" in n and "quantity available" in n
+
+
 def resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(SCRIPT_DIR, path)
 
@@ -169,7 +176,7 @@ def key_field_for(col: str) -> str:
 # ===========================================================================
 def _empty_ckpt() -> dict:
     return {"removals": {}, "add_done": False, "pre_dedupe_done": False,
-            "corrections": {}, "dedupe_done": {}}
+            "corrections": {}, "fill_qao_done": False, "dedupe_done": {}}
 
 
 def load_checkpoint() -> dict:
@@ -396,6 +403,7 @@ def build_plan():
     add_rows: List[dict] = []
     si_rows_for_derive: List[dict] = []
     sku2handle: Dict[str, str] = {}
+    fill_qao = False
     for tab in TABS:
         cols, rows = load_tab(tab)
         if not rows:
@@ -432,6 +440,9 @@ def build_plan():
                 nv = r.get(nc)
                 if is_blank(nv):
                     continue
+                if _is_fill_qao(nv):
+                    fill_qao = True     # set quantity_available_online = quantity_available
+                    continue            # handled once, set-based, for all AGJEANS
                 derive = is_use_scraper(nv)
                 if derive and col_db not in DERIVED_FIELDS:
                     continue
@@ -446,7 +457,8 @@ def build_plan():
                     nv=("" if derive else s(nv)), derive=derive, handle=handle))
     return {"corrections": corrections, "remove_handles": sorted(remove_handles),
             "remove_skus": sorted(remove_skus), "add_rows": add_rows,
-            "si_rows": si_rows_for_derive, "sku2handle": sku2handle}
+            "si_rows": si_rows_for_derive, "sku2handle": sku2handle,
+            "fill_qao": fill_qao}
 
 
 # ===========================================================================
@@ -493,6 +505,34 @@ def apply_removals(cur, conn, handles, skus, ckpt):
         done[tbl] = True
         save_checkpoint(ckpt)
         log(f"   {tbl}: removed {n} rows for {len(handles)} handles (committed)")
+
+
+def apply_fill_qao(cur, conn, ckpt):
+    """Set quantity_available_online = quantity_available for ALL AGJEANS
+    variant_metrics rows, in bounded batches (the table is ~24M rows). Idempotent
+    - only rows where they differ are touched, so it drains to zero and re-runs
+    safely."""
+    if ckpt.get("fill_qao_done"):
+        log("   fill_qao: already done (checkpoint)")
+        return
+    total = 0
+    while True:
+        cur.execute(
+            f"UPDATE TOP ({DELETE_BATCH}) variant_metrics "
+            f"SET quantity_available_online = quantity_available "
+            f"WHERE brand={VC} AND "
+            f"ISNULL(quantity_available_online, -2147483648) <> "
+            f"ISNULL(quantity_available, -2147483648)", (BRAND,))
+        rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+        conn.commit(); total += rc
+        if rc:
+            log(f"   fill_qao: set quantity_available_online = quantity_available "
+                f"on {total} rows so far...")
+        if rc < DELETE_BATCH:
+            break
+    ckpt["fill_qao_done"] = True
+    save_checkpoint(ckpt)
+    log(f"   fill_qao: done - {total} variant_metrics rows updated")
 
 
 def apply_add(cur, conn, add_rows, ckpt):
@@ -726,6 +766,9 @@ def main() -> None:
     if DO_PRE_DEDUPE:
         log(f"Pre-dedupe: {len(compute_keep_pn(plan['si_rows']))} handles collapse to "
             f"one style_info row before correcting (avoids uq_style_info_product)")
+    if plan.get("fill_qao"):
+        log("fill_qao: quantity_available_online will be set = quantity_available "
+            "for ALL AGJEANS variant_metrics")
 
     deriver = None
     if DO_DERIVED and n_der:
@@ -790,6 +833,9 @@ def main() -> None:
         if DO_CORRECTIONS:
             log("Phase 3: corrections (value + key matched)...")
             apply_corrections(cur, conn, corrections, deriver, ckpt)
+        if DO_CORRECTIONS and plan.get("fill_qao"):
+            log("Phase 3.5: quantity_available_online = quantity_available (all AGJEANS)...")
+            apply_fill_qao(cur, conn, ckpt)
         if DO_DEDUPE:
             log("Phase 4: dedupe...")
             for table, keysets in DEDUPE_KEYS.items():
