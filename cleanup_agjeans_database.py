@@ -667,10 +667,29 @@ def _resolve_si_conflict(cur, changed_col, new_val, match_val, handle) -> bool:
     return False
 
 
-def apply_corrections(cur, conn, corrections, deriver, ckpt):
+def _colliding_variant_titles(corrections, deriver) -> set:
+    """variant_title values that two or more DISTINCT skus would be set to. On
+    variant_metrics those collide on uq_variant_metrics_title (they share capture
+    dates), so they must be skipped and the names reworked in the workbook."""
+    by_val: Dict[str, set] = {}
+    for c in corrections:
+        if c.change_field != "variant_title":
+            continue
+        nv = c.new_val
+        if c.derive and deriver is not None:
+            nv = deriver.get("variant_title", c.key_val, c.key_field, c.match_val)
+        if is_blank(nv):
+            continue
+        by_val.setdefault(norm(nv), set()).add(s(c.key_val))
+    return {v for v, skus in by_val.items() if len(skus) > 1}
+
+
+def apply_corrections(cur, conn, corrections, deriver, ckpt, collide_vt=None):
     done = ckpt.setdefault("corrections", {})
     start = int(done.get("_i", 0))
     conflicts: List[tuple] = []
+    vt_skipped = 0
+    collide_vt = collide_vt or set()
     changed = derived_used = derived_miss = 0
     for i, c in enumerate(corrections):
         if i < start:
@@ -687,6 +706,15 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
                     new_val = None
                 else:
                     derived_used += 1
+        if (c.change_field == "variant_title" and not is_blank(new_val)
+                and norm(new_val) in collide_vt):
+            # two distinct skus would get this variant_title -> collides on
+            # uq_variant_metrics_title; skip both, rename in the workbook.
+            conflicts.append(("variant_title", s(new_val), c.key_val))
+            vt_skipped += 1
+            if (i + 1) % COMMIT_EVERY == 0:
+                conn.commit(); done["_i"] = i + 1; save_checkpoint(ckpt)
+            continue
         if not is_blank(new_val) and norm(new_val) != norm(c.match_val):
             # style_info has a unique index (brand, product_name, inseam_label).
             # Resolve a would-be collision: delete a same-style_id duplicate, or
@@ -718,15 +746,18 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
             log(f"   corrections: {i+1}/{len(corrections)} ({changed} rows changed)...")
     conn.commit(); done["_i"] = len(corrections); save_checkpoint(ckpt)
     log(f"   corrections: {len(corrections)} spec cells - {changed} DB rows changed; "
-        f"derived used {derived_used}, unresolved {derived_miss}")
+        f"derived used {derived_used}, unresolved {derived_miss}; "
+        f"variant_title skipped {vt_skipped}")
     if conflicts:
         uniq = sorted(set(conflicts))
-        log(f"   NOTE: {len(uniq)} style_info correction(s) SKIPPED - another handle "
-            f"(a DISTINCT style) already holds that (product_name, inseam_label). "
-            f"These aren't duplicates (different handle); rework the name in the "
-            f"workbook so it doesn't repeat, then re-run:")
-        for cf, nv, kv in uniq[:20]:
-            log(f"      handle {kv} -> {cf}={nv!r} (left unchanged)")
+        log(f"   NOTE: {len(uniq)} correction(s) SKIPPED - a DISTINCT style (different "
+            f"handle/sku) would take the same name, which collides on a unique index. "
+            f"Rework these names in the workbook (BOTH lookup and variant_metrics "
+            f"tabs for variant_title) so they don't repeat, then re-run:")
+        for cf, nv, kv in uniq[:60]:
+            log(f"      {cf}={nv!r}  key={kv}")
+        if len(uniq) > 60:
+            log(f"      ... and {len(uniq)-60} more")
 
 
 def dedupe(cur, conn, table, key_cols, pk):
@@ -839,7 +870,11 @@ def main() -> None:
             apply_pre_dedupe(cur, conn, compute_keep_pn(plan["si_rows"]), ckpt)
         if DO_CORRECTIONS:
             log("Phase 3: corrections (value + key matched)...")
-            apply_corrections(cur, conn, corrections, deriver, ckpt)
+            collide_vt = _colliding_variant_titles(corrections, deriver)
+            if collide_vt:
+                log(f"   {len(collide_vt)} variant_title value(s) map to >1 sku "
+                    f"(distinct styles) - these will be skipped and reported")
+            apply_corrections(cur, conn, corrections, deriver, ckpt, collide_vt)
         if DO_CORRECTIONS and plan.get("fill_qao"):
             log("Phase 3.5: quantity_available_online = quantity_available (all AGJEANS)...")
             apply_fill_qao(cur, conn, ckpt)
