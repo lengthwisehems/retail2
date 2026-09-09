@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import time
 import types
 import datetime as dt
 from decimal import Decimal
@@ -71,7 +72,8 @@ SQL_PASSWORD = os.environ.get("SQL_PASSWORD", "")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, f"cleanup_{BRAND.lower()}_checkpoint.json")
-COMMIT_EVERY = 2000
+COMMIT_EVERY = 500      # commit + log progress this often (visibility + safe resume)
+SLOW_UPDATE_SEC = 20    # log a warning for any single correction slower than this
 DELETE_BATCH = 5000
 VC = "CAST(%s AS varchar(255))"
 
@@ -703,7 +705,12 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt):
             kclause, kparams = _match_clause(c.key_field, c.key_val)
             sql = (f"UPDATE {c.table} SET {', '.join(sets)} "
                    f"WHERE brand = {VC} AND {mclause} AND {kclause}")
+            t0 = time.monotonic()
             cur.execute(sql, params + [BRAND] + mparams + kparams)
+            dt_s = time.monotonic() - t0
+            if dt_s > SLOW_UPDATE_SEC:
+                log(f"   SLOW ({dt_s:.0f}s): {c.table}.{c.change_field} "
+                    f"match={s(c.match_val)[:20]!r} {c.key_field}={c.key_val[:26]!r}")
             rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
             changed += rc
         if (i + 1) % COMMIT_EVERY == 0:
