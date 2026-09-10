@@ -797,9 +797,22 @@ def apply_corrections(cur, conn, corrections, deriver, ckpt, collide_vt=None):
             log(f"      ... and {len(uniq)-60} more")
 
 
+def _has_column(cur, table, col) -> bool:
+    cur.execute("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME=%s AND COLUMN_NAME=%s", (table, col))
+    return cur.fetchone() is not None
+
+
 def dedupe(cur, conn, table, key_cols, pk):
-    cur.execute(f"SELECT {pk} AS pk, {', '.join('['+c+']' for c in key_cols)}, "
-                f"captured_datetime FROM {table} WHERE brand={VC}", (BRAND,))
+    # Survivor rule: keep the OLDEST captured_datetime where the table has one
+    # (variant_metrics/style_metrics), else - as for lookup/style_info, which
+    # have no captured_datetime - keep the lowest PK (the original row). Both
+    # break final ties on the lowest PK.
+    has_dt = _has_column(cur, table, "captured_datetime")
+    sel = (f"SELECT {pk} AS pk, {', '.join('['+c+']' for c in key_cols)}, "
+           + ("captured_datetime" if has_dt else "NULL")
+           + f" FROM {table} WHERE brand={VC}")
+    cur.execute(sel, (BRAND,))
     groups: Dict[tuple, list] = {}
     for r in cur.fetchall():
         k = tuple(norm(r[i + 1]) for i in range(len(key_cols)))
@@ -810,6 +823,8 @@ def dedupe(cur, conn, table, key_cols, pk):
     for k, members in groups.items():
         if len(members) < 2:
             continue
+        # (dt is None, dt, pk): with no captured_datetime every dt is None, so
+        # this collapses to ordering by pk -> smallest pk survives.
         members.sort(key=lambda t: (t[1] is None, t[1], t[0]))
         for pkv, _ in members[1:]:
             cur.execute(f"DELETE FROM {table} WHERE {pk}=%s", (pkv,))
