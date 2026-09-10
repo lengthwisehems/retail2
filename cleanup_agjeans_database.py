@@ -75,6 +75,7 @@ CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, f"cleanup_{BRAND.lower()}_checkpoint.
 COMMIT_EVERY = 500      # commit + log progress this often (visibility + safe resume)
 SLOW_UPDATE_SEC = 20    # log a warning for any single correction slower than this
 DELETE_BATCH = 5000
+FILL_QAO_PK_WINDOW = 200000   # variant_metric_id span per fill_qao batch (clustered range)
 VC = "CAST(%s AS varchar(255))"
 
 TABS = ("style_info", "lookup", "style_metrics", "variant_metrics")
@@ -178,7 +179,8 @@ def key_field_for(col: str) -> str:
 # ===========================================================================
 def _empty_ckpt() -> dict:
     return {"removals": {}, "add_done": False, "pre_dedupe_done": False,
-            "corrections": {}, "fill_qao_done": False, "dedupe_done": {}}
+            "corrections": {}, "fill_qao_done": False,
+            "fill_qao_pk": None, "fill_qao_total": 0, "dedupe_done": {}}
 
 
 def load_checkpoint() -> dict:
@@ -510,28 +512,63 @@ def apply_removals(cur, conn, handles, skus, ckpt):
 
 
 def apply_fill_qao(cur, conn, ckpt):
-    """Set quantity_available_online = quantity_available for ALL AGJEANS
-    variant_metrics rows, in bounded batches (the table is ~24M rows). Idempotent
-    - only rows where they differ are touched, so it drains to zero and re-runs
-    safely."""
+    """Set quantity_available_online = quantity_available for every AGJEANS
+    variant_metrics row.
+
+    variant_metrics is ~24M rows, so we must NOT use
+        UPDATE TOP (N) ... WHERE brand=AGJEANS AND qao <> qa
+    That WHERE empties itself as we go: once the first rows are fixed they no
+    longer match, so each pass has to scan PAST all the already-fixed rows to
+    find the next N that still differ. After a big partial run (e.g. a WAN drop
+    at ~1.275M rows) the very first resumed batch has to scan through all of
+    those millions of now-matching rows before finding any work, and that single
+    statement blows past the query timeout - which is exactly the "first batch
+    of the resumed run times out with no progress logged" failure.
+
+    Instead we walk the CLUSTERED primary key (variant_metric_id) in fixed
+    id-windows. Each window is a bounded clustered range read - constant work no
+    matter how many rows are already fixed - and the last finished window's high
+    id is checkpointed, so a dropped connection resumes at the next window
+    instead of rescanning from the front. Still idempotent: the qao<>qa residual
+    inside each window means already-correct rows aren't rewritten."""
     if ckpt.get("fill_qao_done"):
         log("   fill_qao: already done (checkpoint)")
         return
-    total = 0
-    while True:
+    # clustered PK endpoints are index bounds -> instant, whole table
+    cur.execute("SELECT MIN(variant_metric_id), MAX(variant_metric_id) "
+                "FROM variant_metrics")
+    lo, hi = (cur.fetchone() or (None, None))
+    if lo is None:
+        ckpt["fill_qao_done"] = True
+        save_checkpoint(ckpt)
+        log("   fill_qao: variant_metrics is empty - nothing to do")
+        return
+    start = ckpt.get("fill_qao_pk")
+    cur_lo = (start + 1) if isinstance(start, int) else lo
+    total = ckpt.get("fill_qao_total", 0) or 0
+    log(f"   fill_qao: walking variant_metric_id {cur_lo}..{hi} in windows of "
+        f"{FILL_QAO_PK_WINDOW}"
+        + (f" (resuming; {total} already updated)" if start is not None else ""))
+    while cur_lo <= hi:
+        cur_hi = min(cur_lo + FILL_QAO_PK_WINDOW - 1, hi)
         cur.execute(
-            f"UPDATE TOP ({DELETE_BATCH}) variant_metrics "
-            f"SET quantity_available_online = quantity_available "
-            f"WHERE brand={VC} AND "
-            f"ISNULL(quantity_available_online, -2147483648) <> "
-            f"ISNULL(quantity_available, -2147483648)", (BRAND,))
+            "UPDATE variant_metrics "
+            "SET quantity_available_online = quantity_available "
+            "WHERE variant_metric_id BETWEEN %s AND %s "
+            f"AND brand={VC} AND "
+            "ISNULL(quantity_available_online, -2147483648) <> "
+            "ISNULL(quantity_available, -2147483648)",
+            (cur_lo, cur_hi, BRAND))
         rc = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
-        conn.commit(); total += rc
+        conn.commit()
+        total += rc
+        ckpt["fill_qao_pk"] = cur_hi
+        ckpt["fill_qao_total"] = total
+        save_checkpoint(ckpt)
         if rc:
-            log(f"   fill_qao: set quantity_available_online = quantity_available "
-                f"on {total} rows so far...")
-        if rc < DELETE_BATCH:
-            break
+            log(f"   fill_qao: ids {cur_lo}..{cur_hi} -> {rc} rows set "
+                f"({total} total)")
+        cur_lo = cur_hi + 1
     ckpt["fill_qao_done"] = True
     save_checkpoint(ckpt)
     log(f"   fill_qao: done - {total} variant_metrics rows updated")
