@@ -2288,10 +2288,9 @@ def apply_quantity_of_style(rows: List[Dict[str, str]]) -> None:
 def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
     """Mark the superseded style when two Style Ids share a Product title.
 
-    The older style gets "OLD" appended after LONG/PETITE/REGULAR but before
-    the " | " separator. A style counts as superseded when none of its
-    variants are for sale and its PDP is gone; otherwise the one with the
-    oldest Created At date is marked.
+    A style is only superseded when all three hold: every variant has
+    Available for Sale false, its PDP is gone, and its inventory is zero or
+    less. A duplicate whose twin is still live and sellable is left alone.
     """
     by_product: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
     for row in rows:
@@ -2301,24 +2300,19 @@ def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
     for _product, styles in by_product.items():
         if len(styles) < 2:
             continue
-        inactive = []
         for style_id, style_rows in styles.items():
-            for_sale = any(r["Available for Sale"].lower() == "true" for r in style_rows)
-            pdp = any(r.get("_pdp_active") for r in style_rows)
-            if not for_sale and not pdp:
-                inactive.append(style_id)
-        if inactive:
-            targets = inactive
-        else:
-            def created(style_id: str) -> str:
-                raw = styles[style_id][0].get("Created At", "")
+            for_sale = any(r["Available for Sale"].lower() == "true"
+                           for r in style_rows)
+            pdp_live = any(r.get("_pdp_active") for r in style_rows)
+            inventory = 0
+            for r in style_rows:
                 try:
-                    return datetime.strptime(raw, "%m/%d/%Y").isoformat()
-                except ValueError:
-                    return raw
-            targets = [min(styles, key=created)]
-        for style_id in targets:
-            for row in styles[style_id]:
+                    inventory += int(float(r.get("Quantity Available") or 0))
+                except (TypeError, ValueError):
+                    pass
+            if for_sale or pdp_live or inventory > 0:
+                continue
+            for row in style_rows:
                 row["Product"] = _insert_old_marker(row["Product"])
 
 
