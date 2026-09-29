@@ -55,7 +55,9 @@ FILTER_WORDS: List[str] = [
     "Sweatpants", "Sweats", "Sweatshirt", "Sweatshirts", "Swim", "T Shirt",
     "T Shirts", "Tank", "Tank Tops", "Tee", "Tees", "Top", "Vest", "Vests",
 ]
-EXCLUDED_TITLE_TERMS = FILTER_WORDSEXCLUDED_PRODUCT_TYPES = {
+EXCLUDED_TITLE_TERMS = FILTER_WORDS
+
+EXCLUDED_PRODUCT_TYPES = {
     "blazers",
     "bodysuits",
     "dresses",
@@ -1706,6 +1708,8 @@ def jean_style_from_desc(description: str) -> str:
 # ---------------------------------------------------------------------------
 # Rise Label — title, then description, then tags
 # ---------------------------------------------------------------------------
+RISE_BARE_KEYWORDS = {"high", "low", "mid", "lo"}
+
 RISE_LABEL_RULES: List[Tuple[str, List[str]]] = [
     ("Ultra High", ["SUPER HIGH WAIST", "SUPER HIGH-WAIST", "ULTRA HIGH WAIST",
                     "ULTRA HIGH-WAIST", "SUPER HIGH RISE", "SUPER HIGH-RISE",
@@ -1723,13 +1727,31 @@ RISE_LABEL_RULES: List[Tuple[str, List[str]]] = [
 
 
 def determine_rise_label_v2(title: str, description: str, tags_str: str) -> str:
-    for source in (title, description, tags_str):
+    """Title, then description, then tags; longest matching keyword wins.
+
+    Within a source the most specific keyword is taken rather than the first
+    category in list order, so "MID RISE" beats a stray "LOW" in the care
+    instructions ("tumble dry on low"). The bare one-word keywords (high, low,
+    mid, lo) only count in the title: in body copy "high" matches inside
+    "thigh" and a care line like "tumble dry on low" is not a rise.
+    """
+    for index, source in enumerate((title, description, tags_str)):
         hay = _kn(source)
         if not hay:
             continue
-        for label, keywords in RISE_LABEL_RULES:
-            if any(_kn(k) in hay for k in keywords):
-                return label
+        is_title = index == 0
+        best = None
+        for order, (label, keywords) in enumerate(RISE_LABEL_RULES):
+            for keyword in keywords:
+                token = _kn(keyword)
+                if token in RISE_BARE_KEYWORDS and not is_title:
+                    continue
+                if re.search(r"\b" + re.escape(token) + r"\b", hay):
+                    candidate = (len(token), -order)
+                    if best is None or candidate > best[0]:
+                        best = (candidate, label)
+        if best:
+            return best[1]
     return ""
 
 
@@ -2008,12 +2030,16 @@ def build_rows(
             title_parts = [clean_text(part) for part in normalize_output_text(title).split("|")]
             color_code = title_parts[1] if len(title_parts) > 1 and title_parts[1] else color_value
 
+            # The length segment comes from the option attributes when the
+            # variant carries them, otherwise from the title's own keyword.
+            length_segment = (attr_label or naming["inseam_label_kw"]).upper()
             alt_parts = [naming["variant_title_pre"], color_code]
-            if attr_label:
-                alt_parts.append(attr_label.upper())
+            if length_segment:
+                alt_parts.append(length_segment)
             product_title_alt = " | ".join([p for p in alt_parts if p])
             variant_title = " | ".join(
                 [p for p in alt_parts + ([size_value] if size_value else []) if p])
+            length_segment_store = length_segment
 
             keyword_inseam_style = determine_inseam_style(title, handle, description, inseam_value)
             inseam_style = determine_inseam_style_v2(
@@ -2057,12 +2083,18 @@ def build_rows(
                 "Color - Standardized": determine_color_standardized(tags, description),
                 "Stretch": determine_stretch(description),
                 "_style_name_draft": naming["style_name_draft"],
+                "_vt_pre": naming["variant_title_pre"],
+                "_inseam_label_kw": naming["inseam_label_kw"],
+                "_color_code": color_code,
+                "_attr_label": length_segment_store,
+                "_raw_title": title,
                 "_sku_no_size": sku_no_size,
                 "_pdp_active": "1" if pdp_active else "",
             })
 
         seen_products += 1
 
+    apply_good_insert_normalization(staged_rows)
     apply_jean_style_draft_fill(staged_rows)
     fill_jean_style_from_text(staged_rows, stage="title_desc")
     apply_jean_style_draft_fill(staged_rows)
@@ -2073,10 +2105,86 @@ def build_rows(
     apply_duplicate_old_marker(staged_rows)
 
     for row in staged_rows:
+        row.pop("_vt_pre", None)
+        row.pop("_inseam_label_kw", None)
+        row.pop("_color_code", None)
+        row.pop("_attr_label", None)
+        row.pop("_raw_title", None)
         row.pop("_style_name_draft", None)
         row.pop("_sku_no_size", None)
         row.pop("_pdp_active", None)
     return staged_rows
+
+
+GOOD_INSERT_WORDS = ["LEGS", "CLASSIC", "WAIST", "CURVE", "BOY"]
+
+
+def _normalize_color_key(color: str) -> str:
+    """BLACK001 and BLACK are the same colour for matching purposes."""
+    return re.sub(r"\d+$", "", (color or "").strip().upper())
+
+
+def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
+    """Re-attach the collection word that a length-specific title drops.
+
+    A petite/long title such as "ALWAYS FITS GOOD PETITE BOOTCUT JEANS" names
+    the same style as its regular sibling "ALWAYS FITS GOOD CLASSIC BOOTCUT
+    JEANS". The length word belongs in the option-attribute segment, so it is
+    stripped here and LEGS/CLASSIC/WAIST/CURVE/BOY is tried after "GOOD";
+    the insert is kept only when it matches a style name that already exists
+    for the same colour.
+    """
+    names_by_color: Dict[str, Set[str]] = {}
+    for row in rows:
+        key = _normalize_color_key(row.get("_color_code", ""))
+        if row["Style Name"]:
+            names_by_color.setdefault(key, set()).add(row["Style Name"].upper())
+
+    for row in rows:
+        kw = row.get("_inseam_label_kw", "")
+        if not kw:
+            continue
+        stripped_sn = clean_text(re.sub(rf"\b{re.escape(kw)}\b", " ",
+                                        row["Style Name"], flags=re.IGNORECASE))
+        stripped_vt = clean_text(re.sub(rf"\b{re.escape(kw)}\b", " ",
+                                        row.get("_vt_pre", ""), flags=re.IGNORECASE))
+        if not stripped_sn:
+            continue
+        color_key = _normalize_color_key(row.get("_color_code", ""))
+        siblings = names_by_color.get(color_key, set())
+
+        chosen_sn, chosen_vt = "", ""
+        for word in GOOD_INSERT_WORDS:
+            cand_sn = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_sn, count=1,
+                             flags=re.IGNORECASE)
+            if cand_sn.upper() in siblings and cand_sn.upper() != row["Style Name"].upper():
+                chosen_sn = cand_sn
+                chosen_vt = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_vt,
+                                   count=1, flags=re.IGNORECASE)
+                break
+        if not chosen_sn:
+            # No sibling to match: still move the length word out of the name.
+            chosen_sn, chosen_vt = stripped_sn, stripped_vt
+        row["Style Name"] = chosen_sn
+        row["_vt_pre"] = chosen_vt
+
+    for row in rows:
+        # Product Line reads VARIANT_TITLE_PRE, so it has to be recomputed
+        # after the collection word has been re-attached above.
+        vt_up = row.get("_vt_pre", "").upper()
+        for needle, label in PRODUCT_LINE_CONTAINS_RULES:
+            if needle in vt_up:
+                row["Product Line"] = label
+                break
+        parts = [row.get("_vt_pre", ""), row.get("_color_code", "")]
+        if row.get("_attr_label"):
+            parts.append(row["_attr_label"].upper())
+        row["Product Title Alt"] = " | ".join([p for p in parts if p])
+        size = row.get("Size", "")
+        row["Variant Title"] = " | ".join(
+            [p for p in parts + ([size] if size else []) if p])
+        row["Product"] = build_product_field(row.get("_raw_title", ""),
+                                             row["Variant Title"])
 
 
 def apply_jean_style_draft_fill(rows: List[Dict[str, str]]) -> None:
