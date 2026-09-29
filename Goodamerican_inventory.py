@@ -314,6 +314,7 @@ CSV_HEADERS = [
     "Handle",
     "Published At",
     "Created At",
+    "Updated At",
     "Product",
     "Product Title Alt",
     "Style Name",
@@ -584,6 +585,7 @@ def fetch_collection_products(
             title
             publishedAt
             createdAt
+            updatedAt
             productType
             tags
             vendor
@@ -2085,6 +2087,7 @@ def build_rows(
                 "Handle": handle,
                 "Published At": parse_date(product.get("publishedAt")),
                 "Created At": parse_date(product.get("createdAt")),
+                "Updated At": parse_date(product.get("updatedAt")),
                 "Product": build_product_field(title, attr_label),
                 "Product Title Alt": product_title_alt,
                 "Style Name": naming["style_name"],
