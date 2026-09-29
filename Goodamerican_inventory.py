@@ -3,10 +3,11 @@ import csv
 import logging
 import re
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -30,21 +31,31 @@ SEARCHSPRING_SITE_ID = "5ojqb3"
 
 COLLECTION_HANDLES = ["womens-jeans", "sale"]
 
-EXCLUDED_TITLE_TERMS: List[str] = [
-    "Accessories", "Accessory", "Bermuda", "Bermudas", "Bikini", "Blazer", "Blazers", "Blouse", "Blouses", "Bodysuit", 
-    "Bodysuits", "Button Up", "Button-Up", "Capri", "Cardigan", "Cardigans", "Clothing Top", "Clothing Tops", 
-    "Coat", "Coats", "Coats & Jackets", "Core Handbags", "Corsets", "Crop Top", "Crop Tops", 
-    "Denim Short", "Denim Shorts", "Donation", "Dress", "Dresses", "Fashion Core Handbag", "Fashion Core Handbags", 
-    "Fashion Handbag", "Fashion Handbags", "Gift Wrap", "Goodies Accessories", "Goodies Accessory", "Hat", "Handbag", 
-    "Heel", "Heels", "Henley", "Hoodie", "Hoodies", "Jacket", "Jackets", "Jogger Short", "Jogger Shorts", "Jort", 
-    "Jumpsuit", "Jumpsuits", "Neck", "One Piece", "One Pieces", "One-Piece", "One-Pieces", "Outerwear", "Pant Suit", 
-    "Pant Suits", "Purse", "Romper", "Rompers", "Sandel", "Sandle", "Scarf", "Scrunchie", "Shacket", "Shipping", "Shipping Protection", 
-    "Shirt", "Shirts", "Shirts & Tops", "Shoe", "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Sleeve", "Sleeves", 
-    "Suit", "Suits", "Sweat", "Sweater", "Sweaters", "Sweatpant", "Sweatpants", "Sweats", "Sweatshirt", "Sweatshirts", 
-    "Swim", "T Shirt", "T Shirts", "Tank", "Tank Tops", "Tee", "Tees", "Top", "Tops", "Tote", "Trench", "T-shirt", 
-    "T-Shirts", "Vest", "Vests"
+# ---------------------------------------------------------------------------
+# Products are dropped when the product title contains any of these words.
+# Kept near the top so it is easy to edit.
+# ---------------------------------------------------------------------------
+FILTER_WORDS: List[str] = [
+    "Accessories", "Accessory", "Bermuda", "Bermudas", "Bikini", "Blazer",
+    "Blazers", "Blouse", "Blouses", "Bodysuit", "Bodysuits", "Button Up",
+    "Button-Up", "Capri", "Cardigan", "Cardigans", "Clothing Top",
+    "Clothing Tops", "Coat", "Coats", "Coats & Jackets", "Core Handbags",
+    "Corset", "Corsets", "Crop Top", "Crop Tops", "Denim Short",
+    "Denim Shorts", "Donation", "Dress", "Dresses", "Fashion Core Handbag",
+    "Fashion Core Handbags", "Fashion Handbag", "Fashion Handbags",
+    "Gift Wrap", "Goodies Accessories", "Goodies Accessory", "Handbag", "Hat",
+    "Heel", "Heels", "Henley", "Hoodie", "Hoodies", "Jacket", "Jackets",
+    "Jogger Short", "Jogger Shorts", "Jort", "Jumpsuit", "Jumpsuits", "Neck",
+    "One Piece", "One Pieces", "One-Piece", "One-Pieces", "Outerwear",
+    "Pant Suit", "Pant Suits", "Purse", "Romper", "Rompers", "Sandel",
+    "Sandle", "Scarf", "Scrunchie", "Shacket", "Shipping",
+    "Shipping Protection", "Shirt", "Shirts", "Shirts & Tops", "Shoe",
+    "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Sleeve", "Sleeves",
+    "Suit", "Suits", "Sweat", "Sweater", "Sweaters", "Sweatpant",
+    "Sweatpants", "Sweats", "Sweatshirt", "Sweatshirts", "Swim", "T Shirt",
+    "T Shirts", "Tank", "Tank Tops", "Tee", "Tees", "Top", "Vest", "Vests",
 ]
-EXCLUDED_PRODUCT_TYPES = {
+EXCLUDED_TITLE_TERMS = FILTER_WORDSEXCLUDED_PRODUCT_TYPES = {
     "blazers",
     "bodysuits",
     "dresses",
@@ -128,14 +139,182 @@ LENGTH_LABELS = {
     "PETITE": "Petite",
 }
 
+# ---------------------------------------------------------------------------
+# Product naming engine — keyword categories.
+# Each entry is (keyword, label); label defaults to the keyword.
+# Matching is case-insensitive PLAIN SUBSTRING (not whole-word) by design:
+# short keywords such as "LO" are meant to match inside longer words.
+# ---------------------------------------------------------------------------
+JEAN_STYLE_KEYWORDS: List[Tuple[str, str]] = [
+    ("WIDE", "WIDE LEG"), ("PALAZZO", "PALAZZO"), ("BOOTCUT", "BOOTCUT"),
+    ("CIGARETTE", "CIGARETTE"), ("STRAIGHT", "STRAIGHT"), ("FLARES", "FLARE"),
+    ("BARREL", "BARREL"), ("BAGGY", "BAGGY"), ("BOOT", "BOOTCUT"),
+    ("SKINNY", "SKINNY"), ("WIDE LEG", "WIDE LEG"), ("BOYFRIEND", "BOYFRIEND"),
+    ("LOOSE", "LOOSE"), ("PARACHUTE", "PARACHUTE"), ("FLARE ", "FLARE"),
+]
+PRODUCT_LINE_KEYWORDS: List[Tuple[str, str]] = [
+    ("DOLLY JOLEANS", "DOLLY JOLEANS"), ("DOLLY", "DOLLY"),
+    ("SUPER COMPRESSION", "SUPER COMPRESSION"),
+    ("LIGHT COMPRESSION", "LIGHT COMPRESSION"), ("COMPRESSION", "COMPRESSION"),
+    ("ALWAYS FITS", "ALWAYS FITS"), ("SOFT TECH", "SOFT TECH"),
+    ("SOFTTECH", "SOFT TECH"), ("SOFT-TECH", "SOFT TECH"),
+    ("NEVER FADES", "NEVER FADE"), ("NEVER FADE ", "NEVER FADE"),
+    ("POWER STRETCH", "POWER STRETCH"), ("SOFT SCULPT", "SOFT SCULPT"),
+    ("SOFT STRETCH", "SOFT STRETCH"),
+    ("BETTER THAN LEATHER", "BETTER THAN LEATHER"),
+    ("BETTER THAN SUEDE", "BETTER THAN SUEDE"), ("ALWAYS FIT", "ALWAYS FITS"),
+    ("JEANIUS", "JEANIUS"), ("WEIGHTLESS", "WEIGHTLESS"),
+]
+PULLON_KEYWORDS: List[Tuple[str, str]] = [
+    ("PULL ON", "PULL ON"), ("PULLON", "PULL ON"), ("PULL-ON", "PULL ON"),
+]
+TYPE2_KEYWORDS: List[Tuple[str, str]] = [
+    ("LEGGINGS", "LEGGINGS"), ("TROUSERS", "TROUSERS"),
+    ("SWEATPANTS", "SWEATPANTS"), ("TROUSER ", "TROUSERS"),
+]
+FABRIC_KEYWORDS: List[Tuple[str, str]] = [
+    ("LIGHTWEIGHT", "LIGHT WEIGHT"), ("LIGHT WEIGHT", "LIGHT WEIGHT"),
+    ("HEAVYWEIGHT", "HEAVY WEIGHT"), ("HEAVY WEIGHT", "HEAVY WEIGHT"),
+    ("MIDDLEWEIGHT", "MIDDLE WEIGHT"), ("MIDDLE WEIGHT", "MIDDLE WEIGHT"),
+    ("VAPOR", "VAPOR"), ("VEGAN", "VEGAN"), ("FAUX", "FAUX"),
+    ("COATED", "COATED"), ("WAX", "WAX"), ("SELVEDGE", "SELVAGE"),
+    ("SELVAGE", "SELVAGE"), ("STRIPED", "STRIPED"), ("CHECKERED", "CHECKERED"),
+    ("PLAID", "PLAID"), ("FLAG", "FLAG"), ("CRUSHED", "CRUSHED"),
+    ("KRUSHED", "KRUSHED"), ("FLORAL PRINT", "FLORAL PRINT"),
+    ("LEOPARD PRINT", "LEOPARD PRINT"), ("LEOPARD", "LEOPARD"),
+    ("SNAKE PRINT", "SNAKE PRINT"), ("SNAKE", "SNAKE"), ("PRINTED", "PRINTED"),
+    ("PRINT", "PRINT"), ("FLOCKED DENIM", "FLOCKED DENIM"),
+    ("LEATHER", "LEATHER"), ("VELVET DENIM", "VELVET DENIM"),
+    ("LEATHERETTE", "LEATHERETTE"), ("CANVAS", "CANVAS"),
+    ("CHIFFON", "CHIFFON"), ("CORDUROY", "CORDUROY"), ("CROCHET", "CROCHET"),
+    ("FLANNEL", "FLANNEL"), ("FLOCKED", "FLOCKED"), ("LITE LINEN", "LITE LINEN"),
+    ("LINEN", "LINEN"), ("LINNEN", "LINEN"), ("MESH", "MESH"), ("WOOL", "WOOL"),
+    ("PONTE", "PONTE"), ("POPLIN", "POPLIN"), ("VELVET", "VELVET"),
+    ("SCUBA", "SCUBA"), ("SILK", "SILK"), ("STONE", "STONE"), ("SUEDE", "SUEDE"),
+    ("TERRY", "TERRY"), ("TWILL", "TWILL"), ("DENIM", "DENIM"),
+    ("RINSE", "RINSE"), ("WASH", "WASH"),
+]
+INSEAM_LABEL_KEYWORDS: List[Tuple[str, str]] = [
+    ("PETITE", "PETITE"), ("LONG", "LONG"), ("X27 S", "PETITE"),
+    ("PETITE X27 S", "PETITE"), ("LONG INSEAM", "LONG"), ("REGULAR", "REGULAR"),
+    ("EXTENDED", "LONG"),
+]
+RISE_KEYWORDS: List[Tuple[str, str]] = [
+    ("SUPER HIGH WAIST", "ULTRA HIGH RISE"), ("SUPER HIGH-WAIST", "ULTRA HIGH RISE"),
+    ("ULTRA HIGH WAIST", "ULTRA HIGH RISE"), ("ULTRA HIGH-WAIST", "ULTRA HIGH RISE"),
+    ("SUPER HIGH RISE", "ULTRA HIGH RISE"), ("SUPER HIGH-RISE", "ULTRA HIGH RISE"),
+    ("SUPER LOW WAIST", "ULTRA LOW RISE"), ("SUPER LOW-WAIST", "ULTRA LOW RISE"),
+    ("ULTRA HIGH RISE", "ULTRA HIGH RISE"), ("ULTRA HIGH-RISE", "ULTRA HIGH RISE"),
+    ("ULTRA LOW WAIST", "ULTRA LOW RISE"), ("ULTRA LOW-WAIST", "ULTRA LOW RISE"),
+    ("SUPER LOW RISE", "ULTRA LOW RISE"), ("SUPER LOW-RISE", "ULTRA LOW RISE"),
+    ("ULTRA LOW RISE", "ULTRA LOW RISE"), ("ULTRA LOW-RISE", "ULTRA LOW RISE"),
+    ("STACKED WAIST", "HIGH RISE"), ("HIGH WAISTED", "HIGH RISE"),
+    ("HIGH-WAISTED", "HIGH RISE"), ("LOW WAISTED", "LOW RISE"),
+    ("LOW-WAISTED", "LOW RISE"), ("MID WAISTED", "MID RISE"),
+    ("V-HIGH RISE", "HIGH RISE"), ("HIGH WAIST", "HIGH RISE"),
+    ("HIGH-WAIST", "HIGH RISE"), ("LOW WAISED", "LOW RISE"),
+    ("SUPER HIGH", "ULTRA HIGH RISE"), ("SUPER LOW", "ULTRA LOW RISE"),
+    ("HIGH RISE", "HIGH RISE"), ("HIGHRISE", "HIGH RISE"),
+    ("HIGH-RISE", "HIGH RISE"), ("LOW WAIST", "LOW RISE"),
+    ("LOW-WAIST", "LOW RISE"), ("LOW RISE", "LOW RISE"),
+    ("LOW-RISE", "LOW RISE"), ("MID RISE", "MID RISE"), ("MID-RISE", "MID RISE"),
+    ("HIGH", "HIGH RISE"), ("LOW", "LOW RISE"), ("MID", "MID RISE"),
+    ("LO", "LOW RISE"),
+]
+INSEAM_STYLE_KEYWORDS: List[Tuple[str, str]] = [
+    ("CROPPED", "CROPPED"), ("ANKLE", "ANKLE"), ("CROP", "CROPPED"),
+    ("FULL LENGTH", "FULL LENGTH"),
+]
+TYPE_KEYWORDS: List[Tuple[str, str]] = [
+    ("JEANS", "JEANS"), ("PANTS", "PANTS"), ("PANT", "PANTS"), ("JEAN", "JEANS"),
+]
+STYLING_KEYWORDS: List[Tuple[str, str]] = [
+    ("WITH", "WITH"), ("W/", "W"), ("W /", "W"), (" W ", "W"),
+    ("STIRRUP", "STIRRUP"), ("DIAMOND CUT", "DIAMOND CUT"),
+    ("W DEEP V YOKE", "W DEEP V YOKE"), ("V WAIST", "V WAIST"),
+    ("DEEP V", "DEEP V"), ("CARGO", "CARGO"), ("EMBELLISHED", "EMBELLISHED"),
+    ("EMBROIDERED", "EMBROIDERED"), ("SHINE", "SHINE"), ("SHINY", "SHINY"),
+    ("PANELED", "PANELED"), ("PANELLED", "PANELED"), ("PANNELED", "PANELED"),
+    ("COLOR BLOCK", "COLOR BLOCK"), ("COLOR BLOCKED", "COLOR BLOCKED"),
+    ("COLORBLOCK ", "COLOR BLOCK"), ("COLORBLOCKED", "COLOR BLOCKED"),
+    ("CONTRAST", "CONTRAST"), ("PANEL", "PANEL"),
+    ("SMOOTH MATTE", "SMOOTH MATTE"), ("BUTTON FRONT", "BUTTON FRONT"),
+    ("SLIT FRONT", "SLIT FRONT"), ("SIDE SEAM SNAPS", "SIDE SEAM SNAPS"),
+    ("TWISTED OUTSEAM", "TWISTED OUTSEAM"), ("BELTED", "BELTED"),
+    ("DRAWSTRING", "DRAWSTRING"), ("ELASTIC WAIST", "ELASTIC WAIST"),
+    ("PINTUCKED", "PINTUCKED"), ("VENT", "VENT"), ("PLEATED", "PLEATED"),
+    ("DARTED", "DARTED"), ("STITCHED", "STITCHED"), ("PLEATY", "PLEATY"),
+    ("SEAMED", "SEAMED"), ("PRESSED", "PRESSED"), ("SEAM ", "SEAM"),
+    ("SEAMS", "SEAMS"), ("INSET", "INSET"), ("SIDE ZIP", "SIDE ZIP"),
+    ("ZIP ", "ZIP"), ("RIPPED", "RIPPED"), ("TRASHED", "TRASHED"),
+    ("PATCHWORK", "PATCHWORK"), ("SPLATTER", "SPLATTER"),
+    ("REWORKED", "REWORKED"), ("DISTRESSED", "DISTRESSED"),
+    ("DESTROYED", "DESTROYED"), ("W KNEE SLITS", "W KNEE SLITS"),
+    ("W KNEE RIPS", "W KNEE RIPS"), ("EXPOSED", "EXPOSED"),
+    ("REPAIR", "REPAIR"), ("CUT-OUT", "CUT OUT"), ("PATCH", "PATCH"),
+    ("KNEE", "KNEE"), ("SLITS", "SLITS"), ("SLIT FRONT", "SLIT FRONT"),
+    ("RIP ", "RIP"), ("RIPS", "RIPS"), ("BRAIDED", "BRAIDED"),
+    ("EMBROIDERED FLORAL", "EMBROIDERED FLORAL"),
+    ("FLORAL EMBROIDERY", "FLORAL EMBROIDERY"), ("LACE ", "LACE"),
+    ("BEADED", "BEADED"), ("ACCENT HARDWARE", "ACCENT HARDWARE"),
+    ("HARDWARE", "HARDWARE"), ("W/ STUD DETAILING", "W/ STUD DETAILING"),
+    ("STUDDED", "STUDDED"), ("SEQUIN", "SEQUIN"), ("STONED", "STONED"),
+    ("PEARL ", "PEARL"), ("CRYSTAL STARS", "CRYSTAL STARS"),
+    ("CRYSTAL", "CRYSTAL"), ("KRYSTAL", "KRYSTAL"), ("SPARKLE", "SPARKLE"),
+    ("DIAMOND", "DIAMOND"), ("RHINESTONE", "RHINESTONE"), ("STAR ", "STAR"),
+    ("STARS", "STARS"), ("FRINGE", "FRINGE"), ("STRIPES", "STRIPES"),
+    ("STRIPE ", "STRIPE"), ("EMBROIDERY", "EMBROIDERY"),
+    ("EMBELLISHMENT", "EMBELLISHMENT"), ("DETAIL", "DETAIL"),
+    ("TRIMMED", "TRIMMED"), ("TRIM ", "TRIM"),
+    ("W DARTED BACK POCKET", "W DARTED BACK POCKET"),
+    ("W DARTED BACK PKT", "W DARTED BACK PKT"),
+    ("SPLIT POCKETS", "SPLIT POCKETS"), ("PATCH POCKET", "PATCH POCKET"),
+    ("WELT POCKET", "WELT POCKET"), ("BACK POCKET", "BACK POCKET"),
+    ("FLAP ", "FLAP"), ("POCKET", "POCKET"),
+    ("W DOUBLE NEEDLE TROUSER HEM", "W DOUBLE NEEDLE TROUSER HEM"),
+    ("FRAYED SEAMS", "FRAYED SEAMS"), ("FRAYED SEAM", "FRAYED SEAM"),
+    ("W CUFFED HEM", "W CUFFED HEM"), ("TROUSER HEM", "TROUSER HEM"),
+    ("CHEWED", "CHEWED"), ("CUTOFF", "CUTOFF"), ("FRAY", "FRAY"),
+    ("ROLLED HEM", "ROLLED HEM"), ("HOVER CUFF", "HOVER CUFF"),
+    ("RAW HEM", "RAW HEM"), ("RAW", "RAW"), ("ROLLED", "ROLLED"),
+    ("SLICE", "SLICE"), ("SLIT", "SLIT"), ("SPLICED", "SPLICED"),
+    ("SPLIT", "SPLIT"), ("STEP FRAY", "STEP FRAY"), ("SLIT HEM", "SLIT HEM"),
+    ("WIDE CUFF", "WIDE CUFF"), ("WIDE HEM", "WIDE HEM"), ("CUFF", "CUFF"),
+    ("CUFFED", "CUFFED"), ("HEM", "HEM"),
+]
+JEAN_STYLE_ADJ_KEYWORDS: List[Tuple[str, str]] = [
+    ("SLIM", "SLIM"), ("STANDARD", "STANDARD"), ("EXTREME", "EXTREME"),
+    ("RELAXED", "RELAXED"), ("CURVE", "CURVE"), ("KICK", "KICK"),
+    ("MINI", "MINI"), ("TRUE", "TRUE"), ("MICRO", "MICRO"),
+    ("OVERSIZED", "OVERSIZED"), ("LOW SLUNG", "LOW SLUNG"), ("WIDE", "WIDE"),
+]
+
+# Product Line resolution, in order. Add new lines between GOOD EASE and
+# GOOD ICON (or anywhere in this list) as needed.
+PRODUCT_LINE_CONTAINS_RULES: List[Tuple[str, str]] = [
+    ("THE KHLOE", "THE KHLOE"),
+    ("ALWAYS FITS", "ALWAYS FITS"),
+    ("DOLLY", "DOLLY"),
+    ("GOOD LEGS", "GOOD LEGS"),
+    ("GOOD WAIST", "GOOD WAIST"),
+    ("GOOD CURVE", "GOOD CURVE"),
+    ("GOOD CLASSIC", "GOOD CLASSIC"),
+    ("GOOD 90", "GOOD 90s"),
+    ("JEANIUS", "JEANIUS"),
+    ("GOOD SKATE", "GOOD SKATE"),
+    ("GOOD EASE", "GOOD EASE"),
+    # <-- add additional product lines here
+    ("GOOD ICON", "GOOD ICON"),
+]
+
 CSV_HEADERS = [
     "Style Id",
     "Handle",
     "Published At",
     "Created At",
     "Product",
+    "Product Title Alt",
     "Style Name",
-    "Style Name - Grouping",
     "Product Type",
     "Tags",
     "Vendor",
@@ -150,7 +329,6 @@ CSV_HEADERS = [
     "Available for Sale",
     "Quantity Available",
     "Quantity of style",
-    "Instock Percent",
     "SKU - Shopify",
     "SKU - Brand",
     "Barcode",
@@ -1225,20 +1403,552 @@ def determine_stretch(description: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Product naming engine (Steps 1-7)
+# ---------------------------------------------------------------------------
+def _clean_naming_title(product_title: str) -> str:
+    """Everything before the first '|', trimmed."""
+    text = normalize_output_text(product_title or "")
+    return clean_text(text.split("|")[0])
+
+
+def mode1_first_match(title: str, pairs: List[Tuple[str, str]]) -> str:
+    """Return the first RAW keyword found anywhere in the title, else ''."""
+    hay = (title or "").upper()
+    for keyword, _label in pairs:
+        if keyword.upper() in hay:
+            return keyword
+    return ""
+
+
+def mode2_maximal_join(title: str, pairs: List[Tuple[str, str]]) -> str:
+    """Keep only the longest/most specific matches, join their labels.
+
+    A matched keyword is dropped when it is a substring of another, longer
+    matched keyword ("DOLLY" loses to "DOLLY PARTON"). Surviving labels are
+    emitted in keyword-list order.
+    """
+    hay = (title or "").upper()
+    matched = [(i, kw, lbl) for i, (kw, lbl) in enumerate(pairs)
+               if kw.upper() in hay]
+    if not matched:
+        return ""
+    survivors = []
+    for i, kw, lbl in matched:
+        ku = kw.upper().strip()
+        shadowed = any(
+            ku != other.upper().strip()
+            and len(other.upper().strip()) > len(ku)
+            and ku in other.upper().strip()
+            for _j, other, _l in matched
+        )
+        if not shadowed:
+            survivors.append((i, lbl))
+    out: List[str] = []
+    for _i, lbl in sorted(survivors):
+        if lbl and lbl not in out:
+            out.append(lbl)
+    return " ".join(out)
+
+
+def _naming_cleanups(text: str) -> str:
+    """90s normalization and the KHLOE accent fix."""
+    if not text:
+        return ""
+    out = re.sub(r"'?90'?[sS]\b", "90s", text)
+    out = out.replace("90S", "90s")
+    out = out.replace("KHLOÉ", "KHLOE").replace("KHLOé", "KHLOE")
+    return clean_text(out)
+
+
+def _join_pieces(pieces: List[str]) -> str:
+    return clean_text(" ".join(p for p in pieces if p))
+
+
+def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[str, str]:
+    """Steps 1-7. Returns every intermediate label plus the final outputs."""
+    title = _clean_naming_title(product_title)
+
+    # Step 1 — Mode 2 over each category
+    jean_style_label = mode2_maximal_join(title, JEAN_STYLE_KEYWORDS)
+    product_line_label = mode2_maximal_join(title, PRODUCT_LINE_KEYWORDS)
+    pullon_label = mode2_maximal_join(title, PULLON_KEYWORDS)
+    type2_label = mode2_maximal_join(title, TYPE2_KEYWORDS)
+    fabric_label = mode2_maximal_join(title, FABRIC_KEYWORDS)
+    inseam_label_kw = mode2_maximal_join(title, INSEAM_LABEL_KEYWORDS)
+    rise_label_kw = mode2_maximal_join(title, RISE_KEYWORDS)
+    inseam_style_label = mode2_maximal_join(title, INSEAM_STYLE_KEYWORDS)
+    type_label = mode2_maximal_join(title, TYPE_KEYWORDS)
+    styling_label = mode2_maximal_join(title, STYLING_KEYWORDS)
+
+    # Step 2 — JEAN_STYLE_ADJ special case
+    adj_first = mode1_first_match(title, JEAN_STYLE_ADJ_KEYWORDS)
+    if adj_first.upper() == "WIDE" and jean_style_label == "PALAZZO":
+        jean_style_adj = "WIDE"
+    elif adj_first.upper() == "WIDE":
+        jean_style_adj = mode2_maximal_join(title, JEAN_STYLE_ADJ_KEYWORDS[:-1])
+    else:
+        jean_style_adj = mode2_maximal_join(title, JEAN_STYLE_ADJ_KEYWORDS)
+
+    # Step 3 — WHATS_LEFT
+    removal_bits = [
+        mode1_first_match(title, JEAN_STYLE_ADJ_KEYWORDS),
+        mode1_first_match(title, JEAN_STYLE_KEYWORDS),
+        mode1_first_match(title, PRODUCT_LINE_KEYWORDS),
+        mode1_first_match(title, PULLON_KEYWORDS),
+        mode1_first_match(title, TYPE2_KEYWORDS),
+        mode1_first_match(title, FABRIC_KEYWORDS),
+        mode1_first_match(title, INSEAM_LABEL_KEYWORDS),
+        mode1_first_match(title, RISE_KEYWORDS),
+        mode1_first_match(title, INSEAM_STYLE_KEYWORDS),
+        mode1_first_match(title, TYPE_KEYWORDS),
+        mode1_first_match(title, STYLING_KEYWORDS),
+        jean_style_adj, jean_style_label, product_line_label, pullon_label,
+        type2_label, fabric_label, inseam_label_kw, rise_label_kw,
+        inseam_style_label, type_label, styling_label,
+    ]
+    removal_words = {w.upper() for w in " ".join(removal_bits).split() if w}
+    whats_left = " ".join(w for w in title.split()
+                          if w.upper() not in removal_words)
+    whats_left = clean_text(whats_left)
+
+    # Step 4 — VARIANT_TITLE_PRE
+    is_always_dolly = (product_line_label == "ALWAYS FITS"
+                       or "DOLLY" in product_line_label)
+    if is_always_dolly:
+        vt_pieces = [product_line_label, whats_left, jean_style_adj,
+                     jean_style_label, pullon_label, rise_label_kw,
+                     styling_label, fabric_label, inseam_style_label,
+                     type2_label, type_label, inseam_label_kw]
+    elif not whats_left and not product_line_label:
+        vt_pieces = [pullon_label, jean_style_adj, jean_style_label,
+                     rise_label_kw, styling_label, fabric_label,
+                     inseam_style_label, type2_label, type_label,
+                     inseam_label_kw]
+    elif not whats_left:
+        vt_pieces = [product_line_label, jean_style_adj, jean_style_label,
+                     pullon_label, rise_label_kw, styling_label, fabric_label,
+                     inseam_style_label, type2_label, type_label,
+                     inseam_label_kw]
+    else:
+        vt_pieces = [whats_left, jean_style_adj, jean_style_label,
+                     product_line_label, pullon_label, rise_label_kw,
+                     styling_label, fabric_label, inseam_style_label,
+                     type2_label, type_label, inseam_label_kw]
+    variant_title_pre = _naming_cleanups(_join_pieces(vt_pieces))
+
+    # Step 5 — STYLE_NAME_DRAFT
+    js_for_draft = jean_style_label or jean_style_first_word
+    if is_always_dolly:
+        sn_pieces = [product_line_label, whats_left, jean_style_adj,
+                     js_for_draft, pullon_label, type2_label]
+    elif not whats_left and not product_line_label:
+        sn_pieces = [pullon_label, jean_style_adj, js_for_draft, type2_label]
+    elif not whats_left:
+        sn_pieces = [product_line_label, jean_style_adj, js_for_draft,
+                     pullon_label, type2_label]
+    else:
+        sn_pieces = [whats_left, jean_style_adj, js_for_draft,
+                     product_line_label, pullon_label, type2_label]
+    style_name_draft = _naming_cleanups(_join_pieces(sn_pieces))
+
+    # Step 6 — STYLE NAME
+    draft = style_name_draft
+    only_jean_style = draft and draft in {jean_style_label,
+                                          jean_style_first_word}
+    if not draft:
+        style_name = _join_pieces([styling_label or fabric_label,
+                                   jean_style_first_word])
+    elif only_jean_style and not fabric_label and not styling_label:
+        style_name = _join_pieces([draft, type_label])
+    elif only_jean_style:
+        style_name = _join_pieces([styling_label or fabric_label, draft])
+    elif " " not in draft:
+        style_name = _join_pieces([styling_label or fabric_label, draft])
+    else:
+        style_name = draft
+    if "GOOD SKATE" in draft.upper():
+        after = draft.upper().split("GOOD SKATE", 1)[1].strip()
+        if not after.startswith("WIDE LEG"):
+            style_name = re.sub(r"GOOD SKATE(\s+WIDE)?", "GOOD SKATE WIDE LEG",
+                                style_name, count=1, flags=re.IGNORECASE)
+    style_name = _naming_cleanups(style_name)
+
+    # Step 7 — PRODUCT LINE
+    vt_up = variant_title_pre.upper()
+    product_line = ""
+    for needle, label in PRODUCT_LINE_CONTAINS_RULES:
+        if needle in vt_up:
+            product_line = label
+            break
+    if not product_line:
+        wl_up = whats_left.upper()
+        adj_up = jean_style_adj.upper()
+        if "GOOD" in wl_up and "BOOTCUT" in jean_style_label.upper():
+            product_line = _join_pieces(
+                ["GOOD", jean_style_adj if adj_up == "SLIM" else "",
+                 jean_style_label])
+        elif "GOOD " in wl_up:
+            product_line = _join_pieces(
+                [whats_left.split()[0],
+                 jean_style_adj if adj_up in {"KICK", "TRUE"} else "",
+                 jean_style_label])
+        elif "GOOD" in wl_up:
+            product_line = _join_pieces(
+                [whats_left, jean_style_adj if adj_up == "KICK" else "",
+                 jean_style_label])
+        elif "VINTAGE" in vt_up:
+            product_line = "VINTAGE"
+        elif "POWER STRETCH" in vt_up and "PULL ON" in vt_up:
+            product_line = "POWER STRETCH PULL ON"
+        elif "PULL ON" in vt_up:
+            product_line = "PULL ON"
+        elif product_line_label:
+            product_line = product_line_label
+
+    return {
+        "jean_style_label": jean_style_label,
+        "product_line_label": product_line_label,
+        "pullon_label": pullon_label,
+        "type2_label": type2_label,
+        "fabric_label": fabric_label,
+        "inseam_label_kw": inseam_label_kw,
+        "rise_label_kw": rise_label_kw,
+        "inseam_style_label": inseam_style_label,
+        "type_label": type_label,
+        "styling_label": styling_label,
+        "jean_style_adj": jean_style_adj,
+        "whats_left": whats_left,
+        "variant_title_pre": variant_title_pre,
+        "style_name_draft": style_name_draft,
+        "style_name": style_name,
+        "product_line": product_line,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jean Style
+# ---------------------------------------------------------------------------
+NON_TAPER_STYLES = {"Straight From Knee/Thigh", "Bootcut", "Wide Leg",
+                    "Boyfriend", "Baggy", "Flare", "Straight From Thigh"}
+TAPER_STYLES = {"Taper", "Tapered", "Skinny", "Barrel", "Straight From Knee"}
+
+
+def _kn(value: str) -> str:
+    """Lowercase, hyphens to spaces, collapse whitespace — for keyword tests."""
+    text = (value or "").lower().replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def jean_style_from_title(title: str) -> str:
+    t = " " + _kn(title) + " "
+
+    def has(*needles: str) -> bool:
+        return any(_kn(n) in t for n in needles)
+
+    if has("barrel"):
+        return "Barrel"
+    if has("boot", "bootcut"):
+        return "Bootcut"
+    if "flare " in t or has("flares"):
+        return "Flare"
+    if "legging " in t or has("leggings", "skinny"):
+        return "Skinny"
+    if has("good skate", "palazzo", "wide", "wide leg"):
+        return "Wide Leg"
+    if has("tapered", "relaxed skinny") or " mom " in t:
+        return "Tapered"
+    if (has("cigarette", "good icon", "slim straight", "soft stretch point")
+            or (has("compression") and has("straight"))
+            or (has("curve") and has("straight"))):
+        return "Straight From Knee"
+    if has("good icon", "good true straight", "vintage straight"):
+        return "Straight From Knee/Thigh"
+    if has("good 90", "oversized straight", "relaxed straight",
+           "standard straight", "the khloe"):
+        return "Straight From Thigh"
+    if has("baggy"):
+        return "Baggy"
+    return ""
+
+
+def jean_style_from_title_and_desc(title: str, description: str) -> str:
+    t, d = _kn(title), _kn(description)
+    if "straight" in t and any(k in d for k in
+                               ("slim straight", "slim, straight", "curve")):
+        return "Straight From Knee"
+    return ""
+
+
+def jean_style_from_desc(description: str) -> str:
+    d = " " + _kn(description) + " "
+
+    def has(*needles: str) -> bool:
+        return any(_kn(n) in d for n in needles)
+
+    if has("flare"):
+        return "Flare"
+    if has("skinny"):
+        return "Skinny"
+    if has("relaxed wide legs", "wide relaxed legs", "wide leg", "wide legs"):
+        return "Wide Leg"
+    if has("vintage inspired straight legs"):
+        return "Straight From Knee"
+    if (has("relaxed") and has("straight")) or has("straight leg from thigh"):
+        return "Straight From Thigh"
+    if has("baggy"):
+        return "Baggy"
+    if has("taper", "tapering", "tapered"):
+        return "Tapered"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Rise Label — title, then description, then tags
+# ---------------------------------------------------------------------------
+RISE_LABEL_RULES: List[Tuple[str, List[str]]] = [
+    ("Ultra High", ["SUPER HIGH WAIST", "SUPER HIGH-WAIST", "ULTRA HIGH WAIST",
+                    "ULTRA HIGH-WAIST", "SUPER HIGH RISE", "SUPER HIGH-RISE",
+                    "ULTRA HIGH RISE", "ULTRA HIGH-RISE", "SUPER HIGH"]),
+    ("Ultra Low",  ["SUPER LOW WAIST", "SUPER LOW-WAIST", "ULTRA LOW WAIST",
+                    "ULTRA LOW-WAIST", "SUPER LOW RISE", "SUPER LOW-RISE",
+                    "ULTRA LOW RISE", "ULTRA LOW-RISE", "SUPER LOW"]),
+    ("High",       ["STACKED WAIST", "HIGH WAISTED", "HIGH-WAISTED",
+                    "V-HIGH RISE", "HIGH WAIST", "HIGH-WAIST", "HIGH RISE",
+                    "HIGHRISE", "HIGH-RISE", "HIGH"]),
+    ("Low",        ["LOW WAISTED", "LOW-WAISTED", "LOW WAISED", "LOW WAIST",
+                    "LOW-WAIST", "LOW RISE", "LOW-RISE", "LOW", "LO"]),
+    ("Mid",        ["MID WAISTED", "MID RISE", "MID-RISE", "MID"]),
+]
+
+
+def determine_rise_label_v2(title: str, description: str, tags_str: str) -> str:
+    for source in (title, description, tags_str):
+        hay = _kn(source)
+        if not hay:
+            continue
+        for label, keywords in RISE_LABEL_RULES:
+            if any(_kn(k) in hay for k in keywords):
+                return label
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Inseam Label
+# ---------------------------------------------------------------------------
+def option_attribute_label(option2: str, option3: str) -> str:
+    """Regular / Long / Petite from the option attributes, else ''."""
+    values = {_kn(option2), _kn(option3)}
+    if values & {"regular", "standard"}:
+        return "Regular"
+    if values & {"long", "tall"}:
+        return "Long"
+    if values & {"short", "petite"}:
+        return "Petite"
+    return ""
+
+
+def determine_inseam_label_v2(option2: str, option3: str, title: str,
+                              inseam: str) -> str:
+    label = option_attribute_label(option2, option3)
+    if label:
+        return label
+    t = _kn(title)
+    if "petite" in t:
+        return "Petite"
+    if "long" in t or "tall" in t:
+        return "Long"
+    if "regular" in t or "standard" in t:
+        return "Regular"
+    try:
+        value = float(inseam)
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and value >= 33 and "petite" not in t and "regular" not in t:
+        return "Long"
+    return "Regular"
+
+
+# ---------------------------------------------------------------------------
+# Inseam
+# ---------------------------------------------------------------------------
+def _round_inseam(value: float) -> str:
+    out = f"{round(value, 3):g}"
+    return out
+
+
+def extract_inseam_v2(description: str, option2: str, option3: str,
+                      sku_no_size: str) -> str:
+    """PDP description first, then the trailing number in sku_brand_no_size."""
+    desc = description or ""
+    attr = option_attribute_label(option2, option3)
+    found = ""
+
+    # Paired forms, e.g. "Inseam Regular: 29 Inseam Long: 32"
+    pairs: Dict[str, str] = {}
+    for m in re.finditer(
+            r"Inseam\s+(Regular|Long|Short|Petite|Tall)\s*:\s*(\d+(?:\.\d+)?)",
+            desc, re.IGNORECASE):
+        pairs[m.group(1).lower()] = m.group(2)
+    # "Inseam: Short 27" | Regular 29"" / "Inseam: Regular 29" | Long 35""
+    for m in re.finditer(
+            r"(Regular|Long|Short|Petite|Tall)\s*(\d+(?:\.\d+)?)",
+            desc, re.IGNORECASE):
+        pairs.setdefault(m.group(1).lower(), m.group(2))
+    if pairs:
+        wanted = {"Regular": ["regular"], "Long": ["long", "tall"],
+                  "Petite": ["short", "petite"]}.get(attr, [])
+        for key in wanted:
+            if key in pairs:
+                found = pairs[key]
+                break
+
+    if not found:
+        m = re.search(r"Inseam\s*:\s*(\d+(?:\.\d+)?)", desc, re.IGNORECASE)
+        if m:
+            found = m.group(1)
+    if not found:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*[\"”]?\s*inseam", desc, re.IGNORECASE)
+        if m:
+            found = m.group(1)
+
+    # sku_brand_no_size: two dashes ending in a 2-digit number 20-40
+    if sku_no_size and sku_no_size.count("-") == 2:
+        m = re.search(r"-(\d{2})$", sku_no_size)
+        if m and 20 <= int(m.group(1)) <= 40:
+            sku_val = m.group(1)
+            if not found or float(sku_val) != float(found):
+                found = sku_val
+
+    if not found:
+        return ""
+    try:
+        return _round_inseam(float(found))
+    except ValueError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Quantity of style — sku_brand minus its size segment
+# ---------------------------------------------------------------------------
+def build_sku_no_size(sku_brand: str, size: str) -> str:
+    """Strip the trailing size (or its first two characters) from the SKU.
+
+    Only the LAST occurrence is removed, so GAGL873CE-B004-26-26 with size
+    "26 PLUS" becomes GAGL873CE-B004-26.
+    """
+    sku = (sku_brand or "").strip()
+    if not sku:
+        return ""
+    size_clean = (size or "").strip()
+    for candidate in (size_clean, size_clean.replace(" ", "-"),
+                      size_clean[:2]):
+        if not candidate:
+            continue
+        pattern = re.compile(r"-" + re.escape(candidate) + r"(?=$)",
+                             re.IGNORECASE)
+        m = None
+        for m in pattern.finditer(sku):
+            pass
+        if m:
+            return sku[:m.start()] + sku[m.end():]
+    return sku
+
+
+# ---------------------------------------------------------------------------
+# Inseam Style
+# ---------------------------------------------------------------------------
+def determine_inseam_style_v2(jean_style: str, inseam_label: str, inseam: str,
+                              keyword_fallback: str) -> str:
+    try:
+        value = float(inseam)
+    except (TypeError, ValueError):
+        value = None
+    if value is None:
+        return (keyword_fallback or "").replace("Crop", "Cropped").replace(
+            "Croppedped", "Cropped")
+
+    petite = inseam_label == "Petite"
+    if jean_style in NON_TAPER_STYLES:
+        if petite:
+            if value <= 25:
+                return "Cropped"
+            return "Ankle" if value < 28 else "Full Length"
+        if value <= 27:
+            return "Cropped"
+        return "Ankle" if value < 30 else "Full Length"
+    if jean_style in TAPER_STYLES:
+        if petite:
+            if value < 25.5:
+                return "Cropped"
+            return "Ankle" if value <= 27 else "Full Length"
+        if value < 27:
+            return "Cropped"
+        return "Ankle" if value <= 28.5 else "Full Length"
+    return (keyword_fallback or "").replace("Crop", "Cropped").replace(
+        "Croppedped", "Cropped")
+
+
+# ---------------------------------------------------------------------------
+# Product field
+# ---------------------------------------------------------------------------
+def _strip_accents_specials(text: str) -> str:
+    out = unicodedata.normalize("NFKD", text or "")
+    out = "".join(c for c in out if not unicodedata.combining(c))
+    out = out.replace("-", " ")
+    out = re.sub(r"[^\w\s|']", " ", out)
+    return re.sub(r"[ \t]+", " ", out).strip()
+
+
+def _place_before_pipe(product: str, word: str) -> str:
+    """Ensure `word` sits immediately before the ' | ' separator."""
+    if "|" not in product:
+        base, rest = product, ""
+    else:
+        base, rest = product.split("|", 1)
+        rest = "|" + rest
+    base = re.sub(rf"\b{word}\b", " ", base, flags=re.IGNORECASE)
+    base = re.sub(r"\s+", " ", base).strip()
+    return clean_text(f"{base} {word} {rest}") if rest else clean_text(f"{base} {word}")
+
+
+def build_product_field(product_title: str, variant_title: str) -> str:
+    product = normalize_output_text(product_title or "")
+    vt = _kn(variant_title)
+    upper = product.upper()
+
+    if "long" in vt and " LONG " not in f" {upper} ":
+        product = _place_before_pipe(product, "LONG")
+    elif "tall" in vt and " LONG " not in f" {upper} " and " TALL " not in f" {upper} ":
+        product = _place_before_pipe(product, "LONG")
+    if "petite" in vt and "PETITE" not in product.upper():
+        product = _place_before_pipe(product, "PETITE")
+    if "regular" in vt and "REGULAR" not in product.upper():
+        product = _place_before_pipe(product, "REGULAR")
+
+    # Tall anywhere becomes Long, parked before the pipe
+    if re.search(r"\bTALL\b", product, re.IGNORECASE):
+        product = re.sub(r"\bTALL\b", " ", product, flags=re.IGNORECASE)
+        product = _place_before_pipe(product, "LONG")
+    for word in ("LONG", "PETITE", "REGULAR"):
+        if re.search(rf"\b{word}\b", product, re.IGNORECASE):
+            product = _place_before_pipe(product, word)
+
+    product = _strip_accents_specials(product)
+    product = re.sub(r"'?90'?[sS]\b", "90s", product)
+    product = product.replace("90S", "90s")
+    if re.search(r"\bBOOT\b", product, re.IGNORECASE):
+        product = re.sub(r"\bBOOT\b", "BOOTCUT", product, flags=re.IGNORECASE)
+    return clean_text(product)
+
+
 def build_rows(
     products: List[Dict[str, object]],
     searchspring_map: Dict[str, Dict[str, str]],
     max_products: Optional[int],
     max_variants: Optional[int],
 ) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
     seen_products = 0
-
-    product_line_map = build_product_line_context(products)
-    base_counter = build_base_title_counter(products)
-    base_title_set = set(base_counter.keys())
-    grouping_key_set = build_grouping_key_set(products, product_line_map)
-
     staged_rows: List[Dict[str, str]] = []
 
     for product in products:
@@ -1253,36 +1963,25 @@ def build_rows(
 
         handle = product.get("handle", "")
         style_id = extract_gid_suffix(product.get("id"))
-        published_at = parse_date(product.get("publishedAt"))
-        created_at = parse_date(product.get("createdAt"))
         description = normalize_output_text(product.get("description") or "")
         tags = product.get("tags") or []
         tags = [normalize_output_text(tag) for tag in tags] if isinstance(tags, list) else []
-        tags_str = ", ".join(tags) if isinstance(tags, list) else normalize_output_text(str(tags))
-        vendor = normalize_output_text(product.get("vendor") or "")
+        tags_str = ", ".join(tags)
         online_store_url = product.get("onlineStoreUrl") or ""
+        pdp_active = bool(online_store_url)
         if not online_store_url:
             online_store_url = f"https://www.goodamerican.com/products/{handle}"
 
-        style_name = clean_text(normalize_output_text_keep_hyphen(product.get("title", "")).split("|")[0])
+        # Jean Style step 1 (title keywords) seeds the naming engine.
+        jean_style = jean_style_from_title(title)
+        naming = compute_naming(title, jean_style.split()[0] if jean_style else "")
 
-        product_line = product_line_map.get(str(product.get("id", "")), determine_product_line(title))
-        jean_style = determine_jean_style(title, description)
-        rise_label = determine_rise_label(description)
+        rise_label = determine_rise_label_v2(title, description, tags_str)
         hem_style = determine_hem_style(description)
-
-        style_grouping = build_style_grouping(
-            style_name,
-            product_line,
-            base_title_set,
-            grouping_key_set,
-        )
 
         images = product.get("images", {}).get("nodes", []) if isinstance(product.get("images"), dict) else []
         product_image = images[0].get("url") if images else ""
-
         searchspring = searchspring_map.get(handle, {})
-        instock_pct = searchspring.get("instock_pct", "")
         image_url = searchspring.get("image_url", "") or product_image
 
         variants = product.get("variants", {}).get("nodes", [])
@@ -1290,45 +1989,50 @@ def build_rows(
             continue
         if max_variants is not None:
             variants = variants[:max_variants]
-
         product_options = product.get("options") or []
-
-        total_inventory = product.get("totalInventory")
-        if total_inventory is None:
-            total_inventory = sum(
-                variant.get("quantityAvailable") or 0 for variant in variants
-            )
 
         for variant in variants:
             option1, option2, option3 = determine_variant_options(
                 product_options,
                 variant.get("selectedOptions") or [],
             )
-            size_value, length_value = parse_size_and_length(option2, option3)
-            variant_title = build_variant_title(title, size_value, length_value, option1, base_counter)
+            size_value, _length_value = parse_size_and_length(option2, option3)
+            sku_brand = variant.get("sku", "") or ""
+            sku_no_size = build_sku_no_size(sku_brand, size_value)
 
-            inseam_value = extract_inseam(description, option2, option3)
-            inseam_label = determine_inseam_label(option2, option3, title, inseam_value)
-            inseam_style = determine_inseam_style(title, handle, description, inseam_value)
+            inseam_value = extract_inseam_v2(description, option2, option3, sku_no_size)
+            inseam_label = determine_inseam_label_v2(option2, option3, title, inseam_value)
+            attr_label = option_attribute_label(option2, option3)
 
-            color_standardized = determine_color_standardized(tags, description)
-            color_simplified = determine_color_simplified(tags, description, color_standardized)
-            stretch = determine_stretch(description)
+            color_value = normalize_output_text(option1)
+            title_parts = [clean_text(part) for part in normalize_output_text(title).split("|")]
+            color_code = title_parts[1] if len(title_parts) > 1 and title_parts[1] else color_value
 
-            row = {
+            alt_parts = [naming["variant_title_pre"], color_code]
+            if attr_label:
+                alt_parts.append(attr_label.upper())
+            product_title_alt = " | ".join([p for p in alt_parts if p])
+            variant_title = " | ".join(
+                [p for p in alt_parts + ([size_value] if size_value else []) if p])
+
+            keyword_inseam_style = determine_inseam_style(title, handle, description, inseam_value)
+            inseam_style = determine_inseam_style_v2(
+                jean_style, inseam_label, inseam_value, keyword_inseam_style)
+
+            staged_rows.append({
                 "Style Id": style_id,
                 "Handle": handle,
-                "Published At": published_at,
-                "Created At": created_at,
-                "Product": title,
-                "Style Name": style_name,
-                "Style Name - Grouping": style_grouping,
+                "Published At": parse_date(product.get("publishedAt")),
+                "Created At": parse_date(product.get("createdAt")),
+                "Product": build_product_field(title, variant_title),
+                "Product Title Alt": product_title_alt,
+                "Style Name": naming["style_name"],
                 "Product Type": product_type,
                 "Tags": tags_str,
-                "Vendor": vendor,
+                "Vendor": normalize_output_text(product.get("vendor") or ""),
                 "Description": description,
                 "Variant Title": variant_title,
-                "Color": normalize_output_text(option1),
+                "Color": color_value,
                 "Size": size_value,
                 "Inseam": inseam_value,
                 "Price": (variant.get("price") or {}).get("amount", ""),
@@ -1336,30 +2040,140 @@ def build_rows(
                 "Promo": extract_promo(tags),
                 "Available for Sale": str(variant.get("availableForSale", "")),
                 "Quantity Available": str(variant.get("quantityAvailable", "")),
-                "Quantity of style": str(total_inventory),
-                "Instock Percent": instock_pct,
+                "Quantity of style": "",
                 "SKU - Shopify": extract_gid_suffix(variant.get("id")),
-                "SKU - Brand": variant.get("sku", ""),
+                "SKU - Brand": sku_brand,
                 "Barcode": variant.get("barcode", ""),
                 "Image URL": image_url,
                 "SKU URL": online_store_url,
                 "Jean Style": jean_style,
-                "Product Line": product_line,
+                "Product Line": naming["product_line"],
                 "Inseam Label": inseam_label,
                 "Rise Label": rise_label,
                 "Hem Style": hem_style,
                 "Inseam Style": inseam_style,
-                "Color - Simplified": color_simplified,
-                "Color - Standardized": color_standardized,
-                "Stretch": stretch,
-            }
-            staged_rows.append(row)
+                "Color - Simplified": determine_color_simplified(
+                    tags, description, determine_color_standardized(tags, description)),
+                "Color - Standardized": determine_color_standardized(tags, description),
+                "Stretch": determine_stretch(description),
+                "_style_name_draft": naming["style_name_draft"],
+                "_sku_no_size": sku_no_size,
+                "_pdp_active": "1" if pdp_active else "",
+            })
 
         seen_products += 1
 
-    rows.extend(staged_rows)
+    apply_jean_style_draft_fill(staged_rows)
+    fill_jean_style_from_text(staged_rows, stage="title_desc")
+    apply_jean_style_draft_fill(staged_rows)
+    fill_jean_style_from_text(staged_rows, stage="desc")
+    apply_jean_style_draft_fill(staged_rows)
+    refresh_inseam_style(staged_rows)
+    apply_quantity_of_style(staged_rows)
+    apply_duplicate_old_marker(staged_rows)
 
-    return rows
+    for row in staged_rows:
+        row.pop("_style_name_draft", None)
+        row.pop("_sku_no_size", None)
+        row.pop("_pdp_active", None)
+    return staged_rows
+
+
+def apply_jean_style_draft_fill(rows: List[Dict[str, str]]) -> None:
+    """Blank Jean Style inherits from rows sharing a STYLE_NAME_DRAFT."""
+    groups: Dict[str, Set[str]] = {}
+    for row in rows:
+        draft = row.get("_style_name_draft", "")
+        if draft and row["Jean Style"]:
+            groups.setdefault(draft, set()).add(row["Jean Style"])
+    for row in rows:
+        if row["Jean Style"]:
+            continue
+        values = groups.get(row.get("_style_name_draft", "")) or set()
+        if len(values) == 1:
+            row["Jean Style"] = next(iter(values))
+
+
+def fill_jean_style_from_text(rows: List[Dict[str, str]], stage: str) -> None:
+    for row in rows:
+        if row["Jean Style"]:
+            continue
+        if stage == "title_desc":
+            row["Jean Style"] = jean_style_from_title_and_desc(
+                row["Product"], row["Description"])
+        else:
+            row["Jean Style"] = jean_style_from_desc(row["Description"])
+
+
+def refresh_inseam_style(rows: List[Dict[str, str]]) -> None:
+    for row in rows:
+        keyword_fallback = determine_inseam_style(
+            row["Product"], row["Handle"], row["Description"], row["Inseam"])
+        row["Inseam Style"] = determine_inseam_style_v2(
+            row["Jean Style"], row["Inseam Label"], row["Inseam"], keyword_fallback)
+
+
+def apply_quantity_of_style(rows: List[Dict[str, str]]) -> None:
+    """Sum quantityAvailable across every row sharing a sku_brand_no_size."""
+    totals: Dict[str, int] = {}
+    for row in rows:
+        key = row.get("_sku_no_size", "")
+        if not key:
+            continue
+        try:
+            qty = int(float(row.get("Quantity Available") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        totals[key] = totals.get(key, 0) + qty
+    for row in rows:
+        key = row.get("_sku_no_size", "")
+        row["Quantity of style"] = str(totals.get(key, "")) if key in totals else ""
+
+
+def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
+    """Mark the superseded style when two Style Ids share a Product title.
+
+    The older style gets "OLD" appended after LONG/PETITE/REGULAR but before
+    the " | " separator. A style counts as superseded when none of its
+    variants are for sale and its PDP is gone; otherwise the one with the
+    oldest Created At date is marked.
+    """
+    by_product: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+    for row in rows:
+        by_product.setdefault(row["Product"], {}).setdefault(
+            row["Style Id"], []).append(row)
+
+    for _product, styles in by_product.items():
+        if len(styles) < 2:
+            continue
+        inactive = []
+        for style_id, style_rows in styles.items():
+            for_sale = any(r["Available for Sale"].lower() == "true" for r in style_rows)
+            pdp = any(r.get("_pdp_active") for r in style_rows)
+            if not for_sale and not pdp:
+                inactive.append(style_id)
+        if inactive:
+            targets = inactive
+        else:
+            def created(style_id: str) -> str:
+                raw = styles[style_id][0].get("Created At", "")
+                try:
+                    return datetime.strptime(raw, "%m/%d/%Y").isoformat()
+                except ValueError:
+                    return raw
+            targets = [min(styles, key=created)]
+        for style_id in targets:
+            for row in styles[style_id]:
+                row["Product"] = _insert_old_marker(row["Product"])
+
+
+def _insert_old_marker(product: str) -> str:
+    if re.search(r"OLD", product, re.IGNORECASE):
+        return product
+    if "|" in product:
+        base, rest = product.split("|", 1)
+        return clean_text(f"{clean_text(base)} OLD | {clean_text(rest)}")
+    return clean_text(f"{product} OLD")
 
 
 def write_csv(rows: List[Dict[str, str]]) -> Path:
