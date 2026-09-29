@@ -2066,8 +2066,8 @@ def build_rows(
             # The length segment comes from the option attributes when the
             # variant carries them, otherwise from the title's own keyword.
             length_segment = (attr_label or naming["inseam_label_kw"]).upper()
-            if length_segment in {"REGULAR", "STANDARD"}:
-                length_segment = ""
+            if length_segment == "STANDARD":
+                length_segment = "REGULAR"
             alt_parts = [naming["variant_title_pre"], color_code]
             if length_segment:
                 alt_parts.append(length_segment)
@@ -2286,11 +2286,14 @@ def apply_quantity_of_style(rows: List[Dict[str, str]]) -> None:
 
 
 def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
-    """Mark the superseded style when two Style Ids share a Product title.
+    """Mark the superseded style behind a duplicated Product title.
 
-    A style is only superseded when all three hold: every variant has
-    Available for Sale false, its PDP is gone, and its inventory is zero or
-    less. A duplicate whose twin is still live and sellable is left alone.
+    Grouping is by Product, which already carries the length word, so a legacy
+    handle holding two inseams only gets OLD on the length that has since been
+    split out into its own style. A style is marked when it is fully dead
+    (nothing for sale, PDP gone, no inventory); otherwise the oldest Created At
+    among the colliding styles is marked, so newer sales can be tracked
+    separately from the style they replaced.
     """
     by_product: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
     for row in rows:
@@ -2300,6 +2303,7 @@ def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
     for _product, styles in by_product.items():
         if len(styles) < 2:
             continue
+        dead = []
         for style_id, style_rows in styles.items():
             for_sale = any(r["Available for Sale"].lower() == "true"
                            for r in style_rows)
@@ -2310,9 +2314,22 @@ def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
                     inventory += int(float(r.get("Quantity Available") or 0))
                 except (TypeError, ValueError):
                     pass
-            if for_sale or pdp_live or inventory > 0:
-                continue
-            for row in style_rows:
+            if not for_sale and not pdp_live and inventory <= 0:
+                dead.append(style_id)
+
+        if dead:
+            targets = dead
+        else:
+            def created(style_id: str) -> str:
+                raw = styles[style_id][0].get("Created At", "")
+                try:
+                    return datetime.strptime(raw, "%m/%d/%Y").isoformat()
+                except ValueError:
+                    return raw
+            targets = [min(styles, key=created)]
+
+        for style_id in targets:
+            for row in styles[style_id]:
                 row["Product"] = _insert_old_marker(row["Product"])
 
 
