@@ -1467,9 +1467,30 @@ def _join_pieces(pieces: List[str]) -> str:
     return clean_text(" ".join(p for p in pieces if p))
 
 
+LENGTH_WORDS_IN_TITLE = ["LONG INSEAM", "PETITE", "REGULAR", "SHORT",
+                         "EXTENDED", "TALL", "LONG"]
+
+
+def _strip_length_words(title: str) -> str:
+    """Remove the length word so it cannot feed the other categories.
+
+    The length belongs in its own segment, and leaving it in makes the
+    two-letter rise keyword "LO" match inside "LONG" and stamp a spurious
+    LOW RISE onto every long-inseam style.
+    """
+    out = title
+    for word in LENGTH_WORDS_IN_TITLE:
+        out = re.sub(rf"\b{re.escape(word)}\b", " ", out, flags=re.IGNORECASE)
+    return clean_text(out)
+
+
 def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[str, str]:
     """Steps 1-7. Returns every intermediate label plus the final outputs."""
-    title = _clean_naming_title(product_title)
+    raw_title = _clean_naming_title(product_title)
+    # The length keyword is read from the raw title; everything else is read
+    # from the title with the length word taken out.
+    inseam_label_kw = mode2_maximal_join(raw_title, INSEAM_LABEL_KEYWORDS)
+    title = _strip_length_words(raw_title)
 
     # Step 1 — Mode 2 over each category
     jean_style_label = mode2_maximal_join(title, JEAN_STYLE_KEYWORDS)
@@ -1477,7 +1498,6 @@ def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[
     pullon_label = mode2_maximal_join(title, PULLON_KEYWORDS)
     type2_label = mode2_maximal_join(title, TYPE2_KEYWORDS)
     fabric_label = mode2_maximal_join(title, FABRIC_KEYWORDS)
-    inseam_label_kw = mode2_maximal_join(title, INSEAM_LABEL_KEYWORDS)
     rise_label_kw = mode2_maximal_join(title, RISE_KEYWORDS)
     inseam_style_label = mode2_maximal_join(title, INSEAM_STYLE_KEYWORDS)
     type_label = mode2_maximal_join(title, TYPE_KEYWORDS)
@@ -1525,18 +1545,16 @@ def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[
     elif not whats_left and not product_line_label:
         vt_pieces = [pullon_label, jean_style_adj, jean_style_label,
                      rise_label_kw, styling_label, fabric_label,
-                     inseam_style_label, type2_label, type_label,
-                     inseam_label_kw]
+                     inseam_style_label, type2_label, type_label]
     elif not whats_left:
         vt_pieces = [product_line_label, jean_style_adj, jean_style_label,
                      pullon_label, rise_label_kw, styling_label, fabric_label,
-                     inseam_style_label, type2_label, type_label,
-                     inseam_label_kw]
+                     inseam_style_label, type2_label, type_label]
     else:
         vt_pieces = [whats_left, jean_style_adj, jean_style_label,
                      product_line_label, pullon_label, rise_label_kw,
                      styling_label, fabric_label, inseam_style_label,
-                     type2_label, type_label, inseam_label_kw]
+                     type2_label, type_label]
     variant_title_pre = _naming_cleanups(_join_pieces(vt_pieces))
 
     # Step 5 — STYLE_NAME_DRAFT
@@ -1660,7 +1678,7 @@ def jean_style_from_title(title: str) -> str:
         return "Wide Leg"
     if has("tapered", "relaxed skinny") or " mom " in t:
         return "Tapered"
-    if (has("cigarette", "good icon", "slim straight", "soft stretch point")
+    if (has("cigarette", "slim straight", "soft stretch point")
             or (has("compression") and has("straight"))
             or (has("curve") and has("straight"))):
         return "Straight From Knee"
@@ -1826,7 +1844,7 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
                 break
 
     if not found:
-        m = re.search(r"Inseam\s*:\s*(\d+(?:\.\d+)?)", desc, re.IGNORECASE)
+        m = re.search(r"Inseam\s*:?\s*(\d+(?:\.\d+)?)", desc, re.IGNORECASE)
         if m:
             found = m.group(1)
     if not found:
@@ -1863,17 +1881,25 @@ def build_sku_no_size(sku_brand: str, size: str) -> str:
     if not sku:
         return ""
     size_clean = (size or "").strip()
-    for candidate in (size_clean, size_clean.replace(" ", "-"),
-                      size_clean[:2]):
-        if not candidate:
-            continue
-        pattern = re.compile(r"-" + re.escape(candidate) + r"(?=$)",
-                             re.IGNORECASE)
+    if not size_clean:
+        return sku
+    # A size can span several dash-separated segments ("14-18 PLUS" appears in
+    # the SKU as "-14-18"), so peel the trailing segments that belong to it.
+    size_tokens = [t for t in re.split(r"[\s-]+", size_clean.upper()) if t]
+    trimmed = sku
+    for token in reversed(size_tokens):
+        m = re.search(r"-" + re.escape(token) + r"$", trimmed, re.IGNORECASE)
+        if m:
+            trimmed = trimmed[:m.start()]
+    if trimmed != sku:
+        return trimmed
+    head = size_tokens[0][:2] if size_tokens else ""
+    if head:
         m = None
-        for m in pattern.finditer(sku):
+        for m in re.finditer(r"-" + re.escape(head) + r"$", sku, re.IGNORECASE):
             pass
         if m:
-            return sku[:m.start()] + sku[m.end():]
+            return sku[:m.start()]
     return sku
 
 
@@ -1918,8 +1944,9 @@ def _strip_accents_specials(text: str) -> str:
     out = unicodedata.normalize("NFKD", text or "")
     out = "".join(c for c in out if not unicodedata.combining(c))
     out = out.replace("-", " ")
-    out = re.sub(r"[^\w\s|']", " ", out)
-    return re.sub(r"[ \t]+", " ", out).strip()
+    out = re.sub(r"[^\w\s|'&]", " ", out)
+    out = re.sub(r"[ \t]+", " ", out).strip()
+    return re.sub(r"\s*\|\s*", " | ", out)
 
 
 def _place_before_pipe(product: str, word: str) -> str:
@@ -1934,9 +1961,12 @@ def _place_before_pipe(product: str, word: str) -> str:
     return clean_text(f"{base} {word} {rest}") if rest else clean_text(f"{base} {word}")
 
 
-def build_product_field(product_title: str, variant_title: str) -> str:
+def build_product_field(product_title: str, length_label: str) -> str:
+    """length_label is the variant's own length attribute, not the resolved
+    Inseam Label: a style whose options carry no length must not pick up a
+    REGULAR just because Inseam Label defaults to Regular."""
     product = normalize_output_text(product_title or "")
-    vt = _kn(variant_title)
+    vt = _kn(length_label)
     upper = product.upper()
 
     if "long" in vt and " LONG " not in f" {upper} ":
@@ -1994,8 +2024,11 @@ def build_rows(
         if not online_store_url:
             online_store_url = f"https://www.goodamerican.com/products/{handle}"
 
-        # Jean Style step 1 (title keywords) seeds the naming engine.
-        jean_style = jean_style_from_title(title)
+        # VARIANT_TITLE_PRE does not depend on Jean Style, so build it first
+        # and read the Jean Style keywords off it: it has the length word
+        # moved out, so phrases like "GOOD 90" stay contiguous.
+        naming = compute_naming(title, "")
+        jean_style = jean_style_from_title(naming["variant_title_pre"])
         naming = compute_naming(title, jean_style.split()[0] if jean_style else "")
 
         rise_label = determine_rise_label_v2(title, description, tags_str)
@@ -2033,6 +2066,8 @@ def build_rows(
             # The length segment comes from the option attributes when the
             # variant carries them, otherwise from the title's own keyword.
             length_segment = (attr_label or naming["inseam_label_kw"]).upper()
+            if length_segment in {"REGULAR", "STANDARD"}:
+                length_segment = ""
             alt_parts = [naming["variant_title_pre"], color_code]
             if length_segment:
                 alt_parts.append(length_segment)
@@ -2050,7 +2085,7 @@ def build_rows(
                 "Handle": handle,
                 "Published At": parse_date(product.get("publishedAt")),
                 "Created At": parse_date(product.get("createdAt")),
-                "Product": build_product_field(title, variant_title),
+                "Product": build_product_field(title, attr_label),
                 "Product Title Alt": product_title_alt,
                 "Style Name": naming["style_name"],
                 "Product Type": product_type,
@@ -2087,6 +2122,7 @@ def build_rows(
                 "_inseam_label_kw": naming["inseam_label_kw"],
                 "_color_code": color_code,
                 "_attr_label": length_segment_store,
+                "_variant_length": attr_label,
                 "_raw_title": title,
                 "_sku_no_size": sku_no_size,
                 "_pdp_active": "1" if pdp_active else "",
@@ -2109,6 +2145,7 @@ def build_rows(
         row.pop("_inseam_label_kw", None)
         row.pop("_color_code", None)
         row.pop("_attr_label", None)
+        row.pop("_variant_length", None)
         row.pop("_raw_title", None)
         row.pop("_style_name_draft", None)
         row.pop("_sku_no_size", None)
@@ -2140,9 +2177,19 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
         if row["Style Name"]:
             names_by_color.setdefault(key, set()).add(row["Style Name"].upper())
 
+    rows_by_name: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        rows_by_name.setdefault(row["Style Name"].upper(), []).append(row)
+
     for row in rows:
         kw = row.get("_inseam_label_kw", "")
         if not kw:
+            continue
+        # Only rescue a name that stands alone, or whose every sku is a
+        # length-specific one; a name shared with regular skus is already right.
+        peers = rows_by_name.get(row["Style Name"].upper(), [])
+        all_length_specific = all(r.get("_inseam_label_kw") for r in peers)
+        if not all_length_specific:
             continue
         stripped_sn = clean_text(re.sub(rf"\b{re.escape(kw)}\b", " ",
                                         row["Style Name"], flags=re.IGNORECASE))
@@ -2184,7 +2231,7 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
         row["Variant Title"] = " | ".join(
             [p for p in parts + ([size] if size else []) if p])
         row["Product"] = build_product_field(row.get("_raw_title", ""),
-                                             row["Variant Title"])
+                                             row.get("_variant_length", ""))
 
 
 def apply_jean_style_draft_fill(rows: List[Dict[str, str]]) -> None:
