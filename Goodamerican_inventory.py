@@ -1739,7 +1739,7 @@ def jean_style_from_title(title: str) -> str:
         return "Wide Leg"
     if has("tapered", "relaxed skinny") or " mom " in t:
         return "Tapered"
-    if (has("cigarette", "slim straight", "soft stretch point")
+    if (has("cigarette", "slim straight", "soft stretch point", "good boy")
             or (has("compression") and has("straight"))
             or (has("curve") and has("straight"))):
         return "Straight From Knee"
@@ -2236,6 +2236,10 @@ def build_rows(
     apply_jean_style_draft_fill(staged_rows)
     fill_jean_style_from_text(staged_rows, stage="desc")
     apply_jean_style_draft_fill(staged_rows)
+    fill_jean_style_from_handle(staged_rows)
+    fill_jean_style_from_style_name(staged_rows)
+    fill_jean_style_from_tags(staged_rows)
+    fill_jean_style_from_style_name(staged_rows)
     apply_jean_style_word_to_style_name(staged_rows)
     refresh_inseam_style(staged_rows)
     apply_quantity_of_style(staged_rows)
@@ -2488,6 +2492,37 @@ def fill_jean_style_from_text(rows: List[Dict[str, str]], stage: str) -> None:
                 row["Product"], row["Description"])
         else:
             row["Jean Style"] = jean_style_from_desc(row["Description"])
+
+
+def fill_jean_style_from_handle(rows: List[Dict[str, str]]) -> None:
+    """Last resort before sibling matching: the handle often names the fit."""
+    for row in rows:
+        if row["Jean Style"]:
+            continue
+        row["Jean Style"] = jean_style_from_title(row["Handle"])
+
+
+def fill_jean_style_from_style_name(rows: List[Dict[str, str]]) -> None:
+    """Inherit Jean Style from other skus carrying the same Style Name."""
+    by_name: Dict[str, List[str]] = {}
+    for row in rows:
+        if row["Style Name"] and row["Jean Style"]:
+            by_name.setdefault(row["Style Name"].upper(), []).append(
+                row["Jean Style"])
+    for row in rows:
+        if row["Jean Style"]:
+            continue
+        found = by_name.get((row["Style Name"] or "").upper())
+        if found:
+            row["Jean Style"] = Counter(found).most_common(1)[0][0]
+
+
+def fill_jean_style_from_tags(rows: List[Dict[str, str]]) -> None:
+    """Final fallback: run the keyword ladder over the product tags."""
+    for row in rows:
+        if row["Jean Style"]:
+            continue
+        row["Jean Style"] = jean_style_from_title(row["Tags"])
 
 
 def apply_jean_style_word_to_style_name(rows: List[Dict[str, str]]) -> None:
