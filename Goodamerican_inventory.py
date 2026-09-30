@@ -6,6 +6,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
+from difflib import SequenceMatcher
 from fractions import Fraction
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -2090,6 +2091,7 @@ def build_rows(
     searchspring_map: Dict[str, Dict[str, str]],
     max_products: Optional[int],
     max_variants: Optional[int],
+    session=None,
 ) -> List[Dict[str, str]]:
     seen_products = 0
     staged_rows: List[Dict[str, str]] = []
@@ -2223,7 +2225,8 @@ def build_rows(
 
         seen_products += 1
 
-    apply_good_insert_normalization(staged_rows)
+    apply_good_insert_normalization(staged_rows, session)
+    apply_good_palazzo_waist(staged_rows)
     apply_jean_style_draft_fill(staged_rows)
     fill_jean_style_from_text(staged_rows, stage="title_desc")
     apply_jean_style_draft_fill(staged_rows)
@@ -2246,15 +2249,76 @@ def build_rows(
     return staged_rows
 
 
+_SISTER_LINK_CACHE: Dict[str, List[str]] = {}
+_INSEAM_CONTAINER = "artificialVariantsInseamContainer"
+_PRODUCT_HREF = re.compile(r'href="/products/([^"?#]+)')
+
+
+def fetch_sister_variant_handles(session, handle: str) -> List[str]:
+    """Handles linked from the PDP's artificialVariantsInseam block.
+
+    Good American links a style to its other-inseam siblings there, so a
+    petite title points straight at the collection it belongs to. The links
+    are read from inside that container rather than by matching attributes on
+    the anchor: sisterVariantLink is also used by the colour swatches, which
+    would otherwise be picked up instead.
+    """
+    if handle in _SISTER_LINK_CACHE:
+        return _SISTER_LINK_CACHE[handle]
+    found: List[str] = []
+    try:
+        response = session.get(
+            f"https://www.goodamerican.com/products/{handle}", timeout=30)
+        if response.status_code == 200:
+            start = response.text.find(_INSEAM_CONTAINER)
+            if start >= 0:
+                block = response.text[start:start + 4000]
+                found = _PRODUCT_HREF.findall(block)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("sister-variant lookup failed for %s: %s", handle, exc)
+    found = [h for h in dict.fromkeys(found) if h != handle]
+    _SISTER_LINK_CACHE[handle] = found
+    return found
+
+
+def _description_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, normalize_key(left or ""),
+                           normalize_key(right or "")).ratio()
+
+
 GOOD_INSERT_WORDS = ["LEGS", "CLASSIC", "WAIST", "CURVE", "BOY"]
 
 
-def _normalize_color_key(color: str) -> str:
-    """BLACK001 and BLACK are the same colour for matching purposes."""
-    return re.sub(r"\d+$", "", (color or "").strip().upper())
+def _color_exact(row: Dict[str, str]) -> str:
+    return (row.get("_color_code") or "").strip().upper()
 
 
-def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
+def _color_base(row: Dict[str, str]) -> str:
+    """Digit-stripped colour, so BLACK001 can fall back to BLACK."""
+    return re.sub(r"\d+$", "", _color_exact(row))
+
+
+GOOD_INSERT_WORDS = ["LEGS", "CLASSIC", "WAIST", "CURVE", "BOY"]
+
+
+def _build_color_key_map(rows: List[Dict[str, str]]) -> Dict[str, str]:
+    """Fold BLACK001 into BLACK, but keep INDIGO254 apart from INDIGO271.
+
+    A numbered colour is only merged into its bare form when that bare form is
+    itself a colour in the data; otherwise stripping digits would lump every
+    shade of a wash together.
+    """
+    colors = {(row.get("_color_code") or "").strip().upper() for row in rows}
+    colors.discard("")
+    mapping: Dict[str, str] = {}
+    for color in colors:
+        base = re.sub(r"\d+$", "", color)
+        mapping[color] = base if base and base != color and base in colors else color
+    return mapping
+
+
+def apply_good_insert_normalization(rows: List[Dict[str, str]],
+                                    session=None) -> None:
     """Re-attach the collection word that a length-specific title drops.
 
     A petite/long title such as "ALWAYS FITS GOOD PETITE BOOTCUT JEANS" names
@@ -2264,23 +2328,37 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
     the insert is kept only when it matches a style name that already exists
     for the same colour.
     """
+    # Colours are compared exactly first. INDIGO254 and INDIGO271 are
+    # different washes, so digits cannot simply be dropped; the digit-stripped
+    # form is only consulted as a fallback, which is what lets BLACK001 find
+    # a sibling listed under plain BLACK.
     names_by_color: Dict[str, Set[str]] = {}
+    names_by_color_base: Dict[str, Set[str]] = {}
     for row in rows:
-        key = _normalize_color_key(row.get("_color_code", ""))
         if row["Style Name"]:
-            names_by_color.setdefault(key, set()).add(row["Style Name"].upper())
+            names_by_color.setdefault(_color_exact(row), set()).add(
+                row["Style Name"].upper())
+            names_by_color_base.setdefault(_color_base(row), set()).add(
+                row["Style Name"].upper())
 
     rows_by_name: Dict[str, List[Dict[str, str]]] = {}
+    rows_by_handle: Dict[str, List[Dict[str, str]]] = {}
     for row in rows:
         rows_by_name.setdefault(row["Style Name"].upper(), []).append(row)
+        rows_by_handle.setdefault(row["Handle"], []).append(row)
 
     for row in rows:
         kw = row.get("_inseam_label_kw", "")
         if not kw:
             continue
+        color_key = _color_exact(row)
         # Only rescue a name that stands alone, or whose every sku is a
         # length-specific one; a name shared with regular skus is already right.
-        peers = rows_by_name.get(row["Style Name"].upper(), [])
+        # Scope the "all skus are length-specific" test to this colour: the
+        # whole rule is colour-based, and a same-named style in another colour
+        # should not block the rescue.
+        peers = [r for r in rows_by_name.get(row["Style Name"].upper(), [])
+                 if _color_exact(r) == color_key]
         all_length_specific = all(r.get("_inseam_label_kw") for r in peers)
         if not all_length_specific:
             continue
@@ -2290,18 +2368,53 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
                                         row.get("_vt_pre", ""), flags=re.IGNORECASE))
         if not stripped_sn:
             continue
-        color_key = _normalize_color_key(row.get("_color_code", ""))
         siblings = names_by_color.get(color_key, set())
 
+        def collect(pool: Set[str]) -> List[Tuple[str, str]]:
+            out = []
+            for word in GOOD_INSERT_WORDS:
+                cand = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_sn, count=1,
+                              flags=re.IGNORECASE)
+                if cand.upper() in pool and cand.upper() != row["Style Name"].upper():
+                    out.append((word, cand))
+            return out
+
+        # Consider the exact colour and the digit-stripped one together: a
+        # style can be listed under BLACK while its sibling is BLACK001, and
+        # the exact pool alone would settle on the wrong collection. Any
+        # ambiguity this introduces is resolved below.
+        pool = set(siblings) | names_by_color_base.get(_color_base(row), set())
+        candidates = collect(pool)
+
         chosen_sn, chosen_vt = "", ""
-        for word in GOOD_INSERT_WORDS:
-            cand_sn = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_sn, count=1,
-                             flags=re.IGNORECASE)
-            if cand_sn.upper() in siblings and cand_sn.upper() != row["Style Name"].upper():
-                chosen_sn = cand_sn
-                chosen_vt = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_vt,
-                                   count=1, flags=re.IGNORECASE)
-                break
+        if len(candidates) > 1 and session is not None:
+            # Several collections share this colour. The PDP's sister-variant
+            # links name the exact style this length belongs to.
+            sister_names = {
+                r["Style Name"].upper()
+                for sister in fetch_sister_variant_handles(session, row["Handle"])
+                for r in rows_by_handle.get(sister, [])
+            }
+            for word, cand_sn in candidates:
+                if cand_sn.upper() in sister_names:
+                    candidates = [(word, cand_sn)]
+                    break
+        if len(candidates) > 1:
+            # Fall back to whichever candidate's copy reads most like this one.
+            best_score = -1.0
+            best = candidates[0]
+            for word, cand_sn in candidates:
+                peers = rows_by_name.get(cand_sn.upper(), [])
+                score = max((_description_similarity(row["Description"],
+                                                     peer["Description"])
+                             for peer in peers), default=0.0)
+                if score > best_score:
+                    best_score, best = score, (word, cand_sn)
+            candidates = [best]
+        if candidates:
+            word, chosen_sn = candidates[0]
+            chosen_vt = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_vt,
+                               count=1, flags=re.IGNORECASE)
         if not chosen_sn:
             # No sibling to match: still move the length word out of the name.
             chosen_sn, chosen_vt = stripped_sn, stripped_vt
@@ -2327,6 +2440,19 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
         row["Variant Title"] = dedupe_trailing_length(row["Variant Title"])
         row["Product"] = build_product_field(row.get("_raw_title", ""),
                                              row.get("_variant_length", ""))
+
+
+def apply_good_palazzo_waist(rows: List[Dict[str, str]]) -> None:
+    """A solitary "GOOD PALAZZO" is really "GOOD WAIST PALAZZO"."""
+    pattern = re.compile(r"\bGOOD\s+PALAZZO\b", re.IGNORECASE)
+    bare = {row["Style Name"] for row in rows
+            if row["Style Name"] and pattern.search(row["Style Name"])}
+    if len(bare) != 1:
+        return
+    for row in rows:
+        for field in ("Style Name", "_vt_pre"):
+            if row.get(field) and pattern.search(row[field]):
+                row[field] = pattern.sub("GOOD WAIST PALAZZO", row[field], count=1)
 
 
 def apply_jean_style_draft_fill(rows: List[Dict[str, str]]) -> None:
@@ -2515,6 +2641,7 @@ def main() -> None:
         searchspring_map,
         args.max_products,
         args.max_variants,
+        session,
     )
     logging.info("Rows prepared: %s", len(rows))
     write_csv(rows)
