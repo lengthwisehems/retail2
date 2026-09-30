@@ -2213,6 +2213,10 @@ def build_rows(
                 "Color - Standardized": determine_color_standardized(tags, description),
                 "Stretch": determine_stretch(description),
                 "_style_name_draft": naming["style_name_draft"],
+                "_jean_style_label": naming["jean_style_label"],
+                "_product_line_label": naming["product_line_label"],
+                "_pullon_label": naming["pullon_label"],
+                "_type2_label": naming["type2_label"],
                 "_vt_pre": naming["variant_title_pre"],
                 "_inseam_label_kw": naming["inseam_label_kw"],
                 "_color_code": color_code,
@@ -2232,6 +2236,7 @@ def build_rows(
     apply_jean_style_draft_fill(staged_rows)
     fill_jean_style_from_text(staged_rows, stage="desc")
     apply_jean_style_draft_fill(staged_rows)
+    apply_jean_style_word_to_style_name(staged_rows)
     refresh_inseam_style(staged_rows)
     apply_quantity_of_style(staged_rows)
     apply_duplicate_old_marker(staged_rows)
@@ -2243,6 +2248,10 @@ def build_rows(
         row.pop("_attr_label", None)
         row.pop("_variant_length", None)
         row.pop("_raw_title", None)
+        row.pop("_jean_style_label", None)
+        row.pop("_product_line_label", None)
+        row.pop("_pullon_label", None)
+        row.pop("_type2_label", None)
         row.pop("_style_name_draft", None)
         row.pop("_sku_no_size", None)
         row.pop("_pdp_active", None)
@@ -2479,6 +2488,41 @@ def fill_jean_style_from_text(rows: List[Dict[str, str]], stage: str) -> None:
                 row["Product"], row["Description"])
         else:
             row["Jean Style"] = jean_style_from_desc(row["Description"])
+
+
+def apply_jean_style_word_to_style_name(rows: List[Dict[str, str]]) -> None:
+    """Fill the Style Name's jean-style slot from the final Jean Style.
+
+    Step 5 uses JEAN_STYLE_LABEL when the title supplies one and otherwise
+    falls back to the first word of Jean Style. That fallback is only useful
+    once Jean Style is settled, which happens after the description and
+    sibling passes have run, so the slot is filled here rather than while the
+    name is first assembled.
+    """
+    for row in rows:
+        if row.get("_jean_style_label"):
+            continue
+        jean_style = row.get("Jean Style") or ""
+        if not jean_style:
+            continue
+        word = jean_style.split()[0].upper()
+        name = row.get("Style Name") or ""
+        if not name or re.search(rf"\b{re.escape(word)}\b", name, re.IGNORECASE):
+            continue
+        # Step 5 order: whats_left, adj, JEAN STYLE, product line, pullon, type2
+        tail_labels = [row.get("_product_line_label", ""),
+                       row.get("_pullon_label", ""),
+                       row.get("_type2_label", "")]
+        inserted = ""
+        for label in tail_labels:
+            if not label:
+                continue
+            m = re.search(rf"\b{re.escape(label)}\b", name, re.IGNORECASE)
+            if m:
+                inserted = clean_text(
+                    f"{name[:m.start()].strip()} {word} {name[m.start():].strip()}")
+                break
+        row["Style Name"] = inserted or clean_text(f"{name} {word}")
 
 
 def refresh_inseam_style(rows: List[Dict[str, str]]) -> None:
