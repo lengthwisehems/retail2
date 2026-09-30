@@ -1739,7 +1739,7 @@ def jean_style_from_title(title: str) -> str:
         return "Wide Leg"
     if has("tapered", "relaxed skinny") or " mom " in t:
         return "Tapered"
-    if (has("cigarette", "slim straight", "soft stretch point", "good boy")
+    if (has("cigarette", "slim straight", "soft stretch ponte", "good boy")
             or (has("compression") and has("straight"))
             or (has("curve") and has("straight"))):
         return "Straight From Knee"
