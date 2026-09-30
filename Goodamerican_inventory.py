@@ -1864,8 +1864,14 @@ def option_attribute_label(option2: str, option3: str) -> str:
 
 
 def determine_inseam_label_v2(option2: str, option3: str, title: str,
-                              inseam: str) -> str:
-    label = option_attribute_label(option2, option3)
+                              inseam: str, handle: str = "") -> str:
+    """Handle first, then the variant options, then the title, then inseam.
+
+    A length spelled out in the handle outranks the options, the same
+    precedence the Product and Variant Title fields use: a petite handle whose
+    options still read Regular is a petite sku.
+    """
+    label = handle_length_label(handle) or option_attribute_label(option2, option3)
     if label:
         return label
     t = _kn(title)
@@ -2150,7 +2156,8 @@ def build_rows(
             sku_no_size = build_sku_no_size(sku_brand, size_value)
 
             inseam_value = extract_inseam_v2(description, option2, option3, sku_no_size)
-            inseam_label = determine_inseam_label_v2(option2, option3, title, inseam_value)
+            inseam_label = determine_inseam_label_v2(
+                option2, option3, title, inseam_value, handle)
             attr_label = handle_length_label(handle) or option_attribute_label(option2, option3)
 
             color_value = normalize_output_text(option1)
