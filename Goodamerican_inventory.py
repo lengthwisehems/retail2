@@ -1344,6 +1344,8 @@ def determine_inseam_style(title: str, handle: str, description: str, inseam: st
             "floor sweeping",
             "floor-grazing",
             "hit just below the ankle",
+            "long line silhouette",
+            "slouchy leg",
         ]
     ):
         return "Full Length"
@@ -1670,14 +1672,14 @@ def compute_naming(product_title: str, jean_style_first_word: str = "",
                 ["GOOD", jean_style_adj if adj_up == "SLIM" else "",
                  jean_style_label])
         elif "GOOD " in wl_up:
+            # The adjective list can match more than one word ("STANDARD KICK");
+            # only the KICK/TRUE part belongs in the product line.
+            keep = next((w for w in ("KICK", "TRUE") if w in adj_up.split()), "")
             product_line = _join_pieces(
-                [whats_left.split()[0],
-                 jean_style_adj if adj_up in {"KICK", "TRUE"} else "",
-                 jean_style_label])
+                [whats_left.split()[0], keep, jean_style_label])
         elif "GOOD" in wl_up:
-            product_line = _join_pieces(
-                [whats_left, jean_style_adj if adj_up == "KICK" else "",
-                 jean_style_label])
+            keep = "KICK" if "KICK" in adj_up.split() else ""
+            product_line = _join_pieces([whats_left, keep, jean_style_label])
         elif "VINTAGE" in vt_up:
             product_line = "VINTAGE"
         elif "POWER STRETCH" in vt_up and "PULL ON" in vt_up:
@@ -1687,7 +1689,17 @@ def compute_naming(product_title: str, jean_style_first_word: str = "",
         elif product_line_label:
             product_line = product_line_label
 
+    if is_always_dolly:
+        sn_branch = "dolly"
+    elif not whats_left and not product_line_label:
+        sn_branch = "bare"
+    elif not whats_left:
+        sn_branch = "no_whats_left"
+    else:
+        sn_branch = "default"
+
     return {
+        "sn_branch": sn_branch,
         "jean_style_label": jean_style_label,
         "product_line_label": product_line_label,
         "pullon_label": pullon_label,
@@ -1739,6 +1751,8 @@ def jean_style_from_title(title: str) -> str:
         return "Wide Leg"
     if has("tapered", "relaxed skinny") or " mom " in t:
         return "Tapered"
+    if has("good icon"):
+        return "Straight From Knee/Thigh"
     if (has("cigarette", "slim straight", "soft stretch ponte", "good boy")
             or (has("compression") and has("straight"))
             or (has("curve") and has("straight"))):
@@ -1750,6 +1764,8 @@ def jean_style_from_title(title: str) -> str:
         return "Straight From Thigh"
     if has("baggy"):
         return "Baggy"
+    if has("straight"):
+        return "Straight From Knee"
     return ""
 
 
@@ -2092,6 +2108,204 @@ def build_product_field(product_title: str, length_label: str) -> str:
     return clean_text(product)
 
 
+
+# ---------------------------------------------------------------------------
+# Color - Standardized / Simplified
+# Ordered rules, first match wins, whole words only: "Standard" must not
+# register as "Tan", and "Stone" must not match inside "Stonewashed".
+# ---------------------------------------------------------------------------
+COLOR_STD_BY_COLOR: List[Tuple[str, List[str]]] = [
+    ("Animal Print", ["animal print", "leopard", "snake", "camo"]),
+    ("Print",        ["print", "stripes"]),
+    ("Blue",         ["blue", "bleu", "blues", "navy", "indigo"]),
+    ("Tan",          ["tan", "sand", "buff", "cement", "ginger", "sable",
+                      "beige", "khaki"]),
+    ("Brown",        ["brown", "cinnamon", "camel", "chocolate", "pecan",
+                      "oak", "coffee", "espresso"]),
+    ("Green",        ["green", "olive", "cypress", "moss", "sage"]),
+    ("Gray",         ["grey", "gray", "stone"]),
+    ("Orange",       ["orange"]),
+    ("Pink",         ["pink", "blush", "coral"]),
+    ("Purple",       ["purple", "violet"]),
+    ("Red",          ["red", "wine", "cherry", "burgundy"]),
+    ("White",        ["white", "ecru", "egret", "cream", "creme", "blizzard",
+                      "ivory", "parchment", "blanc"]),
+]
+COLOR_STD_YELLOW_TITLE = ["yellow", "sunny"]
+COLOR_STD_BLACK = ["black", "noir", "onyx", "raven"]
+COLOR_STD_TONE_TO_BLUE = ["dark", "medium", "light"]
+
+COLOR_STD_BY_DESC: List[Tuple[str, List[str]]] = [
+    ("Animal Print", ["animal print", "leopard", "snake"]),
+    ("Brown",        ["brown"]),
+    ("Green",        ["green", "olive"]),
+    ("Gray",         ["grey", "gray", "smoke"]),
+    ("Orange",       ["orange"]),
+    ("Pink",         ["pink"]),
+    ("Print",        ["print", "stripes"]),
+    ("Green",        ["green", "olive", "cypress", "sage"]),
+    ("Purple",       ["purple", "maroon", "violet"]),
+    ("Red",          ["red", "wine", "burgundy"]),
+    ("Tan",          ["tan", "beige", "khaki"]),
+    ("White",        ["white", "ecru", "pearly", "cream"]),
+    ("Yellow",       ["yellow"]),
+    ("Blue",         ["blue", "navy", "indigo"]),
+    ("Black",        ["black", "washed-black"]),
+]
+# Wash phrases that all imply a blue denim. "<tone> <colour> wash" is matched
+# with a wildcard so "dark indigo wash" counts too.
+COLOR_STD_WASH_PHRASES = [
+    "dark base", "acid wash", "dark rinse", "dark stretch denim", "dark wash",
+    "dark washed", "dark vintage wash", "dark vintage inspired wash",
+    "rich dark base", "rich, dark base", "medium base", "medium wash",
+    "medium vintage wash", "medium rinse", "medium washed",
+    "medium vintage inspired wash", "light wash", "light vintage wash",
+    "light rinse", "light washed", "light vintage inspired wash",
+    "season-ready wash", "medium-dark", "medium-light",
+]
+COLOR_STD_WASH_REGEX = re.compile(
+    r"\b(?:dark|medium|light)\s+\w+\s+wash\b", re.IGNORECASE)
+
+
+def _has_whole(text: str, phrase: str) -> bool:
+    return bool(re.search(r"\b" + re.escape(phrase) + r"\b", text))
+
+
+def _match_rules(text: str, rules: List[Tuple[str, List[str]]]) -> str:
+    for label, phrases in rules:
+        if any(_has_whole(text, p) for p in phrases):
+            return label
+    return ""
+
+
+def _color_words(color: str) -> str:
+    """Colour names carry a wash number (INDIGO964); drop it so whole-word
+    matching can still see the colour."""
+    return _kn(re.sub(r"(?<=[A-Za-z])\d+", "", color or ""))
+
+
+def color_standardized_v2(color: str, description: str, title: str) -> str:
+    """Steps 1-2: the colour name, then description cues."""
+    c = _color_words(color)
+    if c:
+        hit = _match_rules(c, COLOR_STD_BY_COLOR)
+        if hit:
+            return hit
+        if any(_has_whole(_kn(title), p) for p in COLOR_STD_YELLOW_TITLE):
+            return "Yellow"
+        if any(_has_whole(c, p) for p in COLOR_STD_BLACK):
+            return "Black"
+        if any(_has_whole(c, p) for p in COLOR_STD_TONE_TO_BLUE):
+            return "Blue"
+
+    d = _kn(description)
+    if d:
+        hit = _match_rules(d, COLOR_STD_BY_DESC)
+        if hit:
+            return hit
+        if any(_has_whole(d, p) for p in COLOR_STD_WASH_PHRASES) or \
+                COLOR_STD_WASH_REGEX.search(d):
+            return "Blue"
+    return ""
+
+
+COLOR_SIMPLE_BY_COLOR: List[Tuple[str, List[str]]] = [
+    ("Dark",   ["wine", "burgundy", "navy", "dark", "hunter green", "deep",
+                "midnight"]),
+    ("Light",  ["pastel", "cream", "blush", "icy", "moonwashed", "light"]),
+    ("Medium", ["medium", "mid"]),
+]
+COLOR_SIMPLE_LIGHT_TO_MEDIUM = [
+    "medium light", "light to medium", "medium to light", "light-to-medium",
+    "medium-to-light", "medium-light", "light-medium", "light/medium",
+    "medium/light", "light medium",
+]
+COLOR_SIMPLE_MEDIUM_TO_DARK = [
+    "medium to dark", "dark to medium", "dark-to-medium", "medium-to-dark",
+    "dark medium", "medium/dark", "dark/medium", "medium-dark", "dark-medium",
+]
+COLOR_SIMPLE_DARK = [
+    "dark", "deep", "black", "wine", "burgundy", "midnight blue",
+    "forest green", "navy", "complex wash", "darker",
+    "deep yet tranquil hue", "deep, luxurious wash", "deep, rich hue",
+    "rich yet subtle", "rich, deep blue", "urbane grey wash",
+]
+COLOR_SIMPLE_LIGHT = [
+    "light blue", "pale blue", "light vintage", "soft blue", "soft pink",
+    "ecru", "white", "acid wash", "acid-wash", "light", "khaki", "tan",
+    "ivory", "light gray wash", "light silver-blue", "light wash",
+    "lighter accents",
+]
+COLOR_SIMPLE_MEDIUM = [
+    "mid blue", "mid-blue", "medium stone wash", "classic stone washed blue",
+    "vintage washed blue", "classic vintage blue", "medium blue",
+    "medium wash", "classic blue", "medium-blue wash", "mid-tone blue wash",
+    "perfectly blended wash",
+]
+
+
+def color_simplified_v2(color: str, color_standardized: str,
+                        description: str) -> str:
+    """Steps 1-3: standardized colour, then the colour name, then description."""
+    std = (color_standardized or "").strip().lower()
+    if std in {"black", "brown"}:
+        return "Dark"
+    if std in {"white", "tan"}:
+        return "Light"
+
+    c = _color_words(color)
+    if c:
+        hit = _match_rules(c, COLOR_SIMPLE_BY_COLOR)
+        if hit:
+            return hit
+
+    d = _kn(description)
+    if not d:
+        return ""
+    has_medium = _has_whole(d, "medium")
+    has_light = _has_whole(d, "light")
+    has_dark = _has_whole(d, "dark")
+    if any(_has_whole(d, p) for p in COLOR_SIMPLE_LIGHT_TO_MEDIUM) or \
+            (has_medium and has_light):
+        return "Light to Medium"
+    if any(_has_whole(d, p) for p in COLOR_SIMPLE_MEDIUM_TO_DARK) or \
+            (has_dark and has_medium):
+        return "Medium to Dark"
+    if any(_has_whole(d, p) for p in COLOR_SIMPLE_DARK):
+        return "Dark"
+    if any(_has_whole(d, p) for p in COLOR_SIMPLE_LIGHT):
+        return "Light"
+    if any(_has_whole(d, p) for p in COLOR_SIMPLE_MEDIUM):
+        return "Medium"
+    return ""
+
+
+def apply_color_fallbacks(rows: List[Dict[str, str]]) -> None:
+    """Step 3/4: inherit from skus of the same colour, then the legacy rules."""
+    for field in ("Color - Standardized", "Color - Simplified"):
+        by_color: Dict[str, List[str]] = {}
+        for row in rows:
+            key = _kn(row.get("Color", ""))
+            if key and row.get(field):
+                by_color.setdefault(key, []).append(row[field])
+        for row in rows:
+            if row.get(field):
+                continue
+            found = by_color.get(_kn(row.get("Color", "")))
+            if found:
+                row[field] = Counter(found).most_common(1)[0][0]
+
+    for row in rows:
+        if not row.get("Color - Standardized"):
+            row["Color - Standardized"] = determine_color_standardized(
+                [t.strip() for t in row.get("Tags", "").split(",")],
+                row.get("Description", ""))
+        if not row.get("Color - Simplified"):
+            row["Color - Simplified"] = determine_color_simplified(
+                [t.strip() for t in row.get("Tags", "").split(",")],
+                row.get("Description", ""), row.get("Color - Standardized", ""))
+
+
 def build_rows(
     products: List[Dict[str, object]],
     searchspring_map: Dict[str, Dict[str, str]],
@@ -2181,6 +2395,8 @@ def build_rows(
             inseam_style = determine_inseam_style_v2(
                 jean_style, inseam_label, inseam_value, keyword_inseam_style)
 
+            color_std = color_standardized_v2(color_value, description, title)
+            color_simple = color_simplified_v2(color_value, color_std, description)
             staged_rows.append({
                 "Style Id": style_id,
                 "Handle": handle,
@@ -2215,12 +2431,12 @@ def build_rows(
                 "Rise Label": rise_label,
                 "Hem Style": hem_style,
                 "Inseam Style": inseam_style,
-                "Color - Simplified": determine_color_simplified(
-                    tags, description, determine_color_standardized(tags, description)),
-                "Color - Standardized": determine_color_standardized(tags, description),
+                "Color - Simplified": color_simple,
+                "Color - Standardized": color_std,
                 "Stretch": determine_stretch(description),
                 "_style_name_draft": naming["style_name_draft"],
                 "_jean_style_label": naming["jean_style_label"],
+                "_sn_branch": naming["sn_branch"],
                 "_product_line_label": naming["product_line_label"],
                 "_pullon_label": naming["pullon_label"],
                 "_type2_label": naming["type2_label"],
@@ -2238,6 +2454,7 @@ def build_rows(
 
     apply_good_insert_normalization(staged_rows, session)
     apply_good_palazzo_waist(staged_rows)
+    rebuild_piped_titles(staged_rows)
     apply_jean_style_draft_fill(staged_rows)
     fill_jean_style_from_text(staged_rows, stage="title_desc")
     apply_jean_style_draft_fill(staged_rows)
@@ -2249,6 +2466,7 @@ def build_rows(
     fill_jean_style_from_style_name(staged_rows)
     apply_jean_style_word_to_style_name(staged_rows)
     refresh_inseam_style(staged_rows)
+    apply_color_fallbacks(staged_rows)
     apply_quantity_of_style(staged_rows)
     apply_duplicate_old_marker(staged_rows)
 
@@ -2258,8 +2476,10 @@ def build_rows(
         row.pop("_color_code", None)
         row.pop("_attr_label", None)
         row.pop("_variant_length", None)
+        row.pop("_good_insert_word", None)
         row.pop("_raw_title", None)
         row.pop("_jean_style_label", None)
+        row.pop("_sn_branch", None)
         row.pop("_product_line_label", None)
         row.pop("_pullon_label", None)
         row.pop("_type2_label", None)
@@ -2399,26 +2619,29 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]],
                     out.append((word, cand))
             return out
 
-        # Consider the exact colour and the digit-stripped one together: a
-        # style can be listed under BLACK while its sibling is BLACK001, and
-        # the exact pool alone would settle on the wrong collection. Any
-        # ambiguity this introduces is resolved below.
-        pool = set(siblings) | names_by_color_base.get(_color_base(row), set())
-        candidates = collect(pool)
-
+        # The PDP's sister-variant link is the only hard evidence of which
+        # collection a length-only title belongs to, so it is consulted first
+        # and may name a style outside this colour's pool. Failing that, only
+        # the EXACT colour is trusted: falling back to the digit-stripped
+        # colour pulls in unrelated washes (BLACK284 has no siblings of its
+        # own, and borrowing BLACK's would invent a collection for it).
+        candidates = collect(siblings)
         chosen_sn, chosen_vt = "", ""
-        if len(candidates) > 1 and session is not None:
-            # Several collections share this colour. The PDP's sister-variant
-            # links name the exact style this length belongs to.
+
+        if session is not None and re.search(r"\bGOOD\b", stripped_sn, re.IGNORECASE):
             sister_names = {
                 r["Style Name"].upper()
                 for sister in fetch_sister_variant_handles(session, row["Handle"])
                 for r in rows_by_handle.get(sister, [])
             }
-            for word, cand_sn in candidates:
-                if cand_sn.upper() in sister_names:
-                    candidates = [(word, cand_sn)]
-                    break
+            if sister_names:
+                for word in GOOD_INSERT_WORDS:
+                    cand = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_sn,
+                                  count=1, flags=re.IGNORECASE)
+                    if cand.upper() in sister_names:
+                        candidates = [(word, cand)]
+                        break
+
         if len(candidates) > 1:
             # Fall back to whichever candidate's copy reads most like this one.
             best_score = -1.0
@@ -2436,10 +2659,13 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]],
             chosen_vt = re.sub(r"\bGOOD\b", f"GOOD {word}", stripped_vt,
                                count=1, flags=re.IGNORECASE)
         if not chosen_sn:
-            # No sibling to match: still move the length word out of the name.
+            # Nothing corroborates a collection word; just move the length
+            # word out of the name rather than guessing one.
             chosen_sn, chosen_vt = stripped_sn, stripped_vt
         row["Style Name"] = chosen_sn
         row["_vt_pre"] = chosen_vt
+        if candidates:
+            row["_good_insert_word"] = candidates[0][0]
 
     for row in rows:
         # Product Line reads VARIANT_TITLE_PRE, so it has to be recomputed
@@ -2458,8 +2684,32 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]],
             [p for p in parts + ([size] if size else []) if p])
         row["Product Title Alt"] = dedupe_trailing_length(row["Product Title Alt"])
         row["Variant Title"] = dedupe_trailing_length(row["Variant Title"])
+        # Product keeps the brand's own title wording; the collection word is
+        # only re-attached in the derived Style Name / piped titles.
         row["Product"] = build_product_field(row.get("_raw_title", ""),
                                              row.get("_variant_length", ""))
+
+
+def rebuild_piped_titles(rows: List[Dict[str, str]]) -> None:
+    """Re-assemble Product Title Alt / Variant Title from the current pieces.
+
+    Later passes (the Palazzo rule) edit VARIANT_TITLE_PRE, so the piped
+    titles and the Product Line that reads them have to be rebuilt.
+    """
+    for row in rows:
+        parts = [row.get("_vt_pre", ""), row.get("_color_code", "")]
+        if row.get("_attr_label"):
+            parts.append(row["_attr_label"].upper())
+        parts = [p for p in parts if p]
+        size = row.get("Size", "")
+        row["Product Title Alt"] = dedupe_trailing_length(" | ".join(parts))
+        row["Variant Title"] = dedupe_trailing_length(
+            " | ".join(parts + ([size] if size else [])))
+        vt_up = row.get("_vt_pre", "").upper()
+        for needle, label in PRODUCT_LINE_CONTAINS_RULES:
+            if needle in vt_up:
+                row["Product Line"] = label
+                break
 
 
 def apply_good_palazzo_waist(rows: List[Dict[str, str]]) -> None:
@@ -2551,10 +2801,21 @@ def apply_jean_style_word_to_style_name(rows: List[Dict[str, str]]) -> None:
         name = row.get("Style Name") or ""
         if not name or re.search(rf"\b{re.escape(word)}\b", name, re.IGNORECASE):
             continue
-        # Step 5 order: whats_left, adj, JEAN STYLE, product line, pullon, type2
-        tail_labels = [row.get("_product_line_label", ""),
-                       row.get("_pullon_label", ""),
-                       row.get("_type2_label", "")]
+        # Where the jean-style slot sits depends on the Step 5 branch. Only
+        # the default branch puts the product line after it; the DOLLY and
+        # ALWAYS FITS branch leads with the product line, and the branch with
+        # no WHATS_LEFT leads with the pull-on label.
+        branch = row.get("_sn_branch", "default")
+        if branch == "dolly":
+            tail_labels = [row.get("_pullon_label", ""), row.get("_type2_label", "")]
+        elif branch == "bare":
+            tail_labels = [row.get("_type2_label", "")]
+        elif branch == "no_whats_left":
+            tail_labels = [row.get("_pullon_label", ""), row.get("_type2_label", "")]
+        else:
+            tail_labels = [row.get("_product_line_label", ""),
+                           row.get("_pullon_label", ""),
+                           row.get("_type2_label", "")]
         inserted = ""
         for label in tail_labels:
             if not label:
@@ -2596,16 +2857,19 @@ LENGTH_SEGMENT_WORDS = ["LONG", "PETITE", "REGULAR"]
 
 
 def dedupe_trailing_length(text: str) -> str:
-    """Remove the length word before the first '|' when it also ends the string.
+    """Drop the length word from the name when it is also its own segment.
 
-    "ALWAYS FITS ... JEANS LONG | INDIGO446 | LONG" carries LONG twice; the
-    trailing segment is the authoritative one, so the copy in the name goes.
+    "ALWAYS FITS ... JEANS LONG | INDIGO446 | LONG" carries LONG twice. The
+    segment is authoritative, so the copy in the name goes. In Variant Title
+    the length sits before the size rather than last, so every segment after
+    the first is checked, not just the final one.
     """
     if not text or "|" not in text:
         return text
-    trailing = text.rsplit("|", 1)[1].strip().upper()
+    segments = [p.strip().upper() for p in text.split("|")[1:]]
     word = next((w for w in LENGTH_SEGMENT_WORDS
-                 if trailing == w or trailing.startswith(w + " ")), "")
+                 for seg in segments
+                 if seg == w or seg.startswith(w + " ")), "")
     if not word:
         return text
     head, rest = text.split("|", 1)
