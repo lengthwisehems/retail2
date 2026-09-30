@@ -6,6 +6,8 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
+from fractions import Fraction
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -173,6 +175,7 @@ PULLON_KEYWORDS: List[Tuple[str, str]] = [
 TYPE2_KEYWORDS: List[Tuple[str, str]] = [
     ("LEGGINGS", "LEGGINGS"), ("TROUSERS", "TROUSERS"),
     ("SWEATPANTS", "SWEATPANTS"), ("TROUSER ", "TROUSERS"),
+    ("TROUSER", "TROUSERS"),
 ]
 FABRIC_KEYWORDS: List[Tuple[str, str]] = [
     ("LIGHTWEIGHT", "LIGHT WEIGHT"), ("LIGHT WEIGHT", "LIGHT WEIGHT"),
@@ -427,6 +430,18 @@ def normalize_output_text(value: Optional[str]) -> str:
     return clean_text(text)
 
 
+def clean_description_text(value: Optional[str]) -> str:
+    """Straighten curly quotes/apostrophes and drop trademark marks."""
+    text = value or ""
+    for curly, straight in (("\u2018", "'"), ("\u2019", "'"), ("\u201a", "'"),
+                            ("\u201c", '"'), ("\u201d", '"'), ("\u201e", '"'),
+                            ("\u00b4", "'"), ("\u02bc", "'")):
+        text = text.replace(curly, straight)
+    for mark in ("\u2122", "\u00ae", "\u2120", "\u00a9"):
+        text = text.replace(mark, "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def normalize_key(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("-", " ").lower()).strip()
 
@@ -481,6 +496,22 @@ def normalize_size(value: Optional[str]) -> str:
     if not value:
         return ""
     return re.sub(r"\s+", " ", value.strip()).upper()
+
+
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
+def parse_datetime_central(value: Optional[str]) -> str:
+    """ISO timestamp -> 'M/D/YYYY H:MM:SS AM/PM' in US Central time."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    local = dt.astimezone(CENTRAL_TZ)
+    return (f"{local.month}/{local.day}/{local.year} "
+            f"{local.strftime('%I:%M:%S %p').lstrip('0')}")
 
 
 def parse_date(value: Optional[str]) -> str:
@@ -697,9 +728,21 @@ def fetch_searchspring_data(session: requests.Session) -> Dict[str, Dict[str, st
     return data_map
 
 
+_FILTER_PATTERNS = [
+    re.compile(r"\b" + re.escape(normalize_key(term)) + r"\b")
+    for term in FILTER_WORDS if normalize_key(term)
+]
+
+
 def has_excluded_title(title: str) -> bool:
+    """Drop the product when its title contains a filter word.
+
+    normalize_key lowercases, so the patterns are built from lowercased terms;
+    comparing the Title-Case list directly never matched. Whole-word matching
+    keeps "Top" from firing on a colour like "Topaz".
+    """
     normalized = normalize_key(title)
-    return any(term in normalized for term in EXCLUDED_TITLE_TERMS)
+    return any(pattern.search(normalized) for pattern in _FILTER_PATTERNS)
 
 
 def is_excluded_product_type(product_type: str) -> bool:
@@ -1416,16 +1459,25 @@ def _clean_naming_title(product_title: str) -> str:
     return clean_text(text.split("|")[0])
 
 
-def mode1_first_match(title: str, pairs: List[Tuple[str, str]]) -> str:
+def _kw_present(keyword: str, hay: str, whole_word: bool) -> bool:
+    token = keyword.upper()
+    if whole_word:
+        return bool(re.search(r"\b" + re.escape(token.strip()) + r"\b", hay))
+    return token in hay
+
+
+def mode1_first_match(title: str, pairs: List[Tuple[str, str]],
+                      whole_word: bool = False) -> str:
     """Return the first RAW keyword found anywhere in the title, else ''."""
     hay = (title or "").upper()
     for keyword, _label in pairs:
-        if keyword.upper() in hay:
+        if _kw_present(keyword, hay, whole_word):
             return keyword
     return ""
 
 
-def mode2_maximal_join(title: str, pairs: List[Tuple[str, str]]) -> str:
+def mode2_maximal_join(title: str, pairs: List[Tuple[str, str]],
+                       whole_word: bool = False) -> str:
     """Keep only the longest/most specific matches, join their labels.
 
     A matched keyword is dropped when it is a substring of another, longer
@@ -1434,7 +1486,7 @@ def mode2_maximal_join(title: str, pairs: List[Tuple[str, str]]) -> str:
     """
     hay = (title or "").upper()
     matched = [(i, kw, lbl) for i, (kw, lbl) in enumerate(pairs)
-               if kw.upper() in hay]
+               if _kw_present(kw, hay, whole_word)]
     if not matched:
         return ""
     survivors = []
@@ -1486,7 +1538,8 @@ def _strip_length_words(title: str) -> str:
     return clean_text(out)
 
 
-def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[str, str]:
+def compute_naming(product_title: str, jean_style_first_word: str = "",
+                   handle: str = "") -> Dict[str, str]:
     """Steps 1-7. Returns every intermediate label plus the final outputs."""
     raw_title = _clean_naming_title(product_title)
     # The length keyword is read from the raw title; everything else is read
@@ -1497,10 +1550,15 @@ def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[
     # Step 1 — Mode 2 over each category
     jean_style_label = mode2_maximal_join(title, JEAN_STYLE_KEYWORDS)
     product_line_label = mode2_maximal_join(title, PRODUCT_LINE_KEYWORDS)
+    # The line can live only in the handle; slot it in so the Step 4/5 order
+    # places it exactly as a title-sourced product line would be placed.
+    if not product_line_label and "soft-tech" in (handle or "").lower():
+        product_line_label = "SOFT TECH"
     pullon_label = mode2_maximal_join(title, PULLON_KEYWORDS)
     type2_label = mode2_maximal_join(title, TYPE2_KEYWORDS)
     fabric_label = mode2_maximal_join(title, FABRIC_KEYWORDS)
-    rise_label_kw = mode2_maximal_join(title, RISE_KEYWORDS)
+    # Whole-word: otherwise "LO" matches inside FLOCKED and stamps LOW RISE.
+    rise_label_kw = mode2_maximal_join(title, RISE_KEYWORDS, whole_word=True)
     inseam_style_label = mode2_maximal_join(title, INSEAM_STYLE_KEYWORDS)
     type_label = mode2_maximal_join(title, TYPE_KEYWORDS)
     styling_label = mode2_maximal_join(title, STYLING_KEYWORDS)
@@ -1523,7 +1581,7 @@ def compute_naming(product_title: str, jean_style_first_word: str = "") -> Dict[
         mode1_first_match(title, TYPE2_KEYWORDS),
         mode1_first_match(title, FABRIC_KEYWORDS),
         mode1_first_match(title, INSEAM_LABEL_KEYWORDS),
-        mode1_first_match(title, RISE_KEYWORDS),
+        mode1_first_match(title, RISE_KEYWORDS, whole_word=True),
         mode1_first_match(title, INSEAM_STYLE_KEYWORDS),
         mode1_first_match(title, TYPE_KEYWORDS),
         mode1_first_match(title, STYLING_KEYWORDS),
@@ -1778,6 +1836,20 @@ def determine_rise_label_v2(title: str, description: str, tags_str: str) -> str:
 # ---------------------------------------------------------------------------
 # Inseam Label
 # ---------------------------------------------------------------------------
+HANDLE_LENGTH_WORDS = [("petite", "Petite"), ("short", "Petite"),
+                       ("long", "Long"), ("tall", "Long"),
+                       ("regular", "Regular")]
+
+
+def handle_length_label(handle: str) -> str:
+    """A length spelled out in the handle wins over the variant options."""
+    tokens = [t for t in (handle or "").lower().split("-") if t]
+    for token, label in HANDLE_LENGTH_WORDS:
+        if token in tokens:
+            return label
+    return ""
+
+
 def option_attribute_label(option2: str, option3: str) -> str:
     """Regular / Long / Petite from the option attributes, else ''."""
     values = {_kn(option2), _kn(option3)}
@@ -1814,6 +1886,23 @@ def determine_inseam_label_v2(option2: str, option3: str, title: str,
 # ---------------------------------------------------------------------------
 # Inseam
 # ---------------------------------------------------------------------------
+_NUM_WITH_FRACTION = r"\d+(?:\.\d+)?(?:\s+\d+\s*/\s*\d+)?"
+
+
+def _parse_inseam_number(text: str) -> Optional[float]:
+    """'32 1/2' -> 32.5, '33.5' -> 33.5."""
+    if not text:
+        return None
+    parts = text.strip().split()
+    total = 0.0
+    for part in parts:
+        try:
+            total += float(Fraction(part)) if "/" in part else float(part)
+        except (ValueError, ZeroDivisionError):
+            return None
+    return total
+
+
 def _round_inseam(value: float) -> str:
     out = f"{round(value, 3):g}"
     return out
@@ -1829,12 +1918,12 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
     # Paired forms, e.g. "Inseam Regular: 29 Inseam Long: 32"
     pairs: Dict[str, str] = {}
     for m in re.finditer(
-            r"Inseam\s+(Regular|Long|Short|Petite|Tall)\s*:\s*(\d+(?:\.\d+)?)",
+            rf"Inseam\s+(Regular|Long|Short|Petite|Tall)\s*:\s*({_NUM_WITH_FRACTION})",
             desc, re.IGNORECASE):
         pairs[m.group(1).lower()] = m.group(2)
     # "Inseam: Short 27" | Regular 29"" / "Inseam: Regular 29" | Long 35""
     for m in re.finditer(
-            r"(Regular|Long|Short|Petite|Tall)\s*(\d+(?:\.\d+)?)",
+            rf"(Regular|Long|Short|Petite|Tall)\s*({_NUM_WITH_FRACTION})",
             desc, re.IGNORECASE):
         pairs.setdefault(m.group(1).lower(), m.group(2))
     if pairs:
@@ -1846,11 +1935,12 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
                 break
 
     if not found:
-        m = re.search(r"Inseam\s*:?\s*(\d+(?:\.\d+)?)", desc, re.IGNORECASE)
+        m = re.search(rf"Inseam\s*:?\s*({_NUM_WITH_FRACTION})", desc, re.IGNORECASE)
         if m:
             found = m.group(1)
     if not found:
-        m = re.search(r"(\d+(?:\.\d+)?)\s*[\"”]?\s*inseam", desc, re.IGNORECASE)
+        m = re.search(rf"({_NUM_WITH_FRACTION})\s*[\"”]?\s*inseam", desc,
+                      re.IGNORECASE)
         if m:
             found = m.group(1)
 
@@ -1859,15 +1949,14 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
         m = re.search(r"-(\d{2})$", sku_no_size)
         if m and 20 <= int(m.group(1)) <= 40:
             sku_val = m.group(1)
-            if not found or float(sku_val) != float(found):
+            current = _parse_inseam_number(found) if found else None
+            if current is None or float(sku_val) != current:
                 found = sku_val
 
     if not found:
         return ""
-    try:
-        return _round_inseam(float(found))
-    except ValueError:
-        return ""
+    value = _parse_inseam_number(found)
+    return _round_inseam(value) if value is not None else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2017,7 +2106,8 @@ def build_rows(
 
         handle = product.get("handle", "")
         style_id = extract_gid_suffix(product.get("id"))
-        description = normalize_output_text(product.get("description") or "")
+        description = clean_description_text(
+            normalize_output_text(product.get("description") or ""))
         tags = product.get("tags") or []
         tags = [normalize_output_text(tag) for tag in tags] if isinstance(tags, list) else []
         tags_str = ", ".join(tags)
@@ -2029,9 +2119,9 @@ def build_rows(
         # VARIANT_TITLE_PRE does not depend on Jean Style, so build it first
         # and read the Jean Style keywords off it: it has the length word
         # moved out, so phrases like "GOOD 90" stay contiguous.
-        naming = compute_naming(title, "")
+        naming = compute_naming(title, "", handle)
         jean_style = jean_style_from_title(naming["variant_title_pre"])
-        naming = compute_naming(title, jean_style.split()[0] if jean_style else "")
+        naming = compute_naming(title, jean_style.split()[0] if jean_style else "", handle)
 
         rise_label = determine_rise_label_v2(title, description, tags_str)
         hem_style = determine_hem_style(description)
@@ -2059,7 +2149,7 @@ def build_rows(
 
             inseam_value = extract_inseam_v2(description, option2, option3, sku_no_size)
             inseam_label = determine_inseam_label_v2(option2, option3, title, inseam_value)
-            attr_label = option_attribute_label(option2, option3)
+            attr_label = handle_length_label(handle) or option_attribute_label(option2, option3)
 
             color_value = normalize_output_text(option1)
             title_parts = [clean_text(part) for part in normalize_output_text(title).split("|")]
@@ -2087,7 +2177,7 @@ def build_rows(
                 "Handle": handle,
                 "Published At": parse_date(product.get("publishedAt")),
                 "Created At": parse_date(product.get("createdAt")),
-                "Updated At": parse_date(product.get("updatedAt")),
+                "Updated At": parse_datetime_central(product.get("updatedAt")),
                 "Product": build_product_field(title, attr_label),
                 "Product Title Alt": product_title_alt,
                 "Style Name": naming["style_name"],
@@ -2233,6 +2323,8 @@ def apply_good_insert_normalization(rows: List[Dict[str, str]]) -> None:
         size = row.get("Size", "")
         row["Variant Title"] = " | ".join(
             [p for p in parts + ([size] if size else []) if p])
+        row["Product Title Alt"] = dedupe_trailing_length(row["Product Title Alt"])
+        row["Variant Title"] = dedupe_trailing_length(row["Variant Title"])
         row["Product"] = build_product_field(row.get("_raw_title", ""),
                                              row.get("_variant_length", ""))
 
@@ -2288,6 +2380,28 @@ def apply_quantity_of_style(rows: List[Dict[str, str]]) -> None:
         row["Quantity of style"] = str(totals.get(key, "")) if key in totals else ""
 
 
+LENGTH_SEGMENT_WORDS = ["LONG", "PETITE", "REGULAR"]
+
+
+def dedupe_trailing_length(text: str) -> str:
+    """Remove the length word before the first '|' when it also ends the string.
+
+    "ALWAYS FITS ... JEANS LONG | INDIGO446 | LONG" carries LONG twice; the
+    trailing segment is the authoritative one, so the copy in the name goes.
+    """
+    if not text or "|" not in text:
+        return text
+    trailing = text.rsplit("|", 1)[1].strip().upper()
+    word = next((w for w in LENGTH_SEGMENT_WORDS
+                 if trailing == w or trailing.startswith(w + " ")), "")
+    if not word:
+        return text
+    head, rest = text.split("|", 1)
+    cleaned = re.sub(rf"\b{word}\b", " ", head, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return f"{cleaned} |{rest}" if cleaned else text
+
+
 def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
     """Mark the superseded style behind a duplicated Product title.
 
@@ -2334,6 +2448,27 @@ def apply_duplicate_old_marker(rows: List[Dict[str, str]]) -> None:
         for style_id in targets:
             for row in styles[style_id]:
                 row["Product"] = _insert_old_marker(row["Product"])
+                for field in ("Product Title Alt", "Variant Title"):
+                    row[field] = _append_old_segment(row[field])
+
+
+def _append_old_segment(text: str) -> str:
+    """Mark the superseded style in the piped titles.
+
+    OLD follows the trailing length word when there is one, otherwise the
+    colour, so "... | BLUE004 | LONG" becomes "... | BLUE004 | LONG OLD".
+    """
+    if not text or re.search(r"\bOLD\b", text, re.IGNORECASE):
+        return text
+    parts = [p.strip() for p in text.split("|")]
+    for index in range(len(parts) - 1, -1, -1):
+        upper = parts[index].upper()
+        if any(upper == w or upper.startswith(w + " ")
+               for w in LENGTH_SEGMENT_WORDS):
+            parts[index] = f"{parts[index]} OLD"
+            return " | ".join(parts)
+    parts[-1] = f"{parts[-1]} OLD"
+    return " | ".join(parts)
 
 
 def _insert_old_marker(product: str) -> str:
