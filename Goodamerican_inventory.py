@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
+from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "Output"
@@ -2305,6 +2306,124 @@ def apply_color_fallbacks(rows: List[Dict[str, str]]) -> None:
                 [t.strip() for t in row.get("Tags", "").split(",")],
                 row.get("Description", ""), row.get("Color - Standardized", ""))
 
+    # The legacy rules spell it "Grey"; the output standardises on "Gray".
+    for row in rows:
+        if row.get("Color - Standardized", "").strip().lower() == "grey":
+            row["Color - Standardized"] = "Gray"
+
+
+# ---------------------------------------------------------------------------
+# Size guide fallback for Inseam
+# ---------------------------------------------------------------------------
+SIZE_GUIDE_SECTION = "product-ssr-size-guide"
+_SIZE_GUIDE_CACHE: Dict[str, str] = {}
+_PDP_TITLE_CACHE: Dict[str, Optional[str]] = {}
+
+
+def fetch_size_guide_title(session, handle: str) -> Optional[str]:
+    """The heading shown at the top of the PDP's Size Guide drawer.
+
+    Returned so it can be checked against the product title before the guide
+    is trusted; None means the drawer could not be read.
+    """
+    if handle in _PDP_TITLE_CACHE:
+        return _PDP_TITLE_CACHE[handle]
+    title = None
+    try:
+        response = session.get(
+            f"https://www.goodamerican.com/products/{handle}", timeout=30)
+        if response.status_code == 200:
+            marker = response.text.find('data-size-guide-loader-target="content"')
+            if marker > 0:
+                window = response.text[max(0, marker - 4000):marker]
+                headings = re.findall(r"<h2[^>]*>(.*?)</h2>", window, re.DOTALL)
+                if headings:
+                    text = re.sub(r"<[^>]+>", " ", headings[-1])
+                    title = re.sub(r"\s+", " ", text).strip()
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("size-guide title lookup failed for %s: %s", handle, exc)
+    _PDP_TITLE_CACHE[handle] = title
+    return title
+
+
+def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
+    """First Inseam value from the PDP's Size Guide drawer.
+
+    The drawer is lazy-loaded, so the table is pulled from the section
+    rendering endpoint the page itself uses. The drawer heading is checked
+    against the product title first; a guide belonging to another product is
+    ignored.
+    """
+    if handle in _SIZE_GUIDE_CACHE:
+        return _SIZE_GUIDE_CACHE[handle]
+    value = ""
+    try:
+        drawer_title = fetch_size_guide_title(session, handle)
+        expected = normalize_key(product_title.split("|")[0])
+        if drawer_title and expected and normalize_key(drawer_title) != expected:
+            logging.debug("size guide title mismatch for %s: %r vs %r",
+                          handle, drawer_title, product_title)
+            _SIZE_GUIDE_CACHE[handle] = ""
+            return ""
+
+        response = session.get(
+            f"https://www.goodamerican.com/products/{handle}",
+            params={"sections": SIZE_GUIDE_SECTION}, timeout=30)
+        if response.status_code == 200:
+            html = (response.json() or {}).get(SIZE_GUIDE_SECTION, "")
+            soup = BeautifulSoup(html, "html.parser")
+            for table in soup.find_all("table"):
+                table_rows = table.find_all("tr")
+                if len(table_rows) < 2:
+                    continue
+                headers = [c.get_text(" ", strip=True).lower()
+                           for c in table_rows[0].find_all(["th", "td"])]
+                if "inseam" not in headers:
+                    continue
+                column = headers.index("inseam")
+                for data_row in table_rows[1:]:
+                    cells = data_row.find_all(["th", "td"])
+                    if len(cells) <= column:
+                        continue
+                    raw = cells[column].get_text(" ", strip=True)
+                    m = re.search(_NUM_WITH_FRACTION, raw)
+                    if m:
+                        number = _parse_inseam_number(m.group(0))
+                        if number is not None:
+                            value = _round_inseam(number)
+                            break
+                if value:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("size guide lookup failed for %s: %s", handle, exc)
+    _SIZE_GUIDE_CACHE[handle] = value
+    return value
+
+
+def apply_size_guide_inseam(rows: List[Dict[str, str]], session) -> None:
+    """Fill a still-blank Inseam from the PDP size guide, then re-derive the
+    label and style that depend on it."""
+    if session is None:
+        return
+    pending = sorted({row["Handle"] for row in rows if not row["Inseam"].strip()})
+    if not pending:
+        return
+    logging.info("Size guide lookup for %s handles with no inseam", len(pending))
+    filled = 0
+    for row in rows:
+        if row["Inseam"].strip():
+            continue
+        value = fetch_size_guide_inseam(session, row["Handle"],
+                                        row.get("_raw_title", ""))
+        if not value:
+            continue
+        row["Inseam"] = value
+        filled += 1
+        row["Inseam Label"] = determine_inseam_label_v2(
+            row.get("_opt2", ""), row.get("_opt3", ""),
+            row.get("_raw_title", ""), value, row["Handle"])
+    logging.info("Size guide filled inseam on %s rows", filled)
+
 
 def build_rows(
     products: List[Dict[str, object]],
@@ -2446,6 +2565,8 @@ def build_rows(
                 "_attr_label": length_segment_store,
                 "_variant_length": attr_label,
                 "_raw_title": title,
+                "_opt2": option2,
+                "_opt3": option3,
                 "_sku_no_size": sku_no_size,
                 "_pdp_active": "1" if pdp_active else "",
             })
@@ -2465,6 +2586,7 @@ def build_rows(
     fill_jean_style_from_tags(staged_rows)
     fill_jean_style_from_style_name(staged_rows)
     apply_jean_style_word_to_style_name(staged_rows)
+    apply_size_guide_inseam(staged_rows, session)
     refresh_inseam_style(staged_rows)
     apply_color_fallbacks(staged_rows)
     apply_quantity_of_style(staged_rows)
@@ -2477,6 +2599,8 @@ def build_rows(
         row.pop("_attr_label", None)
         row.pop("_variant_length", None)
         row.pop("_good_insert_word", None)
+        row.pop("_opt2", None)
+        row.pop("_opt3", None)
         row.pop("_raw_title", None)
         row.pop("_jean_style_label", None)
         row.pop("_sn_branch", None)
