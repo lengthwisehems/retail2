@@ -2346,56 +2346,89 @@ def fetch_size_guide_title(session, handle: str) -> Optional[str]:
     return title
 
 
+def _inseam_from_size_guide_html(html: str) -> str:
+    """First value under the Inseam column of a size-guide table."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    for table in soup.find_all("table"):
+        table_rows = table.find_all("tr")
+        if len(table_rows) < 2:
+            continue
+        headers = [c.get_text(" ", strip=True).lower()
+                   for c in table_rows[0].find_all(["th", "td"])]
+        if "inseam" not in headers:
+            continue
+        column = headers.index("inseam")
+        for data_row in table_rows[1:]:
+            cells = data_row.find_all(["th", "td"])
+            if len(cells) <= column:
+                continue
+            m = re.search(_NUM_WITH_FRACTION,
+                          cells[column].get_text(" ", strip=True))
+            if m:
+                number = _parse_inseam_number(m.group(0))
+                if number is not None:
+                    return _round_inseam(number)
+    return ""
+
+
 def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
     """First Inseam value from the PDP's Size Guide drawer.
 
-    The drawer is lazy-loaded, so the table is pulled from the section
-    rendering endpoint the page itself uses. The drawer heading is checked
-    against the product title first; a guide belonging to another product is
-    ignored.
+    The drawer is lazy-loaded, so the table comes from the same section
+    rendering endpoint the page itself calls. The drawer heading is compared
+    with the product title first and a guide belonging to another product is
+    ignored; when the heading cannot be read the guide is still used, because
+    the request is already scoped to this product's URL.
+
+    Failures are logged at warning level: this depends on the live site, and a
+    silent empty result is indistinguishable from "no guide exists".
     """
     if handle in _SIZE_GUIDE_CACHE:
         return _SIZE_GUIDE_CACHE[handle]
     value = ""
+    url = f"https://www.goodamerican.com/products/{handle}"
     try:
         drawer_title = fetch_size_guide_title(session, handle)
         expected = normalize_key(product_title.split("|")[0])
         if drawer_title and expected and normalize_key(drawer_title) != expected:
-            logging.debug("size guide title mismatch for %s: %r vs %r",
-                          handle, drawer_title, product_title)
+            logging.info("Size guide skipped for %s: drawer titled %r, product %r",
+                         handle, drawer_title, expected)
             _SIZE_GUIDE_CACHE[handle] = ""
             return ""
 
-        response = session.get(
-            f"https://www.goodamerican.com/products/{handle}",
-            params={"sections": SIZE_GUIDE_SECTION}, timeout=30)
-        if response.status_code == 200:
-            html = (response.json() or {}).get(SIZE_GUIDE_SECTION, "")
-            soup = BeautifulSoup(html, "html.parser")
-            for table in soup.find_all("table"):
-                table_rows = table.find_all("tr")
-                if len(table_rows) < 2:
-                    continue
-                headers = [c.get_text(" ", strip=True).lower()
-                           for c in table_rows[0].find_all(["th", "td"])]
-                if "inseam" not in headers:
-                    continue
-                column = headers.index("inseam")
-                for data_row in table_rows[1:]:
-                    cells = data_row.find_all(["th", "td"])
-                    if len(cells) <= column:
-                        continue
-                    raw = cells[column].get_text(" ", strip=True)
-                    m = re.search(_NUM_WITH_FRACTION, raw)
-                    if m:
-                        number = _parse_inseam_number(m.group(0))
-                        if number is not None:
-                            value = _round_inseam(number)
-                            break
-                if value:
-                    break
+        # Do NOT send an Accept: application/json header here. Shopify
+        # answers that with an empty section body; the browser's default
+        # Accept is what returns the rendered table.
+        response = session.get(url, params={"sections": SIZE_GUIDE_SECTION},
+                               timeout=30, allow_redirects=True)
+        if response.status_code != 200:
+            logging.warning("Size guide HTTP %s for %s", response.status_code, handle)
+            _SIZE_GUIDE_CACHE[handle] = ""
+            return ""
+
+        html = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                html = payload.get(SIZE_GUIDE_SECTION) or ""
+        except ValueError:
+            html = response.text      # section markup served directly
+        value = _inseam_from_size_guide_html(html or response.text)
+
+        if not value:
+            # Last resort: some responses render the guide into the PDP body
+            # instead of answering the section request.
+            page = session.get(url, timeout=30)
+            if page.status_code == 200:
+                value = _inseam_from_size_guide_html(page.text)
+            if value:
+                logging.info("Size guide for %s read from the PDP body", handle)
+        if not value:
+            logging.warning(
+                "Size guide for %s returned no Inseam column (%s chars)",
+                handle, len(html or ""))
     except Exception as exc:  # noqa: BLE001
-        logging.debug("size guide lookup failed for %s: %s", handle, exc)
+        logging.warning("Size guide lookup failed for %s: %s", handle, exc)
     _SIZE_GUIDE_CACHE[handle] = value
     return value
 
