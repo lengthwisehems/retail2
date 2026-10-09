@@ -2316,6 +2316,25 @@ def apply_color_fallbacks(rows: List[Dict[str, str]]) -> None:
 # Size guide fallback for Inseam
 # ---------------------------------------------------------------------------
 SIZE_GUIDE_SECTION = "product-ssr-size-guide"
+# Good American rate-limits bursts of PDP requests; a 429 here is what turns
+# the whole lookup into silent blanks, so pace them and back off on 429.
+SIZE_GUIDE_DELAY = 0.4
+SIZE_GUIDE_RETRIES = 3
+SIZE_GUIDE_429_SLEEP = 10.0
+
+
+def _get_with_backoff(session, url, **kwargs):
+    """GET that waits out a 429 instead of giving up on it."""
+    for attempt in range(SIZE_GUIDE_RETRIES):
+        response = session.get(url, timeout=30, **kwargs)
+        if response.status_code != 429:
+            return response
+        retry_after = response.headers.get("Retry-After", "")
+        wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
+                else SIZE_GUIDE_429_SLEEP * (attempt + 1))
+        logging.warning("Rate limited (429) on %s; waiting %.1fs", url, wait)
+        time.sleep(wait)
+    return session.get(url, timeout=30, **kwargs)
 _SIZE_GUIDE_CACHE: Dict[str, str] = {}
 _PDP_TITLE_CACHE: Dict[str, Optional[str]] = {}
 
@@ -2330,8 +2349,8 @@ def fetch_size_guide_title(session, handle: str) -> Optional[str]:
         return _PDP_TITLE_CACHE[handle]
     title = None
     try:
-        response = session.get(
-            f"https://www.goodamerican.com/products/{handle}", timeout=30)
+        response = _get_with_backoff(
+            session, f"https://www.goodamerican.com/products/{handle}")
         if response.status_code == 200:
             marker = response.text.find('data-size-guide-loader-target="content"')
             if marker > 0:
@@ -2399,8 +2418,9 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
         # Do NOT send an Accept: application/json header here. Shopify
         # answers that with an empty section body; the browser's default
         # Accept is what returns the rendered table.
-        response = session.get(url, params={"sections": SIZE_GUIDE_SECTION},
-                               timeout=30, allow_redirects=True)
+        response = _get_with_backoff(session, url,
+                                     params={"sections": SIZE_GUIDE_SECTION},
+                                     allow_redirects=True)
         if response.status_code != 200:
             logging.warning("Size guide HTTP %s for %s", response.status_code, handle)
             _SIZE_GUIDE_CACHE[handle] = ""
@@ -2418,7 +2438,7 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
         if not value:
             # Last resort: some responses render the guide into the PDP body
             # instead of answering the section request.
-            page = session.get(url, timeout=30)
+            page = _get_with_backoff(session, url)
             if page.status_code == 200:
                 value = _inseam_from_size_guide_html(page.text)
             if value:
@@ -2446,8 +2466,11 @@ def apply_size_guide_inseam(rows: List[Dict[str, str]], session) -> None:
     for row in rows:
         if row["Inseam"].strip():
             continue
+        before = row["Handle"] in _SIZE_GUIDE_CACHE
         value = fetch_size_guide_inseam(session, row["Handle"],
                                         row.get("_raw_title", ""))
+        if not before:
+            time.sleep(SIZE_GUIDE_DELAY)
         if not value:
             continue
         row["Inseam"] = value
