@@ -345,6 +345,7 @@ CSV_HEADERS = [
     "Jean Style",
     "Product Line",
     "Inseam Label",
+    "Inseam Label Multi",
     "Rise Label",
     "Hem Style",
     "Inseam Style",
@@ -2481,6 +2482,131 @@ def apply_size_guide_inseam(rows: List[Dict[str, str]], session) -> None:
     logging.info("Size guide filled inseam on %s rows", filled)
 
 
+# ---------------------------------------------------------------------------
+# Inseam Label Multi
+# ---------------------------------------------------------------------------
+LENGTH_SEGMENT_SET = {"PETITE", "LONG", "REGULAR"}
+_INSEAM_SIBLING_CACHE: Dict[str, List[Tuple[str, str]]] = {}
+
+
+def _alt_base_and_length(alt: str) -> Tuple[str, str]:
+    """Split "NAME | COLOUR | PETITE" into its base and the length segment."""
+    parts = [p.strip() for p in (alt or "").split("|")]
+    if len(parts) > 1 and parts[-1].upper() in LENGTH_SEGMENT_SET:
+        return " | ".join(parts[:-1]), parts[-1].upper()
+    return (alt or "").strip(), ""
+
+
+def fetch_inseam_siblings(session, handle: str) -> List[Tuple[str, str]]:
+    """(handle, inseam label) pairs from the PDP's inseam container.
+
+    The container is populated only when a style is offered in more than one
+    inseam; an empty one means this is the only length, so [] distinguishes
+    single-inseam styles from multi-inseam ones.
+    """
+    if handle in _INSEAM_SIBLING_CACHE:
+        return _INSEAM_SIBLING_CACHE[handle]
+    found: List[Tuple[str, str]] = []
+    try:
+        response = _get_with_backoff(
+            session, f"https://www.goodamerican.com/products/{handle}")
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            container = soup.select_one(
+                '[data-product-target="artificialVariantsInseamContainer"]')
+            if container is not None and container.find(recursive=False):
+                for anchor in container.select('a[href^="/products/"]'):
+                    sibling = anchor["href"].split("/products/")[-1].split("?")[0]
+                    label = (anchor.get("data-inseam-label") or "").strip()
+                    found.append((sibling, label))
+        else:
+            logging.warning("Inseam container HTTP %s for %s",
+                            response.status_code, handle)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Inseam container lookup failed for %s: %s", handle, exc)
+    _INSEAM_SIBLING_CACHE[handle] = found
+    return found
+
+
+def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
+    """Mark styles offered in more than one inseam, and align their alt titles.
+
+    A style counts as Multi when stripping the length segment from its alt
+    title collides with another style's, which catches the pairs whose names
+    already line up. Anything with a length segment that finds no partner that
+    way is checked against the PDP's inseam container, which lists the sister
+    lengths explicitly. Those siblings then take the regular sku's wording, so
+    a petite variant reads under the same name as the style it belongs to.
+    """
+    for row in rows:
+        row["Inseam Label Multi"] = "Single"
+
+    # Step 1 - alt titles that collide once the length segment is removed
+    by_base: Dict[str, Set[str]] = {}
+    for row in rows:
+        base, _length = _alt_base_and_length(row["Product Title Alt"])
+        by_base.setdefault(base.upper(), set()).add(row["Style Id"])
+    for row in rows:
+        base, _length = _alt_base_and_length(row["Product Title Alt"])
+        if len(by_base.get(base.upper(), set())) > 1:
+            row["Inseam Label Multi"] = "Multi"
+
+    if session is None:
+        return
+
+    # Step 2 - ask the PDP about the ones a name match could not settle
+    rows_by_handle: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        rows_by_handle.setdefault(row["Handle"], []).append(row)
+
+    pending = sorted({
+        row["Handle"] for row in rows
+        if row["Inseam Label Multi"] == "Single"
+        and _alt_base_and_length(row["Product Title Alt"])[1]
+    })
+    if pending:
+        logging.info("Inseam container lookup for %s handles", len(pending))
+
+    groups: List[List[str]] = []
+    for handle in pending:
+        if rows_by_handle.get(handle, [{}])[0].get("Inseam Label Multi") == "Multi":
+            continue
+        siblings = fetch_inseam_siblings(session, handle)
+        if not siblings:
+            continue
+        family = [h for h, _ in siblings] or [handle]
+        if handle not in family:
+            family.append(handle)
+        for sibling in family:
+            for row in rows_by_handle.get(sibling, []):
+                row["Inseam Label Multi"] = "Multi"
+        groups.append(family)
+
+    # Step 3 - adopt the regular sku's wording across the family
+    for family in groups:
+        regular = ""
+        for sibling in family:
+            for row in rows_by_handle.get(sibling, []):
+                base, length = _alt_base_and_length(row["Product Title Alt"])
+                if not length or length == "REGULAR":
+                    regular = base
+                    break
+            if regular:
+                break
+        if not regular:
+            continue
+        for sibling in family:
+            for row in rows_by_handle.get(sibling, []):
+                base, length = _alt_base_and_length(row["Product Title Alt"])
+                if base.upper() == regular.upper():
+                    continue
+                row["Product Title Alt"] = (
+                    f"{regular} | {length}" if length else regular)
+                size = row.get("Size", "")
+                row["Variant Title"] = " | ".join(
+                    [p for p in (row["Product Title Alt"], size) if p])
+
+
 def build_rows(
     products: List[Dict[str, object]],
     searchspring_map: Dict[str, Dict[str, str]],
@@ -2603,6 +2729,7 @@ def build_rows(
                 "Jean Style": jean_style,
                 "Product Line": naming["product_line"],
                 "Inseam Label": inseam_label,
+                "Inseam Label Multi": "",
                 "Rise Label": rise_label,
                 "Hem Style": hem_style,
                 "Inseam Style": inseam_style,
@@ -2645,6 +2772,7 @@ def build_rows(
     apply_size_guide_inseam(staged_rows, session)
     refresh_inseam_style(staged_rows)
     apply_color_fallbacks(staged_rows)
+    apply_inseam_label_multi(staged_rows, session)
     apply_quantity_of_style(staged_rows)
     apply_duplicate_old_marker(staged_rows)
 
