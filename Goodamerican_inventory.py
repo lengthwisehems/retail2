@@ -2582,6 +2582,19 @@ def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
                 row["Inseam Label Multi"] = "Multi"
         groups.append(family)
 
+    # Every multi-inseam style names its length explicitly, so the regular
+    # member gets a REGULAR segment rather than being the unmarked one.
+    for row in rows:
+        if row["Inseam Label Multi"] != "Multi":
+            continue
+        base, length = _alt_base_and_length(row["Product Title Alt"])
+        if length:
+            continue
+        row["Product Title Alt"] = f"{base} | REGULAR"
+        size = row.get("Size", "")
+        row["Variant Title"] = " | ".join(
+            [p for p in (row["Product Title Alt"], size) if p])
+
     # Step 3 - adopt the regular sku's wording across the family
     for family in groups:
         regular = ""
