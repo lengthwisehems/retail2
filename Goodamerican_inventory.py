@@ -2324,6 +2324,34 @@ SIZE_GUIDE_RETRIES = 3
 SIZE_GUIDE_429_SLEEP = 10.0
 
 
+_PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
+
+
+def fetch_product_page(session, handle: str) -> Optional[str]:
+    """The PDP HTML, fetched once per handle and shared by every lookup.
+
+    The size-guide title, the sister-variant links and the inseam siblings all
+    read the same page. Fetching it once per handle instead of once per lookup
+    cuts the request count roughly threefold, which matters because the site
+    rate-limits bursts. Rotating HOST_ROTATION would not help here: the other
+    hosts redirect to www, so they share one rate limiter.
+    """
+    if handle in _PDP_PAGE_CACHE:
+        return _PDP_PAGE_CACHE[handle]
+    html = None
+    try:
+        response = _get_with_backoff(
+            session, f"https://www.goodamerican.com/products/{handle}")
+        if response.status_code == 200:
+            html = response.text
+        else:
+            logging.warning("PDP HTTP %s for %s", response.status_code, handle)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("PDP fetch failed for %s: %s", handle, exc)
+    _PDP_PAGE_CACHE[handle] = html
+    return html
+
+
 def _get_with_backoff(session, url, **kwargs):
     """GET that waits out a 429 instead of giving up on it."""
     for attempt in range(SIZE_GUIDE_RETRIES):
@@ -2350,12 +2378,11 @@ def fetch_size_guide_title(session, handle: str) -> Optional[str]:
         return _PDP_TITLE_CACHE[handle]
     title = None
     try:
-        response = _get_with_backoff(
-            session, f"https://www.goodamerican.com/products/{handle}")
-        if response.status_code == 200:
-            marker = response.text.find('data-size-guide-loader-target="content"')
+        page = fetch_product_page(session, handle)
+        if page:
+            marker = page.find('data-size-guide-loader-target="content"')
             if marker > 0:
-                window = response.text[max(0, marker - 4000):marker]
+                window = page[max(0, marker - 4000):marker]
                 headings = re.findall(r"<h2[^>]*>(.*?)</h2>", window, re.DOTALL)
                 if headings:
                     text = re.sub(r"<[^>]+>", " ", headings[-1])
@@ -2439,9 +2466,9 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
         if not value:
             # Last resort: some responses render the guide into the PDP body
             # instead of answering the section request.
-            page = _get_with_backoff(session, url)
-            if page.status_code == 200:
-                value = _inseam_from_size_guide_html(page.text)
+            page = fetch_product_page(session, handle)
+            if page:
+                value = _inseam_from_size_guide_html(page)
             if value:
                 logging.info("Size guide for %s read from the PDP body", handle)
         if not value:
@@ -2508,10 +2535,9 @@ def fetch_inseam_siblings(session, handle: str) -> List[Tuple[str, str]]:
         return _INSEAM_SIBLING_CACHE[handle]
     found: List[Tuple[str, str]] = []
     try:
-        response = _get_with_backoff(
-            session, f"https://www.goodamerican.com/products/{handle}")
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
+        page = fetch_product_page(session, handle)
+        if page:
+            soup = BeautifulSoup(page, "html.parser")
             container = soup.select_one(
                 '[data-product-target="artificialVariantsInseamContainer"]')
             if container is not None and container.find(recursive=False):
@@ -2519,9 +2545,6 @@ def fetch_inseam_siblings(session, handle: str) -> List[Tuple[str, str]]:
                     sibling = anchor["href"].split("/products/")[-1].split("?")[0]
                     label = (anchor.get("data-inseam-label") or "").strip()
                     found.append((sibling, label))
-        else:
-            logging.warning("Inseam container HTTP %s for %s",
-                            response.status_code, handle)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Inseam container lookup failed for %s: %s", handle, exc)
     _INSEAM_SIBLING_CACHE[handle] = found
@@ -2828,12 +2851,11 @@ def fetch_sister_variant_handles(session, handle: str) -> List[str]:
         return _SISTER_LINK_CACHE[handle]
     found: List[str] = []
     try:
-        response = session.get(
-            f"https://www.goodamerican.com/products/{handle}", timeout=30)
-        if response.status_code == 200:
-            start = response.text.find(_INSEAM_CONTAINER)
+        page = fetch_product_page(session, handle)
+        if page:
+            start = page.find(_INSEAM_CONTAINER)
             if start >= 0:
-                block = response.text[start:start + 4000]
+                block = page[start:start + 4000]
                 found = _PRODUCT_HREF.findall(block)
     except Exception as exc:  # noqa: BLE001
         logging.debug("sister-variant lookup failed for %s: %s", handle, exc)
