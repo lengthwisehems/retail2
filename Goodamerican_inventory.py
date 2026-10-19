@@ -2325,6 +2325,8 @@ SIZE_GUIDE_429_SLEEP = 10.0
 
 
 _PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
+# Counters so the run reports how much of the site it actually touched.
+_REQUEST_COUNTS: Dict[str, int] = {"pdp_pages": 0, "size_guide_sections": 0}
 
 
 def fetch_product_page(session, handle: str) -> Optional[str]:
@@ -2340,6 +2342,7 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
         return _PDP_PAGE_CACHE[handle]
     html = None
     try:
+        _REQUEST_COUNTS["pdp_pages"] += 1
         response = _get_with_backoff(
             session, f"https://www.goodamerican.com/products/{handle}")
         if response.status_code == 200:
@@ -2446,6 +2449,7 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
         # Do NOT send an Accept: application/json header here. Shopify
         # answers that with an empty section body; the browser's default
         # Accept is what returns the rendered table.
+        _REQUEST_COUNTS["size_guide_sections"] += 1
         response = _get_with_backoff(session, url,
                                      params={"sections": SIZE_GUIDE_SECTION},
                                      allow_redirects=True)
@@ -3337,6 +3341,11 @@ def main() -> None:
         session,
     )
     logging.info("Rows prepared: %s", len(rows))
+    logging.info("Product pages downloaded: %s (plus %s size-guide section "
+                 "requests) = %s requests to /products/",
+                 _REQUEST_COUNTS["pdp_pages"],
+                 _REQUEST_COUNTS["size_guide_sections"],
+                 _REQUEST_COUNTS["pdp_pages"] + _REQUEST_COUNTS["size_guide_sections"])
     write_csv(rows)
 
 
