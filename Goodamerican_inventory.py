@@ -89,6 +89,7 @@ EXCLUDED_PRODUCT_TYPES = {
     "pant suits",
     "shirts",
     "suits",
+    "skort",
     "sweaters",
     "sweatshirts",
     "tank tops",
