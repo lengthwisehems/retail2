@@ -2723,8 +2723,9 @@ def unify_color_within_style(rows: List[Dict[str, str]]) -> None:
     """One colour per handle + Style Id.
 
     The same style can report BLACK on some variants and BLACK001 on others;
-    they are one colourway, so the most common spelling wins, and the title's
-    own colour code breaks a tie.
+    they are one colourway. Only consistency matters, not whether the value
+    matches the handle, so the most common spelling wins and an exact tie
+    falls back to the title's colour code purely to stay deterministic.
     """
     groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
     for row in rows:
@@ -2757,8 +2758,9 @@ def unify_multi_inseam_style(rows: List[Dict[str, str]]) -> None:
             continue
         if row.get("Jean Style") not in TAPER_STYLES:
             continue
-        inseam = to_float(row.get("Inseam"))
-        if inseam is None:
+        try:
+            inseam = float(row.get("Inseam") or "")
+        except (TypeError, ValueError):
             continue
         alt = (row.get("Product Title Alt") or "").upper()
         if inseam == 32 and "LONG" in alt:
