@@ -54,7 +54,7 @@ FILTER_WORDS: List[str] = [
     "Pant Suit", "Pant Suits", "Purse", "Romper", "Rompers", "Sandel",
     "Sandle", "Scarf", "Scrunchie", "Shacket", "Shipping",
     "Shipping Protection", "Shirt", "Shirts", "Shirts & Tops", "Shoe",
-    "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Sleeve", "Sleeves",
+    "Shoes", "Short", "Shorts", "Skirt", "Skirts", "Skort", "Skorts", "Sleeve", "Sleeves",
     "Suit", "Suits", "Sweat", "Sweater", "Sweaters", "Sweatpant",
     "Sweatpants", "Sweats", "Sweatshirt", "Sweatshirts", "Swim", "T Shirt",
     "T Shirts", "Tank", "Tank Tops", "Tee", "Tees", "Top", "Vest", "Vests",
@@ -1512,6 +1512,11 @@ def mode2_maximal_join(title: str, pairs: List[Tuple[str, str]],
     return " ".join(out)
 
 
+def _style_name_caps(text: str) -> str:
+    """Style Name is upper case throughout, except the 90s decade marker."""
+    return re.sub(r"90S\b", "90s", (text or "").upper())
+
+
 def _naming_cleanups(text: str) -> str:
     """90s normalization and the KHLOE accent fix."""
     if not text:
@@ -1988,28 +1993,41 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
 # Quantity of style — sku_brand minus its size segment
 # ---------------------------------------------------------------------------
 def build_sku_no_size(sku_brand: str, size: str) -> str:
-    """Strip the trailing size (or its first two characters) from the SKU.
+    """Strip the trailing size from the SKU so a style's variants group.
 
-    Only the LAST occurrence is removed, so GAGL873CE-B004-26-26 with size
-    "26 PLUS" becomes GAGL873CE-B004-26.
+    The SKU does not always spell the size the same way the option does:
+    "14-18 PLUS" appears as "-14-18P". Several spellings are tried, longest
+    first, before falling back to peeling the size's tokens one at a time.
     """
     sku = (sku_brand or "").strip()
-    if not sku:
-        return ""
     size_clean = (size or "").strip()
-    if not size_clean:
+    if not sku or not size_clean:
         return sku
-    # A size can span several dash-separated segments ("14-18 PLUS" appears in
-    # the SKU as "-14-18"), so peel the trailing segments that belong to it.
-    size_tokens = [t for t in re.split(r"[\s-]+", size_clean.upper()) if t]
+
+    tokens = [t for t in re.split(r"[\s-]+", size_clean.upper()) if t]
+    candidates = {size_clean, size_clean.replace(" ", ""),
+                  size_clean.replace(" ", "-"), "-".join(tokens)}
+    for word, short in (("PLUS", "P"), ("PETITE", "P"), ("LONG", "L")):
+        if tokens and tokens[-1] == word:
+            stem = "-".join(tokens[:-1])
+            candidates.update({f"{stem}{short}", f"{stem}-{short}", stem})
+    candidates.discard("")
+
+    for candidate in sorted(candidates, key=len, reverse=True):
+        m = re.search(r"-" + re.escape(candidate) + r"$", sku, re.IGNORECASE)
+        if m:
+            return sku[:m.start()]
+
+    # Nothing matched outright: peel the size's tokens off the end one by one.
     trimmed = sku
-    for token in reversed(size_tokens):
+    for token in reversed(tokens):
         m = re.search(r"-" + re.escape(token) + r"$", trimmed, re.IGNORECASE)
         if m:
             trimmed = trimmed[:m.start()]
     if trimmed != sku:
         return trimmed
-    head = size_tokens[0][:2] if size_tokens else ""
+
+    head = tokens[0][:2] if tokens else ""
     if head:
         m = None
         for m in re.finditer(r"-" + re.escape(head) + r"$", sku, re.IGNORECASE):
@@ -2521,10 +2539,16 @@ _INSEAM_SIBLING_CACHE: Dict[str, List[Tuple[str, str]]] = {}
 
 
 def _alt_base_and_length(alt: str) -> Tuple[str, str]:
-    """Split "NAME | COLOUR | PETITE" into its base and the length segment."""
+    """Split "NAME | COLOUR | PETITE" into its base and the length segment.
+
+    The segment may carry the OLD marker ("LONG OLD"), so it is matched on its
+    leading word rather than by equality.
+    """
     parts = [p.strip() for p in (alt or "").split("|")]
-    if len(parts) > 1 and parts[-1].upper() in LENGTH_SEGMENT_SET:
-        return " | ".join(parts[:-1]), parts[-1].upper()
+    if len(parts) > 1:
+        last = parts[-1].upper()
+        if any(last == w or last.startswith(w + " ") for w in LENGTH_SEGMENT_SET):
+            return " | ".join(parts[:-1]), last
     return (alt or "").strip(), ""
 
 
@@ -2568,11 +2592,14 @@ def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
     for row in rows:
         row["Inseam Label Multi"] = "Single"
 
-    # Step 1 - alt titles that collide once the length segment is removed
+    # Step 1 - alt titles that collide once the length segment is removed.
+    # The collision is counted over distinct lengths, not distinct styles: a
+    # single handle can carry both a REGULAR and a LONG variant, and those are
+    # as much a multi-inseam style as two separate handles would be.
     by_base: Dict[str, Set[str]] = {}
     for row in rows:
-        base, _length = _alt_base_and_length(row["Product Title Alt"])
-        by_base.setdefault(base.upper(), set()).add(row["Style Id"])
+        base, length = _alt_base_and_length(row["Product Title Alt"])
+        by_base.setdefault(base.upper(), set()).add(length)
     for row in rows:
         base, _length = _alt_base_and_length(row["Product Title Alt"])
         if len(by_base.get(base.upper(), set())) > 1:
@@ -2625,11 +2652,13 @@ def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
     # Step 3 - adopt the regular sku's wording across the family
     for family in groups:
         regular = ""
+        regular_style_name = ""
         for sibling in family:
             for row in rows_by_handle.get(sibling, []):
                 base, length = _alt_base_and_length(row["Product Title Alt"])
                 if not length or length == "REGULAR":
                     regular = base
+                    regular_style_name = row["Style Name"]
                     break
             if regular:
                 break
@@ -2645,6 +2674,10 @@ def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
                 size = row.get("Size", "")
                 row["Variant Title"] = " | ".join(
                     [p for p in (row["Product Title Alt"], size) if p])
+                # The name follows the title: a petite sku belongs to the
+                # same style as the regular sku it was matched to.
+                if regular_style_name:
+                    row["Style Name"] = regular_style_name
 
 
 def build_rows(
@@ -2813,7 +2846,10 @@ def build_rows(
     refresh_inseam_style(staged_rows)
     apply_color_fallbacks(staged_rows)
     apply_inseam_label_multi(staged_rows, session)
+    staged_rows = drop_dead_products(staged_rows, session)
     apply_quantity_of_style(staged_rows)
+    for row in staged_rows:
+        row["Style Name"] = _style_name_caps(row["Style Name"])
     apply_duplicate_old_marker(staged_rows)
 
     for row in staged_rows:
@@ -3181,6 +3217,33 @@ def refresh_inseam_style(rows: List[Dict[str, str]]) -> None:
             row["Product"], row["Handle"], row["Description"], row["Inseam"])
         row["Inseam Style"] = determine_inseam_style_v2(
             row["Jean Style"], row["Inseam Label"], row["Inseam"], keyword_fallback)
+
+
+def drop_dead_products(rows: List[Dict[str, str]], session) -> List[Dict[str, str]]:
+    """Remove styles that have no inventory and whose PDP is gone.
+
+    These are delisted products still present in the collection feed. Only
+    zero-inventory styles are checked, so the PDP requests stay few.
+    """
+    if session is None:
+        return rows
+    totals: Dict[str, int] = {}
+    for row in rows:
+        try:
+            qty = int(float(row.get("Quantity Available") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        totals[row["Handle"]] = totals.get(row["Handle"], 0) + qty
+
+    empty = sorted(h for h, qty in totals.items() if qty <= 0)
+    if not empty:
+        return rows
+    logging.info("Checking %s zero-inventory handles for a dead PDP", len(empty))
+    dead = {h for h in empty if fetch_product_page(session, h) is None}
+    if not dead:
+        return rows
+    logging.info("Dropping %s delisted handles (no inventory, PDP gone)", len(dead))
+    return [row for row in rows if row["Handle"] not in dead]
 
 
 def apply_quantity_of_style(rows: List[Dict[str, str]]) -> None:
