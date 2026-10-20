@@ -2382,6 +2382,8 @@ SIZE_GUIDE_429_SLEEP = 10.0
 
 
 _PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
+# Status per handle so a missing page can be told apart from a failed request.
+_PDP_STATUS_CACHE: Dict[str, Optional[int]] = {}
 # Counters so the run reports how much of the site it actually touched.
 _REQUEST_COUNTS: Dict[str, int] = {"pdp_pages": 0, "size_guide_sections": 0}
 
@@ -2398,18 +2400,33 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
     if handle in _PDP_PAGE_CACHE:
         return _PDP_PAGE_CACHE[handle]
     html = None
+    status: Optional[int] = None
     try:
         _REQUEST_COUNTS["pdp_pages"] += 1
         response = _get_with_backoff(
             session, f"https://www.goodamerican.com/products/{handle}")
-        if response.status_code == 200:
+        status = response.status_code
+        if status == 200:
             html = response.text
         else:
-            logging.warning("PDP HTTP %s for %s", response.status_code, handle)
+            logging.warning("PDP HTTP %s for %s", status, handle)
     except Exception as exc:  # noqa: BLE001
         logging.warning("PDP fetch failed for %s: %s", handle, exc)
     _PDP_PAGE_CACHE[handle] = html
+    _PDP_STATUS_CACHE[handle] = status
     return html
+
+
+def pdp_is_missing(session, handle: str) -> bool:
+    """True only when the PDP genuinely 404s.
+
+    A failed request also yields no HTML, so "no page" must not be read as
+    "product gone": a transient 500 or timeout would otherwise drop a live
+    style from the output, and the cached result would make one blip stick
+    for the whole run.
+    """
+    fetch_product_page(session, handle)
+    return _PDP_STATUS_CACHE.get(handle) == 404
 
 
 def _get_with_backoff(session, url, **kwargs):
@@ -3378,7 +3395,7 @@ def drop_dead_products(rows: List[Dict[str, str]], session) -> List[Dict[str, st
     if not empty:
         return rows
     logging.info("Checking %s zero-inventory handles for a dead PDP", len(empty))
-    dead = {h for h in empty if fetch_product_page(session, h) is None}
+    dead = {h for h in empty if pdp_is_missing(session, h)}
     if not dead:
         return rows
     logging.info("Dropping %s delisted handles (no inventory, PDP gone)", len(dead))
