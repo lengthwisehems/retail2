@@ -1,6 +1,7 @@
 import argparse
 import csv
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -1992,12 +1993,23 @@ def extract_inseam_v2(description: str, option2: str, option3: str,
 # ---------------------------------------------------------------------------
 # Quantity of style — sku_brand minus its size segment
 # ---------------------------------------------------------------------------
-def build_sku_no_size(sku_brand: str, size: str) -> str:
-    """Strip the trailing size from the SKU so a style's variants group.
+def _common_sku_stem(skus: List[str]) -> str:
+    """Longest shared prefix of a group's SKUs, trimmed to a dash boundary."""
+    skus = [s for s in skus if s]
+    if len(skus) < 2:
+        return ""
+    prefix = os.path.commonprefix(skus)
+    if "-" in prefix:
+        prefix = prefix[:prefix.rfind("-")]
+    return prefix.rstrip("-")
 
-    The SKU does not always spell the size the same way the option does:
-    "14-18 PLUS" appears as "-14-18P". Several spellings are tried, longest
-    first, before falling back to peeling the size's tokens one at a time.
+
+def build_sku_no_size(sku_brand: str, size: str) -> str:
+    """Strip the trailing size from a single SKU.
+
+    Only used when a variant has no siblings to compare against; the SKU does
+    not always spell the size the way the option does ("14-18 PLUS" appears as
+    "-14-18P"), so several spellings are tried, longest first.
     """
     sku = (sku_brand or "").strip()
     size_clean = (size or "").strip()
@@ -2018,23 +2030,50 @@ def build_sku_no_size(sku_brand: str, size: str) -> str:
         if m:
             return sku[:m.start()]
 
-    # Nothing matched outright: peel the size's tokens off the end one by one.
     trimmed = sku
     for token in reversed(tokens):
         m = re.search(r"-" + re.escape(token) + r"$", trimmed, re.IGNORECASE)
         if m:
             trimmed = trimmed[:m.start()]
-    if trimmed != sku:
-        return trimmed
+    return trimmed if trimmed != sku else sku
 
-    head = tokens[0][:2] if tokens else ""
-    if head:
-        m = None
-        for m in re.finditer(r"-" + re.escape(head) + r"$", sku, re.IGNORECASE):
-            pass
-        if m:
-            return sku[:m.start()]
-    return sku
+
+def build_sku_no_size_map(product_options: List[Dict[str, object]],
+                          variants: List[Dict[str, object]]) -> Dict[str, str]:
+    """Map each variant id to its SKU with the size part removed.
+
+    The size segment of a SKU is frequently an index rather than the size
+    itself - sizes 00-4 .. 28-32 Plus appear as -A .. -E, and XS .. 3XL as
+    -0 .. -8 - so the size text cannot be matched. Instead the variants are
+    grouped by their non-size options and the shared prefix of each group's
+    SKUs is taken. Grouping by the other options keeps a style's inseams
+    apart, so a Long run ending -35-00-4 keeps its -35.
+    """
+    names = [str(o.get("name") or "") for o in (product_options or [])]
+    size_at = next((i for i, n in enumerate(names)
+                    if n.strip().lower() == "size"), None)
+
+    grouped: Dict[Tuple[str, ...], List[Dict[str, object]]] = {}
+    for variant in variants:
+        values = [str(o.get("value") or "")
+                  for o in (variant.get("selectedOptions") or [])]
+        key = tuple(v for i, v in enumerate(values) if i != size_at)
+        grouped.setdefault(key, []).append(variant)
+
+    out: Dict[str, str] = {}
+    for _key, members in grouped.items():
+        stem = _common_sku_stem([str(v.get("sku") or "") for v in members])
+        for variant in members:
+            sku = str(variant.get("sku") or "")
+            if not stem:
+                _o1, o2, o3 = determine_variant_options(product_options,
+                                                        variant.get("selectedOptions") or [])
+                size_value, _length = parse_size_and_length(o2, o3)
+                stem_one = build_sku_no_size(sku, size_value)
+            else:
+                stem_one = stem
+            out[str(variant.get("id") or "")] = stem_one
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2733,6 +2772,7 @@ def build_rows(
         if max_variants is not None:
             variants = variants[:max_variants]
         product_options = product.get("options") or []
+        sku_no_size_map = build_sku_no_size_map(product_options, variants)
 
         for variant in variants:
             option1, option2, option3 = determine_variant_options(
@@ -2741,7 +2781,8 @@ def build_rows(
             )
             size_value, _length_value = parse_size_and_length(option2, option3)
             sku_brand = variant.get("sku", "") or ""
-            sku_no_size = build_sku_no_size(sku_brand, size_value)
+            sku_no_size = sku_no_size_map.get(
+                str(variant.get("id") or "")) or build_sku_no_size(sku_brand, size_value)
 
             inseam_value = extract_inseam_v2(description, option2, option3, sku_no_size)
             inseam_label = determine_inseam_label_v2(
