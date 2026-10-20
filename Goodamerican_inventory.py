@@ -2719,6 +2719,99 @@ def apply_inseam_label_multi(rows: List[Dict[str, str]], session) -> None:
                     row["Style Name"] = regular_style_name
 
 
+def unify_color_within_style(rows: List[Dict[str, str]]) -> None:
+    """One colour per handle + Style Id.
+
+    The same style can report BLACK on some variants and BLACK001 on others;
+    they are one colourway, so the most common spelling wins, and the title's
+    own colour code breaks a tie.
+    """
+    groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for row in rows:
+        groups.setdefault((row["Handle"], row["Style Id"]), []).append(row)
+    for _key, members in groups.items():
+        values = [r["Color"] for r in members if r["Color"]]
+        if len(set(values)) < 2:
+            continue
+        counts = Counter(values)
+        top = counts.most_common()
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            code = (members[0].get("_color_code") or "").strip()
+            winner = next((v for v in counts if v.upper() == code.upper()), top[0][0])
+        else:
+            winner = top[0][0]
+        for row in members:
+            row["Color"] = winner
+
+
+def unify_multi_inseam_style(rows: List[Dict[str, str]]) -> None:
+    """A multi-inseam style reads the same Inseam Style on every length.
+
+    The lengths of one style are the same garment cut to different inseams, so
+    they should not disagree. Two measured cases are corrected first - a taper
+    style's 32" long and 29" regular both sit at Ankle rather than Full Length -
+    and the family is then brought into line with its most common value.
+    """
+    for row in rows:
+        if row.get("Inseam Label Multi") != "Multi":
+            continue
+        if row.get("Jean Style") not in TAPER_STYLES:
+            continue
+        inseam = to_float(row.get("Inseam"))
+        if inseam is None:
+            continue
+        alt = (row.get("Product Title Alt") or "").upper()
+        if inseam == 32 and "LONG" in alt:
+            row["Inseam Style"] = "Ankle"
+        elif inseam == 29 and "REGULAR" in alt:
+            row["Inseam Style"] = "Ankle"
+
+    families: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        if row.get("Inseam Label Multi") != "Multi":
+            continue
+        base, _length = _alt_base_and_length(row.get("Product Title Alt", ""))
+        families.setdefault(base.upper(), []).append(row)
+
+    for _base, members in families.items():
+        values = [r["Inseam Style"] for r in members if r["Inseam Style"]]
+        if len(set(values)) < 2:
+            continue
+        counts = Counter(values)
+        top = counts.most_common()
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            # A tie is settled by the regular length, the canonical one.
+            winner = ""
+            for row in members:
+                _b, length = _alt_base_and_length(row.get("Product Title Alt", ""))
+                if length.startswith("REGULAR") and row["Inseam Style"]:
+                    winner = row["Inseam Style"]
+                    break
+            winner = winner or top[0][0]
+        else:
+            winner = top[0][0]
+        for row in members:
+            row["Inseam Style"] = winner
+
+
+def fill_multi_rise_label(rows: List[Dict[str, str]]) -> None:
+    """A blank Rise Label on a multi-inseam style takes its family's value."""
+    families: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        if row.get("Inseam Label Multi") != "Multi":
+            continue
+        base, _length = _alt_base_and_length(row.get("Product Title Alt", ""))
+        families.setdefault(base.upper(), []).append(row)
+    for _base, members in families.items():
+        known = [r["Rise Label"] for r in members if r["Rise Label"]]
+        if not known:
+            continue
+        winner = Counter(known).most_common(1)[0][0]
+        for row in members:
+            if not row["Rise Label"]:
+                row["Rise Label"] = winner
+
+
 def build_rows(
     products: List[Dict[str, object]],
     searchspring_map: Dict[str, Dict[str, str]],
@@ -2887,6 +2980,9 @@ def build_rows(
     refresh_inseam_style(staged_rows)
     apply_color_fallbacks(staged_rows)
     apply_inseam_label_multi(staged_rows, session)
+    unify_color_within_style(staged_rows)
+    unify_multi_inseam_style(staged_rows)
+    fill_multi_rise_label(staged_rows)
     staged_rows = drop_dead_products(staged_rows, session)
     apply_quantity_of_style(staged_rows)
     for row in staged_rows:
