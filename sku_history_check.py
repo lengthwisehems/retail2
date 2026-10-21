@@ -623,8 +623,15 @@ def fmt(v):
     return str(v)
 
 
+def log(msg=""):
+    """Print a message with a time stamp in front. Leading blank lines stay
+    blank."""
+    blank = len(msg) - len(msg.lstrip("\n"))
+    print("\n" * blank + datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ") + msg[blank:], flush=True)
+
+
 def print_table(title, rows, cols):
-    print(f"\n{title}")
+    log(f"\n{title}")
     if not rows:
         print("  (no rows)")
         return
@@ -728,11 +735,11 @@ def main():
     except Exception:
         pass
     skus = parse_sku_list(SKU_LIST)
-    print("=" * 64)
-    print(f"  SKU HISTORY CHECK   brand: {BRAND}   SKUs pasted: {len(skus)}")
-    print("=" * 64)
+    log("=" * 64)
+    log(f"  SKU HISTORY CHECK   brand: {BRAND}   SKUs pasted: {len(skus)}")
+    log("=" * 64)
     if not skus:
-        print("SKU_LIST is empty - nothing to do.")
+        log("SKU_LIST is empty - nothing to do.")
         return
     try:
         import openpyxl  # noqa: F401  (checked now, before the slow part)
@@ -742,9 +749,9 @@ def main():
     # ---- database ------------------------------------------------
     db_rows, r2, db_done = {}, [], False
     if not SQL_PASSWORD:
-        print("\nDatabase: SKIPPED (SQL_PASSWORD is blank) - showing blob-file columns only.")
+        log("\nDatabase: SKIPPED (SQL_PASSWORD is blank) - showing blob-file columns only.")
     else:
-        print("\nDatabase: querying variant_metrics / lookup ...")
+        log("\nDatabase: querying variant_metrics / lookup ...")
         r1, r2 = run_database(skus, BRAND, CHECK_OTHER_KEYS)
         db_rows = {r["sku_brand"].upper(): r for r in r1}
         db_done = True
@@ -752,14 +759,14 @@ def main():
     # ---- blob files ----------------------------------------------
     blob_rows, blob_done = {}, False
     if CHECK_BLOBS:
-        print("\nBlob storage: asking Azure to search the files (nothing is downloaded) ...")
-        blob_rows, status = BlobSearch(BLOB_SAS_URL).search(BRAND, skus)
+        log("\nBlob storage: asking Azure to search the files (nothing is downloaded) ...")
+        blob_rows, status = BlobSearch(BLOB_SAS_URL).search(BRAND, skus, log=log)
         blob_done = True
         if status["problems"]:
-            print(f"\n  WARNING: {len(status['problems'])} file(s) could NOT be searched properly, so the "
+            log(f"\n  WARNING: {len(status['problems'])} file(s) could NOT be searched properly, so the "
                   f"results below may be missing them:")
             for name, note in status["problems"][:25]:
-                print(f"    {name}: {note}")
+                log(f"    {name}: {note}")
 
     # ---- result 1 --------------------------------------------------
     result1, details = [], {}                       # details: SKU_KEY -> sku_brand + DETAIL_COLS
@@ -812,15 +819,15 @@ def main():
                                                   for n, p in status["problems"]],
                            ["source_file_name", "problem"]))
     if not sheets:
-        print("\nNothing to save - both the database and blob parts were skipped.")
+        log("\nNothing to save - both the database and blob parts were skipped.")
         return
 
     brand = re.sub(r'[\\/:*?"<>|\s]+', "_", BRAND.strip()).upper()
     name = f"SKU_HISTORY_{brand}_{datetime.date.today():%Y_%m_%d}.xlsx"
     path = write_xlsx(os.path.join(HERE, name), sheets)
-    print(f"\nDaily Quantity tab: {len(daily):,} row(s)" if blob_done
+    log(f"\nDaily Quantity tab: {len(daily):,} row(s)" if blob_done
           else "\nDaily Quantity tab: SKIPPED (needs the blob part, CHECK_BLOBS = False)")
-    print(f"Saved ({len(sheets)} tabs): {path or 'could not save - is the file open in Excel?'}")
+    log(f"Saved ({len(sheets)} tabs): {path or 'could not save - is the file open in Excel?'}")
 
 
 if __name__ == "__main__":
