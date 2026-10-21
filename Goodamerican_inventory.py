@@ -396,6 +396,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Checkout storefront inventory scraper.")
     parser.add_argument("--max-products", type=int, default=None)
     parser.add_argument("--max-variants", type=int, default=None)
+    # How hard the site throttles PDP requests depends on the IP making them,
+    # so the pace is tunable: raise it if the log still shows 429s, lower it
+    # from a connection the site is happy to serve faster.
+    parser.add_argument("--pdp-interval", type=float, default=PDP_MIN_INTERVAL,
+                        help="seconds between requests to /products/ "
+                             f"(default {PDP_MIN_INTERVAL})")
     return parser.parse_args()
 
 
@@ -2375,9 +2381,15 @@ def apply_color_fallbacks(rows: List[Dict[str, str]]) -> None:
 # Size guide fallback for Inseam
 # ---------------------------------------------------------------------------
 SIZE_GUIDE_SECTION = "product-ssr-size-guide"
-# Good American rate-limits bursts of PDP requests; a 429 here is what turns
-# the whole lookup into silent blanks, so pace them and back off on 429.
-SIZE_GUIDE_DELAY = 0.4
+# Good American rate-limits PDP HTML per IP, and the limiter is shared by every
+# lookup below. Staying under it is far cheaper than recovering from it: once
+# the bucket empties, the site answers 429 with Retry-After: 60 and knocking
+# again before that elapses extends the penalty instead of clearing it. So all
+# traffic to /products/ passes through one pacer, and a 429 slows that pacer
+# for the rest of the run rather than being retried past.
+PDP_MIN_INTERVAL = 1.1      # seconds between any two /products/ requests
+PDP_MAX_INTERVAL = 8.0      # ceiling once 429s have forced the pace down
+PDP_INTERVAL_STEP = 0.75    # added to the interval after each 429
 SIZE_GUIDE_RETRIES = 3
 SIZE_GUIDE_429_SLEEP = 10.0
 
@@ -2385,8 +2397,22 @@ SIZE_GUIDE_429_SLEEP = 10.0
 _PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
 # Status per handle so a missing page can be told apart from a failed request.
 _PDP_STATUS_CACHE: Dict[str, Optional[int]] = {}
+# Handles whose PDP was never read because the site was throttling. Kept out of
+# the caches above so a later phase can try again, and reported at the end so a
+# run that lost data says so instead of looking clean.
+_PDP_THROTTLED: Set[str] = set()
 # Counters so the run reports how much of the site it actually touched.
-_REQUEST_COUNTS: Dict[str, int] = {"pdp_pages": 0, "size_guide_sections": 0}
+_REQUEST_COUNTS: Dict[str, int] = {"pdp_pages": 0, "size_guide_sections": 0,
+                                   "http_gets": 0, "rate_limited": 0}
+_PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "last": 0.0}
+
+
+def _pace_pdp_request() -> None:
+    """Hold every /products/ request to the current global interval."""
+    wait = _PACE["last"] + _PACE["interval"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
 
 
 def fetch_product_page(session, handle: str) -> Optional[str]:
@@ -2413,6 +2439,13 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
             logging.warning("PDP HTTP %s for %s", status, handle)
     except Exception as exc:  # noqa: BLE001
         logging.warning("PDP fetch failed for %s: %s", handle, exc)
+    if status == 429:
+        # Deliberately not cached. A throttled page is not a missing one, and
+        # caching the empty result would lose the handle for the whole run even
+        # after the pacer has backed off far enough to read it.
+        _PDP_THROTTLED.add(handle)
+        return None
+    _PDP_THROTTLED.discard(handle)
     _PDP_PAGE_CACHE[handle] = html
     _PDP_STATUS_CACHE[handle] = status
     return html
@@ -2431,16 +2464,33 @@ def pdp_is_missing(session, handle: str) -> bool:
 
 
 def _get_with_backoff(session, url, **kwargs):
-    """GET that waits out a 429 instead of giving up on it."""
+    """Paced GET that waits out a 429 instead of guessing past it.
+
+    Every request waits its turn at the global pace first, which is what keeps
+    the limiter from emptying in the first place. When a 429 does come back the
+    server's Retry-After is honoured in full -- retrying sooner puts another
+    request into an already-empty bucket and lengthens the penalty -- and the
+    pace is slowed for every later request, so one bad patch does not repeat
+    itself for the rest of the run.
+    """
     for attempt in range(SIZE_GUIDE_RETRIES):
+        _pace_pdp_request()
+        _REQUEST_COUNTS["http_gets"] += 1
         response = session.get(url, timeout=30, **kwargs)
         if response.status_code != 429:
             return response
-        retry_after = response.headers.get("Retry-After", "")
+        _REQUEST_COUNTS["rate_limited"] += 1
+        _PACE["interval"] = min(PDP_MAX_INTERVAL,
+                                _PACE["interval"] + PDP_INTERVAL_STEP)
+        retry_after = response.headers.get("Retry-After", "").strip()
         wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
                 else SIZE_GUIDE_429_SLEEP * (attempt + 1))
-        logging.warning("Rate limited (429) on %s; waiting %.1fs", url, wait)
+        logging.warning("Rate limited (429) on %s; waiting %.1fs "
+                        "(pace now %.1fs between requests)",
+                        url, wait, _PACE["interval"])
         time.sleep(wait)
+    _pace_pdp_request()
+    _REQUEST_COUNTS["http_gets"] += 1
     return session.get(url, timeout=30, **kwargs)
 _SIZE_GUIDE_CACHE: Dict[str, str] = {}
 _PDP_TITLE_CACHE: Dict[str, Optional[str]] = {}
@@ -2467,6 +2517,8 @@ def fetch_size_guide_title(session, handle: str) -> Optional[str]:
                     title = re.sub(r"\s+", " ", text).strip()
     except Exception as exc:  # noqa: BLE001
         logging.debug("size-guide title lookup failed for %s: %s", handle, exc)
+    if handle in _PDP_THROTTLED:
+        return None          # not an answer, so not worth remembering
     _PDP_TITLE_CACHE[handle] = title
     return title
 
@@ -2530,7 +2582,8 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
                                      allow_redirects=True)
         if response.status_code != 200:
             logging.warning("Size guide HTTP %s for %s", response.status_code, handle)
-            _SIZE_GUIDE_CACHE[handle] = ""
+            if response.status_code != 429:
+                _SIZE_GUIDE_CACHE[handle] = ""
             return ""
 
         html = ""
@@ -2556,6 +2609,8 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
                 handle, len(html or ""))
     except Exception as exc:  # noqa: BLE001
         logging.warning("Size guide lookup failed for %s: %s", handle, exc)
+    if not value and handle in _PDP_THROTTLED:
+        return ""            # blank because of the limiter, not the guide
     _SIZE_GUIDE_CACHE[handle] = value
     return value
 
@@ -2573,11 +2628,11 @@ def apply_size_guide_inseam(rows: List[Dict[str, str]], session) -> None:
     for row in rows:
         if row["Inseam"].strip():
             continue
-        before = row["Handle"] in _SIZE_GUIDE_CACHE
+        # No sleep here: _get_with_backoff paces every /products/ request
+        # against one global interval, so throttling this loop as well would
+        # only double the wait on the requests it makes.
         value = fetch_size_guide_inseam(session, row["Handle"],
                                         row.get("_raw_title", ""))
-        if not before:
-            time.sleep(SIZE_GUIDE_DELAY)
         if not value:
             continue
         row["Inseam"] = value
@@ -2632,6 +2687,8 @@ def fetch_inseam_siblings(session, handle: str) -> List[Tuple[str, str]]:
                     found.append((sibling, label))
     except Exception as exc:  # noqa: BLE001
         logging.warning("Inseam container lookup failed for %s: %s", handle, exc)
+    if handle in _PDP_THROTTLED:
+        return found         # empty because of the limiter, not the markup
     _INSEAM_SIBLING_CACHE[handle] = found
     return found
 
@@ -3057,6 +3114,8 @@ def fetch_sister_variant_handles(session, handle: str) -> List[str]:
     except Exception as exc:  # noqa: BLE001
         logging.debug("sister-variant lookup failed for %s: %s", handle, exc)
     found = [h for h in dict.fromkeys(found) if h != handle]
+    if handle in _PDP_THROTTLED:
+        return found         # empty because of the limiter, not the markup
     _SISTER_LINK_CACHE[handle] = found
     return found
 
@@ -3537,6 +3596,7 @@ def write_csv(rows: List[Dict[str, str]]) -> Path:
 def main() -> None:
     configure_logging()
     args = parse_args()
+    _PACE["interval"] = max(0.0, args.pdp_interval)
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
@@ -3562,10 +3622,18 @@ def main() -> None:
     )
     logging.info("Rows prepared: %s", len(rows))
     logging.info("Product pages downloaded: %s (plus %s size-guide section "
-                 "requests) = %s requests to /products/",
+                 "requests); %s HTTP GETs to /products/ in total, %s of them "
+                 "rate-limited; final pace %.1fs between requests",
                  _REQUEST_COUNTS["pdp_pages"],
                  _REQUEST_COUNTS["size_guide_sections"],
-                 _REQUEST_COUNTS["pdp_pages"] + _REQUEST_COUNTS["size_guide_sections"])
+                 _REQUEST_COUNTS["http_gets"],
+                 _REQUEST_COUNTS["rate_limited"],
+                 _PACE["interval"])
+    if _PDP_THROTTLED:
+        # These handles fell back to weaker evidence, so say so rather than
+        # letting a throttled run look like a clean one.
+        logging.warning("PDP never read for %s handle(s) (rate limited): %s",
+                        len(_PDP_THROTTLED), ", ".join(sorted(_PDP_THROTTLED)))
     write_csv(rows)
 
 
