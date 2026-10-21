@@ -362,6 +362,24 @@ USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
+# The headers a real Chrome sends alongside that User-Agent. Sent on every
+# request so the client does not look like the bare scraper it is.
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": ('"Chromium";v="122", "Not(A:Brand";v="24", '
+                  '"Google Chrome";v="122"'),
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
 
 def configure_logging() -> None:
     handlers: List[logging.Handler] = []
@@ -2381,17 +2399,23 @@ def apply_color_fallbacks(rows: List[Dict[str, str]]) -> None:
 # Size guide fallback for Inseam
 # ---------------------------------------------------------------------------
 SIZE_GUIDE_SECTION = "product-ssr-size-guide"
-# Good American rate-limits PDP HTML per IP, and the limiter is shared by every
-# lookup below. Staying under it is far cheaper than recovering from it: once
-# the bucket empties, the site answers 429 with Retry-After: 60 and knocking
-# again before that elapses extends the penalty instead of clearing it. So all
-# traffic to /products/ passes through one pacer, and a 429 slows that pacer
-# for the rest of the run rather than being retried past.
-PDP_MIN_INTERVAL = 1.1      # seconds between any two /products/ requests
-PDP_MAX_INTERVAL = 8.0      # ceiling once 429s have forced the pace down
+# A 429 from this site is a Cloudflare managed challenge, not a Shopify rate
+# limit: the body is the "Verifying your connection..." interstitial. That
+# matters because waiting does not clear a challenge -- a run that slept six
+# times for the server's Retry-After of 60s on one handle got the challenge
+# back every time. So the wait is capped, a handle is only ever retried once,
+# and the pace adapts in BOTH directions: a burst of challenges slows it, and
+# clean responses bring it back to the floor instead of leaving the rest of the
+# run crawling. How readily the challenge fires depends on the IP, which is why
+# the floor is low and tunable rather than conservative for everyone.
+PDP_MIN_INTERVAL = 0.5      # floor: seconds between any two /products/ requests
+PDP_MAX_INTERVAL = 6.0      # ceiling once challenges have forced the pace down
 PDP_INTERVAL_STEP = 0.75    # added to the interval after each 429
-SIZE_GUIDE_RETRIES = 3
-SIZE_GUIDE_429_SLEEP = 10.0
+PDP_INTERVAL_DECAY = 0.9    # multiplier applied after each clean response
+PDP_429_MAX_WAIT = 15.0     # cap: a challenge outlasts any wait worth making
+PDP_HANDLE_ATTEMPTS = 2     # requests per handle across the whole run
+SIZE_GUIDE_RETRIES = 2
+SIZE_GUIDE_429_SLEEP = 5.0
 
 
 _PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
@@ -2401,6 +2425,9 @@ _PDP_STATUS_CACHE: Dict[str, Optional[int]] = {}
 # the caches above so a later phase can try again, and reported at the end so a
 # run that lost data says so instead of looking clean.
 _PDP_THROTTLED: Set[str] = set()
+# Requests spent per handle, so a handle the challenge keeps blocking costs two
+# requests rather than being re-requested by every phase that wants its page.
+_PDP_ATTEMPTS: Dict[str, int] = {}
 # Counters so the run reports how much of the site it actually touched.
 _REQUEST_COUNTS: Dict[str, int] = {"pdp_pages": 0, "size_guide_sections": 0,
                                    "http_gets": 0, "rate_limited": 0}
@@ -2415,6 +2442,11 @@ def _pace_pdp_request() -> None:
     _PACE["last"] = time.monotonic()
 
 
+def _is_bot_challenge(response) -> bool:
+    """True for Cloudflare's interstitial rather than a real rate limit."""
+    return "Verifying your connection" in (response.text or "")[:2000]
+
+
 def fetch_product_page(session, handle: str) -> Optional[str]:
     """The PDP HTML, fetched once per handle and shared by every lookup.
 
@@ -2426,6 +2458,11 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
     """
     if handle in _PDP_PAGE_CACHE:
         return _PDP_PAGE_CACHE[handle]
+    if _PDP_ATTEMPTS.get(handle, 0) >= PDP_HANDLE_ATTEMPTS:
+        # Already spent its budget on a challenge. One later phase gets a
+        # second try, because a challenge can lift; a third never helped.
+        return None
+    _PDP_ATTEMPTS[handle] = _PDP_ATTEMPTS.get(handle, 0) + 1
     html = None
     status: Optional[int] = None
     try:
@@ -2473,25 +2510,33 @@ def _get_with_backoff(session, url, **kwargs):
     pace is slowed for every later request, so one bad patch does not repeat
     itself for the rest of the run.
     """
+    response = None
     for attempt in range(SIZE_GUIDE_RETRIES):
         _pace_pdp_request()
         _REQUEST_COUNTS["http_gets"] += 1
         response = session.get(url, timeout=30, **kwargs)
         if response.status_code != 429:
+            _PACE["interval"] = max(PDP_MIN_INTERVAL,
+                                    _PACE["interval"] * PDP_INTERVAL_DECAY)
             return response
         _REQUEST_COUNTS["rate_limited"] += 1
         _PACE["interval"] = min(PDP_MAX_INTERVAL,
                                 _PACE["interval"] + PDP_INTERVAL_STEP)
+        if attempt + 1 >= SIZE_GUIDE_RETRIES:
+            break
+        challenge = _is_bot_challenge(response)
         retry_after = response.headers.get("Retry-After", "").strip()
         wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
                 else SIZE_GUIDE_429_SLEEP * (attempt + 1))
-        logging.warning("Rate limited (429) on %s; waiting %.1fs "
-                        "(pace now %.1fs between requests)",
+        # The server's Retry-After assumes a rate limit it will forgive. A
+        # challenge is not forgiven on a timer, so honouring a long one buys
+        # nothing but a slower run.
+        wait = min(wait, PDP_429_MAX_WAIT)
+        logging.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
+                        "Bot challenge (429)" if challenge else "Rate limited (429)",
                         url, wait, _PACE["interval"])
         time.sleep(wait)
-    _pace_pdp_request()
-    _REQUEST_COUNTS["http_gets"] += 1
-    return session.get(url, timeout=30, **kwargs)
+    return response
 _SIZE_GUIDE_CACHE: Dict[str, str] = {}
 _PDP_TITLE_CACHE: Dict[str, Optional[str]] = {}
 
@@ -3598,7 +3643,12 @@ def main() -> None:
     args = parse_args()
     _PACE["interval"] = max(0.0, args.pdp_interval)
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    # A User-Agent on its own is a well-known trigger for Cloudflare's managed
+    # challenge: a real Chrome never sends one without the rest of these. They
+    # cost nothing to send and are the standard way to stop being challenged,
+    # though whether they help here depends on the IP being challenged in the
+    # first place.
+    session.headers.update(BROWSER_HEADERS)
 
     logging.info("Fetching Searchspring data")
     searchspring_map = fetch_searchspring_data(session)
@@ -3631,8 +3681,10 @@ def main() -> None:
                  _PACE["interval"])
     if _PDP_THROTTLED:
         # These handles fell back to weaker evidence, so say so rather than
-        # letting a throttled run look like a clean one.
-        logging.warning("PDP never read for %s handle(s) (rate limited): %s",
+        # letting a challenged run look like a clean one.
+        logging.warning("PDP never read for %s handle(s) (blocked by the bot "
+                        "challenge, so their derived fields fall back to the "
+                        "description and colour pool): %s",
                         len(_PDP_THROTTLED), ", ".join(sorted(_PDP_THROTTLED)))
     write_csv(rows)
 
