@@ -36,7 +36,9 @@
 #
 # NOTHING IS DOWNLOADED. For each of the brand's files the script asks
 # Azure to search inside the file for the pasted SKUs, and Azure sends
-# back only the matching rows (a few bytes per file). Expect roughly
+# back only the matching rows (a few bytes per file; with more than 500
+# pasted SKUs it sends back the SKU and quantity columns of every row,
+# ~150 KB per file, and the SKUs are picked out here). Expect roughly
 # 1-3 minutes for a brand with ~700 files. Azure bills a small
 # "query acceleration" fee per GB it scans (see the Azure Data Lake
 # Storage pricing page).
@@ -354,17 +356,18 @@ def clean_quantity(val):
 
 SKU_COL, QTY_COL = "SKU - Brand", "Quantity Available"
 MAX_QUERY_CHARS  = 200000       # Azure's limit for one query is 256 KB
+MAX_IN_ITEMS     = 500          # Azure rejects an IN (...) list of ~1,000 or more values ("Syntax error in query")
 
 
 def build_where(skus):
     """The search Azure runs inside each file. Matching ignores upper/lower
     case and spaces around the SKU, like the database does. A very long
-    list is split into several queries to stay under Azure's size limit.
+    list is split into several queries to stay under Azure's limits.
     Returns a list of 'FROM ... WHERE ...' strings."""
     keys = ["'" + k.upper().replace("'", "''") + "'" for k in skus]
     batches, cur, size = [], [], 0
     for k in keys:
-        if cur and size + len(k) + 2 > MAX_QUERY_CHARS:
+        if cur and (size + len(k) + 2 > MAX_QUERY_CHARS or len(cur) >= MAX_IN_ITEMS):
             batches.append(cur); cur, size = [], 0
         cur.append(k); size += len(k) + 2
     if cur:
@@ -373,8 +376,14 @@ def build_where(skus):
 
 
 def build_queries(skus):
-    """Returns a list of (query_with_quantity, query_sku_only)."""
-    return [(f'SELECT "{SKU_COL}", "{QTY_COL}" {w}', f'SELECT "{SKU_COL}" {w}') for w in build_where(skus)]
+    """Returns a list of (query_with_quantity, query_sku_only). For a list
+    longer than MAX_IN_ITEMS, one query that returns the two columns of
+    every row (the pasted SKUs are then picked out here) is cheaper than
+    having Azure scan each file once per batch."""
+    wheres = build_where(skus)
+    if len(wheres) > 1:
+        wheres = ["FROM BlobStorage"]
+    return [(f'SELECT "{SKU_COL}", "{QTY_COL}" {w}', f'SELECT "{SKU_COL}" {w}') for w in wheres]
 
 
 def norm_header(name):
@@ -762,6 +771,10 @@ def main():
         log("\nBlob storage: asking Azure to search the files (nothing is downloaded) ...")
         blob_rows, status = BlobSearch(BLOB_SAS_URL).search(BRAND, skus, log=log)
         blob_done = True
+        if status["files"] and len({n for n, _ in status["problems"]}) >= len(status["files"]):
+            log("\n  " + "!" * 60 + "\n  NONE of the files could be searched - the blob columns and the "
+                "Daily Quantity tab will be EMPTY. Reason given for the first file:\n    "
+                + status["problems"][0][1] + "\n  " + "!" * 60)
         if status["problems"]:
             log(f"\n  WARNING: {len(status['problems'])} file(s) could NOT be searched properly, so the "
                   f"results below may be missing them:")
