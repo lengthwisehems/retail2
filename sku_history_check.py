@@ -2,9 +2,13 @@
 # SKU HISTORY CHECK  -  variant_metrics + scraper files in blob storage
 # sku_history_check.py
 # ================================================================
-# Paste a list of sku_brand values into SKU_LIST below, then run:
+# Set LOOK_UP_BY to "sku_brand" or "sku_shopify", paste a list of those
+# values into SKU_LIST below, then run:
 #
 #       python sku_history_check.py
+#
+# Below, "SKU" means whichever of the two LOOK_UP_BY is set to; the
+# "other key" is the other one.
 #
 # RESULT 1  one row per pasted SKU, in the order you pasted them:
 #   from the database (variant_metrics / lookup)
@@ -17,20 +21,22 @@
 #       max_quantity_in_files    highest Quantity Available in those files
 #
 # RESULT 2  only for SKUs NOT FOUND in variant_metrics: is their history
-#           sitting under a different key (same sku_shopify or same
+#           sitting under a different key (same other key or same
 #           variant_title as the lookup row)?
 #
 # DAILY QUANTITY  one row per SKU per day it appears in the scraper files:
 #       Date, First Quantity Available  (earliest file of that day)
 #             Second Quantity Available (latest file of that day)
+#       Turn it off with PULL_DAILY_QUANTITIES = False.
 #
-# Every tab also shows sku_shopify, style_id, sku_url, handle,
-# product_title and variant_title, read from the latest scraper file the
-# SKU appears in (if it is in no file: sku_shopify and variant_title from
-# the lookup table).
+# Every tab also shows the other key, style_id, sku_url, handle,
+# product_title, variant_title, description and image_url, read from the
+# latest scraper file the SKU appears in (if it is in no file: the other
+# key and variant_title from the lookup table).
 #
 # OUTPUT  one Excel workbook next to this script, one tab per result:
-#       SKU_HISTORY_[BRAND]_YYYY_MM_DD.xlsx
+#       SKU_HISTORY_[BRAND]_YYYY_MM_DD.xlsx            (sku_brand list)
+#       SKU_HISTORY_SHOPIFY_[BRAND]_YYYY_MM_DD.xlsx    (sku_shopify list)
 #
 # READ-ONLY. Nothing is changed in the database or in blob storage.
 #
@@ -53,6 +59,10 @@
 # SETTINGS - edit these
 # ================================================================
 BRAND = "GOODAMERICAN"          # as stored in the database "brand" column
+
+# If want to search by SKU_SHOPIFY, fill LOOK_UP_BY = "sku_shopify".
+# If want to search by SKU_BRAND,   fill LOOK_UP_BY = "sku_brand".
+LOOK_UP_BY = "sku_brand"
 
 SKU_LIST = """
 GLST960-I1233-0
@@ -92,6 +102,8 @@ VSTA966F-CLPI-32W
 
 """
 
+PULL_DAILY_QUANTITIES = True    # False = skip the Daily Quantity tab (Result 1 and 2 only)
+
 # Container URL including a SAS token that has READ and LIST permission.
 # (Don't upload this file to GitHub with the token in it.)
 BLOB_SAS_URL = ""               # or set the BLOB_SAS_URL environment variable
@@ -120,6 +132,12 @@ SQL_PASSWORD = os.environ.get("SQL_PASSWORD", SQL_PASSWORD)
 HERE = os.path.dirname(os.path.abspath(__file__))
 csv.field_size_limit(2**31 - 1)
 
+KEYS = {"sku_brand": "SKU - Brand", "sku_shopify": "SKU - Shopify"}    # database column -> scraper CSV column
+KEY = str(LOOK_UP_BY).strip().lower()
+if KEY not in KEYS:
+    raise SystemExit(f'LOOK_UP_BY must be "sku_brand" or "sku_shopify", not "{LOOK_UP_BY}".')
+ALT = "sku_shopify" if KEY == "sku_brand" else "sku_brand"
+
 
 # ================================================================
 # THE PASTED LIST
@@ -141,7 +159,7 @@ def parse_sku_list(text):
 # ================================================================
 # DATABASE PART  (same query as sku_history_check.sql)
 # ================================================================
-SQL_SCRIPT = r"""
+SQL_TEMPLATE = r"""
 SET NOCOUNT ON;
 DECLARE @brand            VARCHAR(255)  = %s;
 DECLARE @check_other_keys BIT           = %s;
@@ -150,10 +168,10 @@ DECLARE @sku_list         NVARCHAR(MAX) = %s;
 DROP TABLE IF EXISTS #skus;
 CREATE TABLE #skus (
     paste_order INT          NOT NULL,
-    sku_brand   VARCHAR(255) COLLATE DATABASE_DEFAULT NOT NULL
+    __KEY__   VARCHAR(255) COLLATE DATABASE_DEFAULT NOT NULL
 );
 
-INSERT INTO #skus (paste_order, sku_brand)
+INSERT INTO #skus (paste_order, __KEY__)
 SELECT MIN(CAST(j.[key] AS INT)), x.sku
 FROM OPENJSON(
          N'["'
@@ -171,7 +189,7 @@ DROP TABLE IF EXISTS #result;
 
 SELECT
     s.paste_order,
-    s.sku_brand,
+    s.__KEY__,
     MIN(vm.captured_datetime)   AS first_captured,
     MAX(vm.captured_datetime)   AS last_captured,
     MAX(vm.quantity_available)  AS max_quantity_available,
@@ -179,30 +197,30 @@ SELECT
 INTO #result
 FROM #skus AS s
 LEFT JOIN variant_metrics AS vm
-       ON vm.sku_brand = s.sku_brand
+       ON vm.__KEY__ = s.__KEY__
       AND (@brand IS NULL OR vm.brand = @brand)
-GROUP BY s.paste_order, s.sku_brand
+GROUP BY s.paste_order, s.__KEY__
 OPTION (RECOMPILE);
 
 SELECT
-    r.sku_brand,
+    r.__KEY__,
     r.first_captured,
     r.last_captured,
     r.max_quantity_available,
     r.snapshots_found,
     CASE WHEN EXISTS (SELECT 1
                       FROM lookup AS l
-                      WHERE l.sku_brand = r.sku_brand
+                      WHERE l.__KEY__ = r.__KEY__
                         AND (@brand IS NULL OR l.brand = @brand))
          THEN 'yes' ELSE 'NO' END                           AS in_lookup,
     CASE WHEN r.snapshots_found = 0
          THEN 'NOT FOUND in variant_metrics' ELSE 'found' END AS status,
-    lk.sku_shopify                                         AS lookup_sku_shopify,
+    lk.__ALT__                                         AS lookup___ALT__,
     lk.variant_title                                       AS lookup_variant_title
 FROM #result AS r
-OUTER APPLY (SELECT TOP 1 l.sku_shopify, l.variant_title
+OUTER APPLY (SELECT TOP 1 l.__ALT__, l.variant_title
              FROM lookup AS l
-             WHERE l.sku_brand = r.sku_brand
+             WHERE l.__KEY__ = r.__KEY__
                AND (@brand IS NULL OR l.brand = @brand)) AS lk
 ORDER BY r.paste_order
 OPTION (RECOMPILE);
@@ -213,39 +231,39 @@ BEGIN
 
     SELECT DISTINCT
         r.paste_order,
-        r.sku_brand,
+        r.__KEY__,
         l.brand,
-        l.sku_shopify,
+        l.__ALT__,
         l.variant_title
     INTO #lk
     FROM #result AS r
     JOIN lookup  AS l
-      ON l.sku_brand = r.sku_brand
+      ON l.__KEY__ = r.__KEY__
      AND (@brand IS NULL OR l.brand = @brand)
     WHERE r.snapshots_found = 0
     OPTION (RECOMPILE);
 
     DROP TABLE IF EXISTS #alt;
 
-    SELECT vm.brand, vm.sku_shopify, vm.variant_title, vm.sku_brand,
+    SELECT vm.brand, vm.__ALT__, vm.variant_title, vm.__KEY__,
            vm.captured_datetime, vm.quantity_available
     INTO #alt
     FROM variant_metrics AS vm
     WHERE (@brand IS NULL OR vm.brand = @brand)
       AND (   EXISTS (SELECT 1 FROM #lk AS k
-                      WHERE k.brand = vm.brand AND k.sku_shopify = vm.sku_shopify)
+                      WHERE k.brand = vm.brand AND k.__ALT__ = vm.__ALT__)
            OR EXISTS (SELECT 1 FROM #lk AS k
                       WHERE k.brand = vm.brand AND k.variant_title = vm.variant_title))
     OPTION (RECOMPILE);
 
     SELECT
-        r.sku_brand,
+        r.__KEY__,
         k.variant_title              AS lookup_variant_title,
-        k.sku_shopify                AS lookup_sku_shopify,
-        CASE WHEN k.sku_brand   IS NULL THEN 'not in lookup either'
-             WHEN m.matched_on  IS NULL THEN 'no rows under sku_shopify or variant_title'
+        k.__ALT__                AS lookup___ALT__,
+        CASE WHEN k.__KEY__   IS NULL THEN 'not in lookup either'
+             WHEN m.matched_on  IS NULL THEN 'no rows under __ALT__ or variant_title'
              ELSE m.matched_on END   AS matched_on,
-        m.recorded_under_sku_brand,
+        m.recorded_under___KEY__,
         m.first_captured,
         m.last_captured,
         m.max_quantity_available,
@@ -255,45 +273,51 @@ BEGIN
            ON k.paste_order = r.paste_order
     OUTER APPLY (
         SELECT CASE WHEN MAX(x.by_sku) = 1 AND MAX(x.by_title) = 1
-                         THEN 'same sku_shopify + variant_title'
-                    WHEN MAX(x.by_sku) = 1 THEN 'same sku_shopify'
+                         THEN 'same __ALT__ + variant_title'
+                    WHEN MAX(x.by_sku) = 1 THEN 'same __ALT__'
                     ELSE 'same variant_title' END AS matched_on,
-               a.sku_brand               AS recorded_under_sku_brand,
+               a.__KEY__               AS recorded_under___KEY__,
                MIN(a.captured_datetime)  AS first_captured,
                MAX(a.captured_datetime)  AS last_captured,
                MAX(a.quantity_available) AS max_quantity_available,
                COUNT(*)                  AS snapshots_found
         FROM #alt AS a
         CROSS APPLY (
-            SELECT CASE WHEN a.sku_shopify   = k.sku_shopify   THEN 1 ELSE 0 END AS by_sku,
+            SELECT CASE WHEN a.__ALT__   = k.__ALT__   THEN 1 ELSE 0 END AS by_sku,
                    CASE WHEN a.variant_title = k.variant_title THEN 1 ELSE 0 END AS by_title
         ) AS x
         WHERE a.brand = k.brand
           AND (x.by_sku = 1 OR x.by_title = 1)
-        GROUP BY a.sku_brand
+        GROUP BY a.__KEY__
     ) AS m
     WHERE r.snapshots_found = 0
-    ORDER BY r.paste_order, m.matched_on, m.recorded_under_sku_brand;
+    ORDER BY r.paste_order, m.matched_on, m.recorded_under___KEY__;
 END
 """
+# __KEY__ = the pasted key (LOOK_UP_BY), __ALT__ = the other key
+SQL_SCRIPT = SQL_TEMPLATE.replace("__KEY__", KEY).replace("__ALT__", ALT)
 
-R1_DB_COLS = ["sku_brand", "first_captured", "last_captured", "max_quantity_available",
+R1_DB_COLS = [KEY, "first_captured", "last_captured", "max_quantity_available",
               "snapshots_found", "in_lookup", "status"]
-R2_COLS    = ["sku_brand", "lookup_variant_title", "lookup_sku_shopify", "matched_on",
-              "recorded_under_sku_brand", "first_captured", "last_captured",
+R2_COLS    = [KEY, "lookup_variant_title", f"lookup_{ALT}", "matched_on",
+              f"recorded_under_{KEY}", "first_captured", "last_captured",
               "max_quantity_available", "snapshots_found"]
 
 # Columns added to every tab, and their header names in the scraper CSV
 # files (matched ignoring upper/lower case and spaces; first one found wins).
-DETAIL_COLS    = ["sku_shopify", "style_id", "sku_url", "handle", "product_title", "variant_title"]
+DETAIL_COLS    = ["sku_shopify", "style_id", "sku_url", "handle", "product_title", "variant_title", "description","image_url"]
 DETAIL_HEADERS = {
+    "sku_brand":     ["SKU - Brand"],
     "sku_shopify":   ["SKU - Shopify"],
     "style_id":      ["Style Id"],
     "sku_url":       ["SKU URL"],
     "handle":        ["Handle"],
     "product_title": ["Product Title", "Product"],
     "variant_title": ["Variant Title"],
+    "description":   ["Description"],
+    "image_url":     ["Image URL"],
 }
+DETAIL_COLS = [ALT if c == KEY else c for c in DETAIL_COLS]   # the pasted key is already the first column
 
 
 def run_database(skus, brand, check_other_keys, connect=None):
@@ -354,7 +378,7 @@ def clean_quantity(val):
         return None
 
 
-SKU_COL, QTY_COL = "SKU - Brand", "Quantity Available"
+SKU_COL, QTY_COL = KEYS[KEY], "Quantity Available"
 MAX_QUERY_CHARS  = 200000       # Azure's limit for one query is 256 KB
 MAX_IN_ITEMS     = 500          # Azure rejects an IN (...) list of ~1,000 or more values ("Syntax error in query")
 
@@ -682,7 +706,7 @@ def build_daily(skus, files, found, base):
                          "First Quantity Available":  qty.get(first),
                          "Second Quantity Available": qty.get(second)})
         for r in rows or [{}]:
-            out.append({**base.get(key, {"sku_brand": sku}), **r})
+            out.append({**base.get(key, {KEY: sku}), **r})
     return out
 
 
@@ -710,11 +734,15 @@ def write_xlsx(path, sheets):
         for cell in ws[1]:
             cell.font = Font(bold=True)
         widths = [len(c) for c in cols]
-        for r in rows:
+        for n, r in enumerate(rows, 2):             # row 1 is the header
             vals = [excel_value(r.get(c)) for c in cols]
-            vals = [ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v for v in vals]
+            vals = [ILLEGAL_CHARACTERS_RE.sub("", v)[:32767] if isinstance(v, str) else v
+                    for v in vals]                  # 32,767 = most characters an Excel cell holds
             ws.append(vals)
-            for i, (cell, v) in enumerate(zip(ws[ws.max_row], vals)):
+            for i, v in enumerate(vals):
+                if v is None or isinstance(v, (int, float)):
+                    continue
+                cell = ws.cell(row=n, column=i + 1)  # not ws[ws.max_row]: that rescans the sheet every row
                 if isinstance(v, datetime.datetime):
                     cell.number_format = "yyyy-mm-dd hh:mm:ss"
                 elif isinstance(v, datetime.date):
@@ -745,7 +773,7 @@ def main():
         pass
     skus = parse_sku_list(SKU_LIST)
     log("=" * 64)
-    log(f"  SKU HISTORY CHECK   brand: {BRAND}   SKUs pasted: {len(skus)}")
+    log(f"  SKU HISTORY CHECK   brand: {BRAND}   {KEY} values pasted: {len(skus)}")
     log("=" * 64)
     if not skus:
         log("SKU_LIST is empty - nothing to do.")
@@ -762,7 +790,7 @@ def main():
     else:
         log("\nDatabase: querying variant_metrics / lookup ...")
         r1, r2 = run_database(skus, BRAND, CHECK_OTHER_KEYS)
-        db_rows = {r["sku_brand"].upper(): r for r in r1}
+        db_rows = {str(r[KEY]).upper(): r for r in r1}
         db_done = True
 
     # ---- blob files ----------------------------------------------
@@ -782,9 +810,9 @@ def main():
                 log(f"    {name}: {note}")
 
     # ---- result 1 --------------------------------------------------
-    result1, details = [], {}                       # details: SKU_KEY -> sku_brand + DETAIL_COLS
+    result1, details = [], {}                       # details: SKU_KEY -> KEY + DETAIL_COLS
     for sku in skus:
-        row = {"sku_brand": sku}
+        row = {KEY: sku}
         d = db_rows.get(sku.upper())
         if db_done:
             if d is None:                           # should not happen; flag, don't guess
@@ -794,14 +822,14 @@ def main():
         if blob_done:
             row.update(blob_rows[sku.upper()])
         if d:                                       # SKU not in any file: fall back to the lookup table
-            row["sku_shopify"]   = row.get("sku_shopify")   or d.get("lookup_sku_shopify")
+            row[ALT]             = row.get(ALT)             or d.get(f"lookup_{ALT}")
             row["variant_title"] = row.get("variant_title") or d.get("lookup_variant_title")
-        details[sku.upper()] = {c: row.get(c) for c in ["sku_brand"] + DETAIL_COLS}
+        details[sku.upper()] = {c: row.get(c) for c in [KEY] + DETAIL_COLS}
         result1.append(row)
 
-    r2_rows = [{**details.get(str(r["sku_brand"]).upper(), {}), **r} for r in r2]
+    r2_rows = [{**details.get(str(r[KEY]).upper(), {}), **r} for r in r2]
     daily = []
-    if blob_done:
+    if blob_done and PULL_DAILY_QUANTITIES:
         base = {k: {**v, **({c: db_rows.get(k, {}).get(c) for c in ("in_lookup", "status")} if db_done else {})}
                 for k, v in details.items()}
         daily = build_daily(skus, status["files"], status["found"], base)
@@ -811,12 +839,12 @@ def main():
     if blob_done:
         print_table("RESULT 1 - from the scraper files in blob storage" if db_done
                     else "RESULT 1 - from the scraper files in blob storage (database part skipped)",
-                    result1, ["sku_brand"] + R1_BLOB_COLS)
+                    result1, [KEY] + R1_BLOB_COLS)
     if db_done and r2:
         print_table("RESULT 2 - NOT FOUND SKUs: rows in variant_metrics under another key", r2, R2_COLS)
 
     # ---- excel workbook --------------------------------------------
-    first = ["sku_brand"] + DETAIL_COLS
+    first = [KEY] + DETAIL_COLS
     sheets = []
     if db_done:
         sheets.append(("Result 1 - Database", result1, first + R1_DB_COLS[1:]))
@@ -824,9 +852,10 @@ def main():
         sheets.append(("Result 1 - Blob Files", result1, first + R1_BLOB_COLS))
     if db_done and CHECK_OTHER_KEYS:
         sheets.append(("Result 2 - Other Keys", r2_rows, first + R2_COLS[1:]))
-    if blob_done:
+    if blob_done and PULL_DAILY_QUANTITIES:
         sheets.append(("Daily Quantity", daily,
                        first + DAILY_COLS + (["in_lookup", "status"] if db_done else [])))
+    if blob_done:
         if status["problems"]:
             sheets.append(("Files Not Searched", [{"source_file_name": n, "problem": p}
                                                   for n, p in status["problems"]],
@@ -836,10 +865,11 @@ def main():
         return
 
     brand = re.sub(r'[\\/:*?"<>|\s]+', "_", BRAND.strip()).upper()
-    name = f"SKU_HISTORY_{brand}_{datetime.date.today():%Y_%m_%d}.xlsx"
+    name = f"SKU_HISTORY_{'SHOPIFY_' if KEY == 'sku_shopify' else ''}{brand}_{datetime.date.today():%Y_%m_%d}.xlsx"
     path = write_xlsx(os.path.join(HERE, name), sheets)
-    log(f"\nDaily Quantity tab: {len(daily):,} row(s)" if blob_done
-          else "\nDaily Quantity tab: SKIPPED (needs the blob part, CHECK_BLOBS = False)")
+    log(f"\nDaily Quantity tab: {len(daily):,} row(s)" if blob_done and PULL_DAILY_QUANTITIES
+        else "\nDaily Quantity tab: SKIPPED (PULL_DAILY_QUANTITIES = False)" if blob_done
+        else "\nDaily Quantity tab: SKIPPED (needs the blob part, CHECK_BLOBS = False)")
     log(f"Saved ({len(sheets)} tabs): {path or 'could not save - is the file open in Excel?'}")
 
 
