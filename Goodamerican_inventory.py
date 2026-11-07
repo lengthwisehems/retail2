@@ -3102,6 +3102,12 @@ def build_rows(
     refresh_inseam_style(staged_rows)
     apply_color_fallbacks(staged_rows)
     apply_inseam_label_multi(staged_rows, session)
+    # Here, not later: this is the last step that adds or changes a length
+    # segment, and it has to stay ahead of unify_multi_inseam_style, which has
+    # the final say on Inseam Style. (apply_duplicate_old_marker only appends
+    # OLD after an existing segment, which _alt_base_and_length reads through.)
+    align_inseam_label_to_title(staged_rows)
+    refresh_inseam_style(staged_rows)
     unify_color_within_style(staged_rows)
     unify_multi_inseam_style(staged_rows)
     fill_multi_rise_label(staged_rows)
@@ -3478,6 +3484,36 @@ def refresh_inseam_style(rows: List[Dict[str, str]]) -> None:
             row["Product"], row["Handle"], row["Description"], row["Inseam"])
         row["Inseam Style"] = determine_inseam_style_v2(
             row["Jean Style"], row["Inseam Label"], row["Inseam"], keyword_fallback)
+
+
+def align_inseam_label_to_title(rows: List[Dict[str, str]]) -> None:
+    """Where the title states a length, make Inseam Label say the same thing.
+
+    The label is settled early, by determine_inseam_label_v2: handle, then the
+    variant options, then the scraped title, then the inseam number. The length
+    segment of Product Title Alt is settled much later, and knows things that
+    function could not: the Multi rule marks the non-petite member of a
+    multi-inseam style REGULAR, which the measurement fallback has no way to
+    see. So a flare whose regular run genuinely measures 33.5" came out Long
+    purely because of the >= 33 rule, while its own title said REGULAR.
+
+    A stated length beats a measured one, so the title wins. Rows whose title
+    carries no length segment are left alone - there the inseam fallback is
+    still the best answer available.
+    """
+    changed = Counter()
+    for row in rows:
+        _base, segment = _alt_base_and_length(row.get("Product Title Alt", ""))
+        if not segment:
+            continue
+        # "LONG OLD" -> "Long"; the OLD marker is not part of the length.
+        label = segment.split()[0].title()
+        if label != row.get("Inseam Label", ""):
+            changed[(row.get("Inseam Label", "") or "(blank)", label)] += 1
+            row["Inseam Label"] = label
+    for (old, new), count in sorted(changed.items(), key=lambda kv: -kv[1]):
+        logging.info("Inseam Label %s -> %s from the title on %s rows",
+                     old, new, count)
 
 
 def drop_dead_products(rows: List[Dict[str, str]], session) -> List[Dict[str, str]]:
