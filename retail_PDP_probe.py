@@ -17,17 +17,17 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup, FeatureNotFound, Tag
+from bs4 import BeautifulSoup, Comment, FeatureNotFound, NavigableString, Tag
 from openpyxl import Workbook
 
 # =========================
 # USER INPUTS (EDIT THESE)
 # =========================
-BRAND = "Paige"
+BRAND = "AYR"
 COLLECTION_URL = [
-    "https://shop.paige.com/collections/women-denim",
+    "https://www.ayr.com/collections/final-sale-womenswear",
 ]
-SELECTOR = "#headlessui-disclosure-panel-_r_27_ > div > ul > li"
+SELECTOR = "#shopify-section-template--20264212136015__product-details > section"
 # Optional click-open controls for accordions/tabs.
 # Example for Paige:
 # PARENT_SELECTOR = "div[data-headlessui-state]"
@@ -47,7 +47,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 TIMEOUT = 30
-MAX_RETRIES = 5
+MAX_RETRIES = 6
+# Pause between every request so the store doesn't rate-limit us (HTTP 429).
+REQUEST_DELAY_SECONDS = 1.0
+# Backoff used for 429/5xx when the server doesn't send a Retry-After header.
+RETRY_BASE_DELAY_SECONDS = 5.0
+RETRY_MAX_DELAY_SECONDS = 60.0
 
 
 @dataclass
@@ -99,26 +104,64 @@ def build_session() -> requests.Session:
     return session
 
 
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Return seconds to wait from a Retry-After header (seconds form only)."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return None
+
+
 def get_with_retries(session: requests.Session, url: str, logger: logging.Logger) -> requests.Response:
-    delay = 1.0
-    last_error: Exception | None = None
+    delay = RETRY_BASE_DELAY_SECONDS
+    last_error: str = "none"
     for attempt in range(1, MAX_RETRIES + 1):
+        time.sleep(REQUEST_DELAY_SECONDS)
         try:
             response = session.get(url, timeout=TIMEOUT)
-            if response.status_code in {429, 500, 502, 503, 504}:
-                logger.warning("Transient HTTP %s for %s (attempt %s/%s)", response.status_code, url, attempt, MAX_RETRIES)
-                time.sleep(delay)
-                delay *= 2
-                continue
-            response.raise_for_status()
-            return response
         except requests.RequestException as exc:
-            last_error = exc
-            logger.warning("Request error for %s (attempt %s/%s): %s", url, attempt, MAX_RETRIES, exc)
-            time.sleep(delay)
-            delay *= 2
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                logger.warning("Request error for %s (attempt %s/%s): %s. Waiting %.0fs", url, attempt, MAX_RETRIES, exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, RETRY_MAX_DELAY_SECONDS)
+            continue
 
-    raise RuntimeError(f"Failed request after {MAX_RETRIES} attempts: {url} | Last error: {last_error}")
+        if response.status_code in {429, 500, 502, 503, 504}:
+            last_error = f"HTTP {response.status_code}"
+            wait = parse_retry_after(response.headers.get("Retry-After"))
+            wait = min(wait, RETRY_MAX_DELAY_SECONDS) if wait is not None else delay
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "HTTP %s for %s (attempt %s/%s). Waiting %.0fs before retrying",
+                    response.status_code, url, attempt, MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                delay = min(delay * 2, RETRY_MAX_DELAY_SECONDS)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    hint = ""
+    if last_error == "HTTP 429":
+        hint = " The site is rate-limiting this IP (HTTP 429). Wait 10-30 minutes and try again."
+    raise RuntimeError(f"Failed request after {MAX_RETRIES} attempts: {url} | Last error: {last_error}.{hint}")
+
+
+def warn_if_collection_missing(session: requests.Session, collection_url: str, logger: logging.Logger) -> None:
+    """Shopify returns an empty product list for collections that don't exist, so check the page itself."""
+    try:
+        response = session.get(collection_url, timeout=TIMEOUT)
+    except requests.RequestException:
+        return
+    if response.status_code == 404:
+        logger.warning(
+            "Collection page returned 404 - this collection URL does not exist. Check the URL: %s",
+            collection_url,
+        )
 
 
 def iter_collection_products(session: requests.Session, collection_url: str, logger: logging.Logger) -> Iterable[dict]:
@@ -130,6 +173,8 @@ def iter_collection_products(session: requests.Session, collection_url: str, log
         products = payload.get("products") or []
         logger.info("Collection %s page %s returned %s products", collection_url, page, len(products))
         if not products:
+            if page == 1:
+                warn_if_collection_missing(session, collection_url, logger)
             break
         for product in products:
             yield product
@@ -139,6 +184,52 @@ def iter_collection_products(session: requests.Session, collection_url: str, log
 def normalize_text(tag: Tag) -> str:
     text = " ".join(part.strip() for part in tag.stripped_strings if part.strip())
     return re.sub(r"\s+", " ", text).strip()
+
+
+BLOCK_TAGS = {
+    "p", "div", "li", "ul", "ol", "dl", "dt", "dd", "table", "section", "article",
+    "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "hr",
+}
+
+
+def has_loose_lines(tag: Tag) -> bool:
+    """True when a block holds text directly (not wrapped in a child tag) or uses <br> line breaks."""
+    for node in tag.children:
+        if isinstance(node, NavigableString) and not isinstance(node, Comment) and node.strip():
+            return True
+        if isinstance(node, Tag) and node.name == "br":
+            return True
+    return False
+
+
+def split_loose_lines(tag: Tag) -> List[str]:
+    """Split a block into lines at <br> tags; block-level children (e.g. <p>) become their own line."""
+    lines: List[str] = []
+    buffer: List[str] = []
+
+    def flush() -> None:
+        text = re.sub(r"\s+", " ", " ".join(buffer)).strip()
+        if text:
+            lines.append(text)
+        buffer.clear()
+
+    for node in tag.children:
+        if isinstance(node, Comment):
+            continue
+        if isinstance(node, NavigableString):
+            buffer.append(str(node))
+        elif isinstance(node, Tag):
+            if node.name == "br":
+                flush()
+            elif node.name in BLOCK_TAGS:
+                flush()
+                text = normalize_text(node)
+                if text:
+                    lines.append(text)
+            else:
+                buffer.append(" ".join(node.stripped_strings))
+    flush()
+    return lines
 
 
 def child_letter(index: int) -> str:
@@ -237,7 +328,10 @@ def extract_child_columns_from_soup(soup: BeautifulSoup, selector: str, logger: 
     children = [child for child in parent.find_all(recursive=False) if isinstance(child, Tag)]
     for child_index, child in enumerate(children, start=1):
         nested = [node for node in child.find_all(recursive=False) if isinstance(node, Tag)]
-        if nested:
+        if nested and has_loose_lines(child):
+            for nested_index, value in enumerate(split_loose_lines(child), start=1):
+                result[f"Child {child_index}{child_letter(nested_index)}"] = value
+        elif nested:
             for nested_index, node in enumerate(nested, start=1):
                 value = normalize_text(node)
                 if value:
@@ -424,7 +518,12 @@ def probe_pdp_rows(session: requests.Session, logger: logging.Logger) -> List[PD
     rows: List[PDPRow] = []
 
     for collection_url in COLLECTION_URL:
-        for product in iter_collection_products(session, collection_url, logger):
+        try:
+            products = list(iter_collection_products(session, collection_url, logger))
+        except Exception as exc:
+            logger.error("Skipping collection %s: %s", collection_url, exc)
+            continue
+        for product in products:
             handle = (product.get("handle") or "").strip()
             if not handle or handle in seen_handles:
                 continue
