@@ -7,6 +7,7 @@ and extracts configured selector child content into Excel columns.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Comment, FeatureNotFound, NavigableString, Tag
@@ -25,7 +26,8 @@ from openpyxl import Workbook
 # =========================
 BRAND = "AYR"
 COLLECTION_URL = [
-    "https://www.ayr.com/collections/final-sale-womenswear",
+    "https://ayr.com/collections/final-sale-womenswear",
+    "https://ayr.com/collections/jeans-womenswear",
 ]
 SELECTOR = "#shopify-section-template--20264212136015__product-details > section"
 # Optional click-open controls for accordions/tabs.
@@ -34,7 +36,10 @@ SELECTOR = "#shopify-section-template--20264212136015__product-details > section
 # SET_PARENT_SELECTOR_TO_OPEN = True
 PARENT_SELECTOR = ""
 SET_PARENT_SELECTOR_TO_OPEN = False
-CLICK_TARGET_TEXTS: List[str] = ["DETAILS"]
+# Button texts to click open before reading the page (e.g. ["DETAILS"] for Paige).
+# Leave empty when the selector content is already in the page (AYR). The browser
+# is still used automatically for any page that gets a bot check.
+CLICK_TARGET_TEXTS: List[str] = []
 BROWSER_RENDER_ENABLED = True
 BROWSER_RENDER_TIMEOUT_MS = 45000
 
@@ -46,13 +51,48 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# The headers a real Chrome sends alongside that User-Agent. A lone User-Agent
+# is a known trigger for bot challenges; sending the full set costs nothing.
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Not(A:Brand";v="24", "Google Chrome";v="124"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 TIMEOUT = 30
 MAX_RETRIES = 6
-# Pause between every request so the store doesn't rate-limit us (HTTP 429).
-REQUEST_DELAY_SECONDS = 1.0
-# Backoff used for 429/5xx when the server doesn't send a Retry-After header.
+# A 429 can be a real rate limit (waiting helps) or a bot challenge page such as
+# "Verifying your connection..." (waiting never helps). Challenges get a short
+# capped wait and few attempts, then the run falls back to a real browser.
+CHALLENGE_MAX_ATTEMPTS = 2
+CHALLENGE_MAX_WAIT_SECONDS = 15.0
+# Pace between requests. It adapts both ways: each 429 slows it down, each clean
+# response brings it back toward the floor.
+REQUEST_DELAY_SECONDS = 0.5
+REQUEST_DELAY_MAX_SECONDS = 6.0
+REQUEST_DELAY_STEP_SECONDS = 0.75
+REQUEST_DELAY_DECAY = 0.9
+# Backoff used for real rate limits / 5xx when the server sends no Retry-After.
 RETRY_BASE_DELAY_SECONDS = 5.0
 RETRY_MAX_DELAY_SECONDS = 60.0
+# How long a browser page may sit on a challenge screen before we give up on it.
+BROWSER_CHALLENGE_WAIT_MS = 20000
+
+_PACE: Dict[str, float] = {"interval": REQUEST_DELAY_SECONDS, "last": 0.0}
+
+
+class BotChallengeError(RuntimeError):
+    """The site answered with a bot-challenge page instead of content."""
 
 
 @dataclass
@@ -100,8 +140,39 @@ def setup_logger() -> logging.Logger:
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json,text/html,*/*"})
+    session.headers.update(BROWSER_HEADERS)
     return session
+
+
+CHALLENGE_MARKERS = ("verifying your connection", "just a moment", "checking your browser", "cf-chl-")
+
+
+def text_is_bot_challenge(text: str) -> bool:
+    head = (text or "")[:5000].lower()
+    return any(marker in head for marker in CHALLENGE_MARKERS)
+
+
+def is_bot_challenge(response: requests.Response) -> bool:
+    """True for a bot-challenge interstitial rather than a real rate limit."""
+    if response.headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    return text_is_bot_challenge(response.text)
+
+
+def pace_request() -> None:
+    """Hold every request to the current global interval."""
+    wait = _PACE["last"] + _PACE["interval"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
+
+
+def slow_pace() -> None:
+    _PACE["interval"] = min(REQUEST_DELAY_MAX_SECONDS, _PACE["interval"] + REQUEST_DELAY_STEP_SECONDS)
+
+
+def relax_pace() -> None:
+    _PACE["interval"] = max(REQUEST_DELAY_SECONDS, _PACE["interval"] * REQUEST_DELAY_DECAY)
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -117,38 +188,64 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
 def get_with_retries(session: requests.Session, url: str, logger: logging.Logger) -> requests.Response:
     delay = RETRY_BASE_DELAY_SECONDS
     last_error: str = "none"
-    for attempt in range(1, MAX_RETRIES + 1):
-        time.sleep(REQUEST_DELAY_SECONDS)
+    attempt = 0
+    max_attempts = MAX_RETRIES
+    while attempt < max_attempts:
+        attempt += 1
+        pace_request()
         try:
             response = session.get(url, timeout=TIMEOUT)
         except requests.RequestException as exc:
             last_error = str(exc)
-            if attempt < MAX_RETRIES:
-                logger.warning("Request error for %s (attempt %s/%s): %s. Waiting %.0fs", url, attempt, MAX_RETRIES, exc, delay)
+            if attempt < max_attempts:
+                logger.warning("Request error for %s (attempt %s/%s): %s. Waiting %.0fs", url, attempt, max_attempts, exc, delay)
                 time.sleep(delay)
                 delay = min(delay * 2, RETRY_MAX_DELAY_SECONDS)
             continue
 
+        challenged = response.status_code in {403, 429, 503} and is_bot_challenge(response)
+        if challenged:
+            slow_pace()
+            last_error = f"HTTP {response.status_code} bot challenge"
+            max_attempts = min(max_attempts, CHALLENGE_MAX_ATTEMPTS)
+            if attempt < max_attempts:
+                retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                wait = min(retry_after if retry_after is not None else delay, CHALLENGE_MAX_WAIT_SECONDS)
+                logger.warning(
+                    "Bot challenge (HTTP %s, 'Verifying your connection') for %s (attempt %s/%s). "
+                    "Waiting %.0fs; pace now %.1fs",
+                    response.status_code, url, attempt, max_attempts, wait, _PACE["interval"],
+                )
+                time.sleep(wait)
+            continue
+
         if response.status_code in {429, 500, 502, 503, 504}:
+            if response.status_code == 429:
+                slow_pace()
             last_error = f"HTTP {response.status_code}"
             wait = parse_retry_after(response.headers.get("Retry-After"))
             wait = min(wait, RETRY_MAX_DELAY_SECONDS) if wait is not None else delay
-            if attempt < MAX_RETRIES:
+            if attempt < max_attempts:
                 logger.warning(
                     "HTTP %s for %s (attempt %s/%s). Waiting %.0fs before retrying",
-                    response.status_code, url, attempt, MAX_RETRIES, wait,
+                    response.status_code, url, attempt, max_attempts, wait,
                 )
                 time.sleep(wait)
                 delay = min(delay * 2, RETRY_MAX_DELAY_SECONDS)
             continue
 
+        relax_pace()
         response.raise_for_status()
         return response
 
-    hint = ""
+    message = f"Failed request after {attempt} attempts: {url} | Last error: {last_error}."
+    if "bot challenge" in last_error:
+        raise BotChallengeError(
+            message + " The site is showing this IP a bot-check page; waiting will not clear it."
+        )
     if last_error == "HTTP 429":
-        hint = " The site is rate-limiting this IP (HTTP 429). Wait 10-30 minutes and try again."
-    raise RuntimeError(f"Failed request after {MAX_RETRIES} attempts: {url} | Last error: {last_error}.{hint}")
+        message += " The site is rate-limiting this IP (HTTP 429). Wait 10-30 minutes and try again."
+    raise RuntimeError(message)
 
 
 def warn_if_collection_missing(session: requests.Session, collection_url: str, logger: logging.Logger) -> None:
@@ -179,6 +276,122 @@ def iter_collection_products(session: requests.Session, collection_url: str, log
         for product in products:
             yield product
         page += 1
+
+
+def load_sync_playwright(logger: logging.Logger):
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        logger.warning(
+            "Playwright is not installed, so the browser fallback is unavailable (%s). "
+            "Install it with: pip install playwright  then: playwright install chromium",
+            exc,
+        )
+        return None
+    return sync_playwright
+
+
+def wait_past_challenge(page, logger: logging.Logger, label: str) -> bool:
+    """Give a real browser time to clear a bot-check page. True once real content is showing."""
+    deadline = time.monotonic() + BROWSER_CHALLENGE_WAIT_MS / 1000
+    announced = False
+    while True:
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+        if html and not text_is_bot_challenge(html):
+            if announced:
+                logger.info("Browser cleared the bot check for %s", label)
+            return True
+        if time.monotonic() > deadline:
+            logger.warning("Browser still on the bot-check page after %.0fs: %s", BROWSER_CHALLENGE_WAIT_MS / 1000, label)
+            return False
+        if not announced:
+            logger.info("Browser is on a bot-check page for %s; waiting for it to clear", label)
+            announced = True
+        page.wait_for_timeout(1000)
+
+
+def handles_from_links(hrefs: Sequence[Optional[str]]) -> List[str]:
+    handles: List[str] = []
+    for href in hrefs:
+        match = re.search(r"/products/([^/?#]+)", href or "")
+        if match and match.group(1) not in handles:
+            handles.append(match.group(1))
+    return handles
+
+
+def browser_collection_products(collection_url: str, logger: logging.Logger) -> List[dict]:
+    """Read a collection's products through a real browser when plain requests are bot-checked."""
+    sync_playwright = load_sync_playwright(logger)
+    if sync_playwright is None:
+        return []
+
+    feed_path = f"{urlparse(collection_url).path.rstrip('/')}/products.json"
+    products: List[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(user_agent=USER_AGENT, locale="en-US")
+            page = context.new_page()
+            page.goto(collection_url, wait_until="domcontentloaded", timeout=BROWSER_RENDER_TIMEOUT_MS)
+            if not wait_past_challenge(page, logger, collection_url):
+                return []
+
+            # Ask for the JSON feed from inside the page, so the request carries the
+            # cookies the browser earned by passing the bot check.
+            page_no = 1
+            while True:
+                result = page.evaluate(
+                    """async (url) => {
+                        const r = await fetch(url, {credentials: 'same-origin', headers: {Accept: 'application/json'}});
+                        return {status: r.status, text: await r.text()};
+                    }""",
+                    f"{feed_path}?limit=250&page={page_no}",
+                )
+                status = result.get("status")
+                try:
+                    batch = json.loads(result.get("text") or "").get("products") or []
+                except (ValueError, AttributeError):
+                    logger.warning("Browser feed request for %s page %s was not JSON (HTTP %s)", collection_url, page_no, status)
+                    break
+                logger.info("Browser: collection %s page %s returned %s products", collection_url, page_no, len(batch))
+                if not batch:
+                    break
+                products.extend(batch)
+                page_no += 1
+
+            if not products:
+                hrefs = page.eval_on_selector_all("a[href*='/products/']", "els => els.map(e => e.getAttribute('href'))")
+                products = [{"handle": handle} for handle in handles_from_links(hrefs)]
+                logger.warning(
+                    "Browser feed unavailable; using the %s product links visible on the collection page "
+                    "(products further down an infinite-scroll page may be missing)",
+                    len(products),
+                )
+        except Exception as exc:
+            logger.warning("Browser collection fallback failed for %s: %s", collection_url, exc)
+        finally:
+            browser.close()
+    return products
+
+
+def collect_collection_products(session: requests.Session, collection_url: str, logger: logging.Logger) -> List[dict]:
+    """Collection products from the JSON feed, falling back to a real browser on a bot check."""
+    products: List[dict] = []
+    try:
+        for product in iter_collection_products(session, collection_url, logger):
+            products.append(product)
+        return products
+    except BotChallengeError as exc:
+        if not BROWSER_RENDER_ENABLED:
+            raise
+        logger.warning("%s Trying a real browser instead.", exc)
+    browser_products = browser_collection_products(collection_url, logger)
+    if not products and not browser_products:
+        raise BotChallengeError(f"Bot check blocked both the product feed and the browser for {collection_url}")
+    return products + browser_products
 
 
 def normalize_text(tag: Tag) -> str:
@@ -435,8 +648,11 @@ def render_page_html_with_clicks(
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            page = browser.new_context(user_agent=USER_AGENT, locale="en-US").new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if not wait_past_challenge(page, logger, url):
+                browser.close()
+                return None
             try:
                 page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
             except PlaywrightTimeoutError:
@@ -517,9 +733,14 @@ def probe_pdp_rows(session: requests.Session, logger: logging.Logger) -> List[PD
     seen_handles: set[str] = set()
     rows: List[PDPRow] = []
 
+    # After this many PDPs in a row are bot-checked over plain HTTP, stop trying
+    # HTTP and go straight to the browser for the rest of the run.
+    challenge_streak_limit = 3
+    challenge_streak = 0
+
     for collection_url in COLLECTION_URL:
         try:
-            products = list(iter_collection_products(session, collection_url, logger))
+            products = collect_collection_products(session, collection_url, logger)
         except Exception as exc:
             logger.error("Skipping collection %s: %s", collection_url, exc)
             continue
@@ -532,13 +753,29 @@ def probe_pdp_rows(session: requests.Session, logger: logging.Logger) -> List[PD
             product_url = urljoin(collection_url, f"/products/{handle}")
             try:
                 html_candidates: List[Tuple[str, str]] = []
-                try:
-                    response = get_with_retries(session, product_url, logger)
-                    html_candidates.append(("http", response.text))
-                except Exception as exc:
-                    logger.warning("HTTP fetch failed for %s; will try browser-render path: %s", product_url, exc)
+                http_failed = False
+                if BROWSER_RENDER_ENABLED and challenge_streak >= challenge_streak_limit:
+                    http_failed = True
+                else:
+                    try:
+                        response = get_with_retries(session, product_url, logger)
+                        html_candidates.append(("http", response.text))
+                        challenge_streak = 0
+                    except BotChallengeError as exc:
+                        http_failed = True
+                        challenge_streak += 1
+                        logger.warning("HTTP fetch bot-checked for %s; will try browser-render path: %s", product_url, exc)
+                        if challenge_streak == challenge_streak_limit and BROWSER_RENDER_ENABLED:
+                            logger.warning(
+                                "%s product pages in a row were bot-checked; using the browser only for the rest of the run",
+                                challenge_streak_limit,
+                            )
+                    except Exception as exc:
+                        http_failed = True
+                        logger.warning("HTTP fetch failed for %s; will try browser-render path: %s", product_url, exc)
 
-                if BROWSER_RENDER_ENABLED and (CLICK_TARGET_TEXTS or (SET_PARENT_SELECTOR_TO_OPEN and PARENT_SELECTOR.strip())):
+                wants_clicks = bool(CLICK_TARGET_TEXTS) or (SET_PARENT_SELECTOR_TO_OPEN and PARENT_SELECTOR.strip())
+                if BROWSER_RENDER_ENABLED and (wants_clicks or http_failed):
                     rendered_html = render_page_html_with_clicks(
                         product_url,
                         PARENT_SELECTOR,
@@ -601,6 +838,12 @@ def main() -> None:
     session = build_session()
     rows = probe_pdp_rows(session, logger)
     logger.info("Collected %s PDP rows", len(rows))
+    empty = [row.handle for row in rows if not row.child_values]
+    if empty:
+        logger.warning(
+            "No selector data for %s of %s product(s): %s",
+            len(empty), len(rows), ", ".join(empty[:20]) + (" ..." if len(empty) > 20 else ""),
+        )
     export_to_excel(rows, logger)
 
 
