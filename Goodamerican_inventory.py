@@ -39,6 +39,7 @@ COLLECTION_HANDLES = ["womens-jeans", "sale"]
 # ---------------------------------------------------------------------------
 # Products are dropped when the product title contains any of these words.
 # Kept near the top so it is easy to edit.
+# Set live on 11/16/2026 at 5:50pm CST
 # ---------------------------------------------------------------------------
 FILTER_WORDS: List[str] = [
     "Accessories", "Accessory", "Bermuda", "Bermudas", "Bikini", "Blazer",
