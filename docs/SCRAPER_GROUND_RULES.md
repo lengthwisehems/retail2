@@ -73,6 +73,12 @@ invented. Never rename a column to suit one brand: the database loads them by na
 `Wishlist count`, `Google Analytics Purchases`, `Google Analytics AVG Revenue`,
 `Google Analytics Total Revenue`
 
+The Data group is where availability varies most. Every brand has price and inventory;
+reviews, wishlist counts, returns and the Google Analytics figures depend entirely on what
+that brand's site exposes, and several brands have none of them. They still come from the
+scraper's file where they exist - they are not loaded from anywhere else - so take them
+when the brand publishes them and leave the column out when it does not.
+
 **`Updated At` should be produced for every brand.** Some of the earlier scrapers do not
 emit it yet; that is an oversight, not a convention.
 
