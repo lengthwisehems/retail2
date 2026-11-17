@@ -15,6 +15,7 @@ import logging
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -285,7 +286,7 @@ def norm_for_match(text: str) -> str:
     Used ONLY for keyword matching so "Mid-Rise", "mid rise" and "Mid  Rise"
     all compare equal. Output columns are not built from this.
     """
-    text = straighten_quotes(text or "").lower()
+    text = strip_accents(straighten_quotes(text or "")).lower()
     text = re.sub(r"[-\u2010\u2011\u2012\u2013\u2014]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -301,6 +302,17 @@ def has_phrase(norm_text: str, phrases: Iterable[str]) -> bool:
     return False
 
 
+def strip_accents(text: str) -> str:
+    """"Cr\u00e8me" -> "Creme" (used for keyword matching)."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c))
+
+
+def deaccent_creme(text: str) -> str:
+    """Per Carrie 11/17: no accent on "creme" anywhere in the output."""
+    return re.sub(r"(cr)[\u00e8\u00c8](me)", lambda m: m.group(1) + ("E" if m.group(0)[2] == "\u00c8" else "e") + m.group(2),
+                  text or "", flags=re.IGNORECASE)
+
+
 def straighten_quotes(text: str) -> str:
     return (
         (text or "")
@@ -311,7 +323,7 @@ def straighten_quotes(text: str) -> str:
 
 def clean_description(text: str) -> str:
     """Description column: '-' -> space, curly quotes -> straight."""
-    return straighten_quotes(text or "").replace("-", " ")
+    return deaccent_creme(straighten_quotes(text or "").replace("-", " "))
 
 
 _FINAL_SALE_PATTERNS = [
@@ -629,7 +641,7 @@ COLOR_STANDARD_RULES: List[Tuple[str, List[str]]] = [
     ("Purple", ["Purple", "Violet"]),
     ("Red", ["Red", "wine", "burgundy"]),
     ("Tan", ["Tan", "Sand", "Sable", "Beige", "khaki"]),
-    ("White", ["White", "ecru", "egret", "cream", "Cr\u00e8me", "Blizzard", "Ivory", "Parchment", "Blanc"]),
+    ("White", ["White", "ecru", "egret", "cream", "Creme", "Blizzard", "Ivory", "Parchment", "Blanc"]),
     ("Black", ["Black", "Noir", "Onyx", "Raven"]),
 ]
 
@@ -1138,8 +1150,8 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
             inseam_label = "Regular"
             has_length = False
 
-        clean_title = strip_final_sale(var.product_title)
-        color = var.color.strip()
+        clean_title = deaccent_creme(strip_final_sale(var.product_title))
+        color = deaccent_creme(var.color.strip())
 
         # Product: title / [Petite|Regular|Long when the variant's inseam is S/R/L /] Color
         product_parts = [clean_title]
@@ -1205,6 +1217,8 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
             "_title_key": clean_title.upper(),
             "_color_key": color.upper(),
             "_title_had_final_sale": title_has_final_sale(var.product_title),
+            "_final_sale": is_promo(var.product_title, var.handle),
+            "_created_raw": created_at,
         })
 
     # Jean Style step 2: still blank and no keywords in title or description ->
@@ -1227,13 +1241,15 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
         first = r["Jean Style"].split()[0] if r["Jean Style"] else ""
         r["Style Name"] = f"{strip_final_sale(r['_raw_title'])} {first}".strip()
 
-    # Product " / OLD": removing Final Sale made two different style ids share one Product.
+    # Product " / OLD" (Carrie 11/17): when a style whose title or handle has
+    # final/sale ends up with the same Product as a style without it, the
+    # final-sale style gets " / OLD".
     by_product: Dict[str, Dict[str, bool]] = defaultdict(dict)
     for r in out:
-        by_product[r["Product"].upper()][r["Style Id"]] = r["_title_had_final_sale"]
+        by_product[r["Product"].upper()][r["Style Id"]] = r["_final_sale"]
     for r in out:
         ids = by_product[r["Product"].upper()]
-        if len(ids) > 1 and any(ids.values()) and not r["_title_had_final_sale"]:
+        if len(ids) > 1 and any(ids.values()) and not all(ids.values()) and r["_final_sale"]:
             r["Product"] = f"{r['Product']} / OLD"
 
     return out
@@ -1249,6 +1265,93 @@ def finalize_rows(out: List[Dict[str, Any]]) -> None:
         totals[(r["Style Id"], r["_color_key"], r["Inseam Label"])] += int(r["Quantity Available"] or 0)
     for r in out:
         r["Quantity of style"] = totals[(r["Style Id"], r["_color_key"], r["Inseam Label"])]
+
+
+def _parse_dt(value: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def insert_old_marker_variant_title(title: str, size: str, inseam_label: str, has_length: bool, marker: str) -> Optional[str]:
+    """OLD goes after the color, right before the size (add-on 2.3).
+    "The LaLa / Waylon / Long / 24" -> "The LaLa / Waylon / Long OLD / 24"
+    "The Space / Asphalt / XS"      -> "The Space / Asphalt / OLD / XS"
+    Returns None when the size can't be found (caller skips and logs)."""
+    parts = [p.strip() for p in (title or "").split(" / ")]
+    idx = next((i for i in range(len(parts) - 1, -1, -1) if size and parts[i].lower() == size.strip().lower()), None)
+    if idx is None or idx == 0:
+        return None
+    if has_length and parts[idx - 1].lower() == (inseam_label or "").lower():
+        parts[idx - 1] = f"{parts[idx - 1]} {marker}"
+    else:
+        parts.insert(idx, marker)
+    return " / ".join(parts)
+
+
+def insert_old_marker_alt_title(alt: str, inseam_label: str, has_length: bool, marker: str) -> str:
+    """Alt title: marker at the end, same inseam rule.
+    "The LaLa / Waylon / Long" -> "... / Long OLD"; "The Space / Asphalt" -> "... / Asphalt / OLD"."""
+    if not alt:
+        return alt
+    parts = [p.strip() for p in alt.split(" / ")]
+    if has_length and parts[-1].lower() == (inseam_label or "").lower():
+        parts[-1] = f"{parts[-1]} {marker}"
+    else:
+        parts.append(marker)
+    return " / ".join(parts)
+
+
+def apply_old_listing_markers(rows: List[Dict[str, Any]], logger: logging.Logger) -> None:
+    """Two or more SKUs (different listings) with the same Variant Title (Carrie 11/17):
+    1. If some of the listings have final/sale in the title or handle and some don't,
+       the final-sale listing(s) get OLD.
+    2. Otherwise the older listing(s) by Created At get OLD; the newest gets none.
+    Only Variant Title and Product Title Alt change. 2 listings -> "OLD";
+    3+ listings -> "OLD1", "OLD2", ... oldest first. A tie or missing date in
+    case 2 changes nothing and is logged."""
+    groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        groups[r["Variant Title"].strip().upper()][r["Style Id"]].append(r)
+
+    marked = skipped = 0
+    for vt, by_style in groups.items():
+        skus = {r["SKU - Shopify"] for style_rows in by_style.values() for r in style_rows}
+        if len(by_style) < 2 or len(skus) < 2:
+            continue
+        created = {sid: _parse_dt(style_rows[0]["_created_raw"]) for sid, style_rows in by_style.items()}
+        final_sale = {sid: style_rows[0]["_final_sale"] for sid, style_rows in by_style.items()}
+        if any(final_sale.values()) and not all(final_sale.values()):
+            targets = [sid for sid in by_style if final_sale[sid]]
+            reason = "final sale"
+        else:
+            dates = list(created.values())
+            if any(d is None for d in dates) or len(set(dates)) < len(dates):
+                logger.warning("OLD skipped: '%s' is shared by %s listings but Created At is missing or tied (%s)",
+                               vt, len(by_style), ", ".join(by_style))
+                skipped += 1
+                continue
+            newest = max(by_style, key=lambda sid: created[sid])
+            targets = [sid for sid in by_style if sid != newest]
+            reason = "older Created At"
+        far_future = datetime.max.replace(tzinfo=timezone.utc)
+        targets.sort(key=lambda sid: (created[sid] or far_future, sid))
+        for n, sid in enumerate(targets, start=1):
+            marker = "OLD" if len(targets) == 1 else f"OLD{n}"
+            for r in by_style[sid]:
+                has_length = bool(_alt_base_and_length(r["Product Title Alt"])[1])
+                new_vt = insert_old_marker_variant_title(r["Variant Title"], r["Size"], r["Inseam Label"], has_length, marker)
+                if new_vt is None:
+                    logger.warning("OLD skipped: size '%s' not found in '%s' (SKU %s)", r["Size"], r["Variant Title"], r["SKU - Shopify"])
+                    skipped += 1
+                    continue
+                r["Product Title Alt"] = insert_old_marker_alt_title(r["Product Title Alt"], r["Inseam Label"], has_length, marker)
+                r["Variant Title"] = new_vt
+                marked += 1
+                logger.info("OLD marked (%s): SKU %s %s -> %s", reason, r["SKU - Shopify"], r["Handle"], new_vt)
+    logger.info("OLD listing rule: %s row(s) marked, %s skipped", marked, skipped)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1276,6 +1379,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     rows = build_rows(variants, product_options, json_cache, pdp_cache, logger)
     apply_inseam_label_multi(rows, pdp_cache, logger)
     finalize_rows(rows)
+    apply_old_listing_markers(rows, logger)
 
     if args.dry_run:
         logger.info("DRY RUN preview: %s rows, %s handles", len(rows), len({r["Handle"] for r in rows}))
