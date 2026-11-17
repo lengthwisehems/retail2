@@ -637,6 +637,21 @@ INSEAM_LABEL_WIDE_STYLES = {
 INSEAM_LABEL_NARROW_STYLES = {"Taper", "Tapered", "Skinny", "Straight from Knee"}
 
 
+def size_length_suffix(size: str) -> str:
+    """
+    The trailing LENGTH letter of a size, e.g. "30L" -> "L", "27P" -> "P",
+    "33.5 T" -> "T". Returns "" when there is no length suffix.
+
+    A digit is required immediately before the letter: STAUD also sells
+    alpha-sized denim (XS/S/M/L/XL), where a trailing "L" is the size
+    itself, not a length. Without that guard, size "L" and "XL" read as
+    Long -- which mislabelled the alpha-sized NOAH JEAN styles, whose
+    sizes all share one inseam.
+    """
+    m = re.fullmatch(r".*\d\s*([A-Za-z])", (size or "").strip())
+    return m.group(1).upper() if m else ""
+
+
 def determine_inseam_label_single(product_title: str, size: str, jean_style: str, inseam: str) -> str:
     """
     Inseam Label rule for styles with only ONE inseam option (no genuine
@@ -645,14 +660,16 @@ def determine_inseam_label_single(product_title: str, size: str, jean_style: str
       2. Wide-leg-family jean style + inseam >= 33 -> Long
       3. Narrow-family jean style + inseam >= 30 -> Long
       4. Otherwise -> Regular
+    Size suffixes are read via size_length_suffix(), so an alpha size like
+    "L"/"XL" is not mistaken for a length.
     """
-    if contains_any(product_title, ["petite"]) or (size or "").strip().upper().endswith("P"):
+    if contains_any(product_title, ["petite"]) or size_length_suffix(size) == "P":
         return "Petite"
 
-    if contains_any(product_title, ["long"]) or (size or "").strip().upper().endswith("L"):
+    if contains_any(product_title, ["long"]) or size_length_suffix(size) == "L":
         return "Long"
 
-    if contains_any(product_title, ["Tall"]) or (size or "").strip().upper().endswith("T"):
+    if contains_any(product_title, ["Tall"]) or size_length_suffix(size) == "T":
         return "Long"
     try:
         n = float(inseam) if inseam else None
@@ -717,6 +734,149 @@ def determine_inseam_label_multi(inseam_style: str, jean_style: str, inseam: str
         return ""
 
     return ""
+
+
+def multi_inseam_check(style_id: str, inseam: str) -> str:
+    """
+    Step 1 of the multi-inseam spec: Multi_inseam_check is Style Id
+    concatenated with Inseam (e.g. 8435253805229 + "30" ->
+    "843525380522930"). Internal only -- never written to the CSV.
+    """
+    return f"{(style_id or '').strip()}{(inseam or '').strip()}"
+
+
+def _check_sort_key(inseam: str) -> tuple:
+    """
+    Sort key ranking one style's Multi_inseam_check values smallest ->
+    largest. Because every check in a style shares the same Style Id
+    prefix, ranking the checks is ranking their inseams -- so we compare
+    the inseam itself rather than the concatenated digits. Comparing the
+    concatenation numerically would misrank a style mixing whole and
+    fractional inseams (e.g. "...34" is 15 digits, "...33.5" is 16, so
+    33.5 would sort above 34). Unparseable inseams sort last.
+    """
+    try:
+        return (0, Decimal((inseam or "").strip()))
+    except Exception:  # noqa: BLE001
+        return (1, Decimal(0), (inseam or "").strip())
+
+
+def add_product_descriptor(product: str, word: str) -> str:
+    """
+    Insert `word` ("PETITE"/"LONG") into Product just before the "|"
+    separator, e.g. "LEO JEAN | BLUE" -> "LEO JEAN LONG | BLUE".
+    No-op if the pre-"|" portion already carries that word, or if there is
+    nothing to add. Products without a "|" get the word appended.
+    """
+    if not word or not product:
+        return product
+    head, sep, tail = product.partition("|")
+    if contains_any(head, [word]):
+        return product
+    head = f"{head.strip()} {word}".strip()
+    if not sep:
+        return head
+    return f"{head} | {tail.strip()}".strip()
+
+
+def apply_multi_inseam_rules(rows: List[Dict[str, Any]]) -> None:
+    """
+    Multi-inseam Product / Inseam Label rules (2026-08-21 spec). Runs AFTER
+    the existing Product and Inseam Label rules and revises their output in
+    place.
+
+    Step 1: build Multi_inseam_check (Style Id + Inseam) and reduce it to
+            the unique values per Style Id. Internal only -- not a CSV
+            column.
+    Step 2: a Style Id with more than one unique Multi_inseam_check is
+            multi_inseam. Rows with a blank Inseam don't count as an inseam
+            option (their check would just be the bare Style Id).
+    Step 3: revise Product -- add "PETITE"/"LONG" before the "|", first
+            from Size (3A), otherwise from the row's rank among its style's
+            inseams (3B).
+    Step 4: revise Inseam Label -- Regular override (4A) and the
+            multi_inseam rank labels (4B), but only for rows that did NOT
+            already resolve as Petite/Long/Tall from the ORIGINAL product
+            title or the size suffix, which stay locked.
+
+    Styles with 4+ distinct inseams are left alone: the spec defines rank
+    rules for 2 and 3 inseams only, and guessing a middle-rank scheme
+    beyond that would invent behavior rather than implement it.
+    """
+    checks_by_style: Dict[str, Dict[str, str]] = defaultdict(dict)
+    for r in rows:
+        inseam = (r["Inseam"] or "").strip()
+        if not inseam:
+            continue
+        # Step 1: keyed by check, so duplicates collapse to unique values.
+        checks_by_style[r["Style Id"]][multi_inseam_check(r["Style Id"], inseam)] = inseam
+
+    ranked_by_style: Dict[str, List[str]] = {
+        sid: sorted(checks, key=lambda c: _check_sort_key(checks[c]))
+        for sid, checks in checks_by_style.items()
+    }
+
+    for r in rows:
+        original_product = r["Product"] or ""
+        # Length suffix only -- an alpha size ("L", "XL") is not a length.
+        size_suffix = size_length_suffix(r["Size"])
+        ranked = ranked_by_style.get(r["Style Id"], [])
+        multi_inseam = len(ranked) > 1  # Step 2
+        check = multi_inseam_check(r["Style Id"], r["Inseam"]) if (r["Inseam"] or "").strip() else ""
+
+        title_is_petite = contains_any(original_product, ["petite"])
+        title_is_long = contains_any(original_product, ["long"])
+        title_is_tall = contains_any(original_product, ["tall"])
+
+        # ---- Step 3A: Product descriptor from Size ----
+        descriptor = ""
+        if size_suffix == "P":
+            descriptor = "PETITE"
+        elif size_suffix in {"L", "T"}:
+            descriptor = "LONG"
+
+        # ---- Step 3B: Product descriptor from multi_inseam rank ----
+        # Size (3A) wins, and a title that already declares Petite/Long/Tall
+        # is left alone rather than being given a contradicting descriptor.
+        if not descriptor and multi_inseam and check and not (title_is_petite or title_is_long or title_is_tall):
+            if len(ranked) == 2:
+                if check == ranked[-1]:
+                    descriptor = "LONG"
+            elif len(ranked) == 3:
+                if check == ranked[-1]:
+                    descriptor = "LONG"
+                elif check == ranked[0]:
+                    descriptor = "PETITE"
+
+        r["Product"] = add_product_descriptor(original_product, descriptor)
+
+        # ---- Step 4: Inseam Label ----
+        # Locked: anything that already resolved Petite/Long/Tall from the
+        # ORIGINAL title or the size suffix (i.e. as evaluated before Step 3
+        # rewrote Product) keeps whatever Inseam Label it has.
+        locked = (
+            title_is_petite or size_suffix == "P"
+            or title_is_long or size_suffix == "L"
+            or title_is_tall or size_suffix == "T"
+        )
+        if locked:
+            continue
+
+        # Part 4A
+        if contains_any(original_product, ["regular"]) or size_suffix == "R":
+            r["Inseam Label"] = "Regular"
+
+        # Part 4B -- rank within the style overrides jean style / inseam value
+        if multi_inseam and check:
+            if len(ranked) == 2:
+                r["Inseam Label"] = "Long" if check == ranked[-1] else "Regular"
+            elif len(ranked) == 3:
+                if check == ranked[-1]:
+                    r["Inseam Label"] = "Long"
+                elif check == ranked[0]:
+                    r["Inseam Label"] = "Petite"
+                else:
+                    r["Inseam Label"] = "Regular"
 
 
 def apply_style_name_editing_rules(rows: List[Dict[str, Any]]) -> None:
@@ -985,6 +1145,10 @@ def main() -> None:
             r["Inseam Label"] = determine_inseam_label_multi(r["Inseam Style"], r["Jean Style"], r["Inseam"])
         else:
             r["Inseam Label"] = determine_inseam_label_single(r["Product"], r["Size"], r["Jean Style"], r["Inseam"])
+
+    # Multi-inseam revisions to Product / Inseam Label (2026-08-21 spec).
+    # Runs last so it revises the output of the rules above.
+    apply_multi_inseam_rules(rows)
 
     # dedupe
     deduped: List[Dict[str, Any]] = []
