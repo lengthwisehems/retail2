@@ -303,14 +303,57 @@ def has_phrase(norm_text: str, phrases: Iterable[str]) -> bool:
 
 
 def strip_accents(text: str) -> str:
-    """"Cr\u00e8me" -> "Creme" (used for keyword matching)."""
-    return "".join(c for c in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(c))
+    """Accented letter -> plain letter ("Cr\u00e8me" -> "Creme", "\u00c9" -> "E").
+    Only accents are removed; symbols such as \u2122 or \u00bd are left alone."""
+    decomposed = unicodedata.normalize("NFD", text or "")
+    return unicodedata.normalize("NFC", "".join(c for c in decomposed if not unicodedata.combining(c)))
 
 
-def deaccent_creme(text: str) -> str:
-    """Per Carrie 11/17: no accent on "creme" anywhere in the output."""
-    return re.sub(r"(cr)[\u00e8\u00c8](me)", lambda m: m.group(1) + ("E" if m.group(0)[2] == "\u00c8" else "e") + m.group(2),
-                  text or "", flags=re.IGNORECASE)
+# Columns left exactly as the site gives them (changing a character could break a link).
+NO_PLAIN_TEXT_COLUMNS = {"Image URL", "SKU URL"}
+
+_PLAIN_REPLACEMENTS = {
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-", "\u2212": "-",
+    "\u2026": "...", "\u2044": "/", "\u00d7": "x",
+    "\u00f8": "o", "\u00d8": "O", "\u00e6": "ae", "\u00c6": "AE", "\u0153": "oe", "\u0152": "OE",
+    "\u00df": "ss", "\u0142": "l", "\u0141": "L", "\u0111": "d", "\u0110": "D",
+}
+
+
+def to_plain_text(text: str) -> str:
+    """Per Carrie 11/17: no special characters in the output.
+    Curly quotes -> straight, accented letters -> plain letters, fractions -> text
+    ("\u00bd" -> "1/2", "31\u00bd" -> "31 1/2"), long dashes -> "-", "\u2026" -> "...",
+    odd spaces -> " ". Anything else that is not plain text (\u2122, \u00ae, \u00a9, emoji...) is removed."""
+    text = strip_accents(straighten_quotes(text or ""))
+    out: List[str] = []
+    for ch in text:
+        if ch.isascii():
+            out.append(ch)
+        elif ch in _PLAIN_REPLACEMENTS:
+            out.append(_PLAIN_REPLACEMENTS[ch])
+        elif "VULGAR FRACTION" in unicodedata.name(ch, ""):
+            frac = unicodedata.normalize("NFKD", ch).replace("\u2044", "/")
+            if out and out[-1][-1:].isdigit():
+                frac = " " + frac
+            out.append(frac)
+        elif ch.isspace():
+            out.append(" ")
+        else:
+            out.append("\x00")  # dropped (trademark, registered, copyright, symbols, emoji)
+    result = "".join(out)
+    # Tidy only the spaces a dropped symbol leaves behind ("R \u00a9 2026" -> "R 2026").
+    result = re.sub(r" \x00+(?= |$)", "", result)
+    result = re.sub(r"^\x00+ ", "", result)
+    return result.replace("\x00", "")
+
+
+def plain_text_rows(rows: List[Dict[str, Any]]) -> None:
+    """Final pass: every text column (except the URLs) is plain text."""
+    for r in rows:
+        for key, value in r.items():
+            if isinstance(value, str) and not key.startswith("_") and key not in NO_PLAIN_TEXT_COLUMNS:
+                r[key] = to_plain_text(value)
 
 
 def straighten_quotes(text: str) -> str:
@@ -322,8 +365,8 @@ def straighten_quotes(text: str) -> str:
 
 
 def clean_description(text: str) -> str:
-    """Description column: '-' -> space, curly quotes -> straight."""
-    return deaccent_creme(straighten_quotes(text or "").replace("-", " "))
+    """Description column: plain text (see to_plain_text), then '-' -> space."""
+    return to_plain_text(text).replace("-", " ")
 
 
 _FINAL_SALE_PATTERNS = [
@@ -1150,8 +1193,8 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
             inseam_label = "Regular"
             has_length = False
 
-        clean_title = deaccent_creme(strip_final_sale(var.product_title))
-        color = deaccent_creme(var.color.strip())
+        clean_title = to_plain_text(strip_final_sale(var.product_title)).strip()
+        color = to_plain_text(var.color).strip()
 
         # Product: title / [Petite|Regular|Long when the variant's inseam is S/R/L /] Color
         product_parts = [clean_title]
@@ -1309,12 +1352,13 @@ def apply_old_listing_markers(rows: List[Dict[str, Any]], logger: logging.Logger
     1. If some of the listings have final/sale in the title or handle and some don't,
        the final-sale listing(s) get OLD.
     2. Otherwise the older listing(s) by Created At get OLD; the newest gets none.
-    Only Variant Title and Product Title Alt change. 2 listings -> "OLD";
-    3+ listings -> "OLD1", "OLD2", ... oldest first. A tie or missing date in
-    case 2 changes nothing and is logged."""
-    groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    Only Variant Title and Product Title Alt change, and the marker is always "OLD".
+    A tie or missing date in case 2 changes nothing and is logged.
+    A listing is Style Id + Color: AYR keeps several colors under one style id /
+    handle, so style id or handle alone does not identify a style."""
+    groups: Dict[str, Dict[Tuple[str, str], List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        groups[r["Variant Title"].strip().upper()][r["Style Id"]].append(r)
+        groups[r["Variant Title"].strip().upper()][(r["Style Id"], r["_color_key"])].append(r)
 
     marked = skipped = 0
     for vt, by_style in groups.items():
@@ -1330,7 +1374,7 @@ def apply_old_listing_markers(rows: List[Dict[str, Any]], logger: logging.Logger
             dates = list(created.values())
             if any(d is None for d in dates) or len(set(dates)) < len(dates):
                 logger.warning("OLD skipped: '%s' is shared by %s listings but Created At is missing or tied (%s)",
-                               vt, len(by_style), ", ".join(by_style))
+                               vt, len(by_style), ", ".join(f"{sid} {color}" for sid, color in by_style))
                 skipped += 1
                 continue
             newest = max(by_style, key=lambda sid: created[sid])
@@ -1338,8 +1382,8 @@ def apply_old_listing_markers(rows: List[Dict[str, Any]], logger: logging.Logger
             reason = "older Created At"
         far_future = datetime.max.replace(tzinfo=timezone.utc)
         targets.sort(key=lambda sid: (created[sid] or far_future, sid))
-        for n, sid in enumerate(targets, start=1):
-            marker = "OLD" if len(targets) == 1 else f"OLD{n}"
+        marker = "OLD"
+        for sid in targets:
             for r in by_style[sid]:
                 has_length = bool(_alt_base_and_length(r["Product Title Alt"])[1])
                 new_vt = insert_old_marker_variant_title(r["Variant Title"], r["Size"], r["Inseam Label"], has_length, marker)
@@ -1380,6 +1424,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     apply_inseam_label_multi(rows, pdp_cache, logger)
     finalize_rows(rows)
     apply_old_listing_markers(rows, logger)
+    plain_text_rows(rows)
 
     if args.dry_run:
         logger.info("DRY RUN preview: %s rows, %s handles", len(rows), len({r["Handle"] for r in rows}))
