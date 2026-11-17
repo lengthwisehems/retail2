@@ -104,6 +104,14 @@ Product Name (or Alt Title where there is one) | color | inseam | size
 The **inseam segment is present only when the style has more than one inseam.** A
 single-inseam style goes straight from colour to size.
 
+For a superseded run, `OLD` takes the inseam slot - appended to the inseam where there is
+one, standing on its own where there is not:
+
+```
+... | color | inseam OLD | size        multi-inseam style
+... | color | OLD | size               single-inseam style
+```
+
 ## Product
 
 The brand's own product name, with the inseam inserted **after the last word "Jean"/
@@ -136,8 +144,14 @@ The derived style: ALL CAPS, no colour, no size, no "JEANS".
 
 `OLD` marks a run of a style that has been superseded by a replacement.
 
-* On **Product Title Alt** it follows the length word where there is one, otherwise the
-  colour: `... | BLUE004 | LONG OLD`.
+* On **Variant Title and Product Title Alt** it takes the inseam slot: appended to the
+  inseam where there is one, on its own where there is not.
+
+  ```
+  GOOD LEGS FLARE JEANS | BLUE004 | LONG OLD
+  VINTAGE STRAIGHT ANKLE JEANS | HONEY | OLD
+  ```
+
 * On **`Product` it is never added** - unless the old SKU is still being sold at the same
   time as the new one, in which case the two must stay distinguishable.
 
@@ -340,7 +354,7 @@ tags, prices, image URLs, timestamps) should differ. Then check:
 ```
 any 90S (capital S) anywhere                                 none
 double spaces, or inconsistent separator spacing             none
-Variant Title follows the order in 2                         every row
+Variant Title follows the order in 2, OLD in the inseam slot  every row
 Inseam Label Multi = Multi but no length segment             none
 Style Name in ALL CAPS, no colour, no size                   every row
 derived values spelled exactly as 3                          every row
