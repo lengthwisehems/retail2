@@ -11,6 +11,7 @@ progress and an ETA.
 """
 import argparse
 import csv
+import json
 import logging
 import re
 import sys
@@ -26,7 +27,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup, Comment, FeatureNotFound, NavigableString, Tag
-from requests.adapters import HTTPAdapter, Retry
 from urllib3.exceptions import InsecureRequestWarning
 import warnings
 
@@ -39,18 +39,51 @@ LOG_FILE = BASE_DIR / f"{BRAND.lower()}_run.log"
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 STORE_HOST = "https://ayr-production.myshopify.com"
-BASE_HOSTS = [
-    STORE_HOST,
-    "https://www.ayr.com",
-    "https://ayr.com",
-]
+# Product pages and product .json. ayr.com and ayr-production.myshopify.com both
+# redirect here, so they share one rate limiter: trying another address after a
+# block does not help (same finding as Good American).
+SITE_HOST = "https://www.ayr.com"
 GRAPHQL_ENDPOINTS = [f"{STORE_HOST}/api/unstable/graphql.json"]
 GRAPHQL_TOKEN = "32431e71f8b832fcb465240380b72ecc"
 COLLECTION_HANDLES = ["jeans-womenswear", "final-sale-womenswear"]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+# Which headers to send. False = simple headers (default). retail_PDP_probe.py
+# found on AYR that a full fake set of Chrome headers drew a hard 403 where
+# simple ones drew a softer 429. True = the full Chrome set Good American sends.
+USE_FULL_BROWSER_HEADERS = False
+SIMPLE_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json,text/html,*/*"}
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
+HEADERS = BROWSER_HEADERS if USE_FULL_BROWSER_HEADERS else SIMPLE_HEADERS
+
+# Product-page pacing - the Good American method (Goodamerican_inventory.py).
+# A 429 from AYR is Cloudflare, and waiting does not clear it: honouring the
+# server's 60s Retry-After five times is what stalled the 11/16 run for 5 minutes
+# on the-bud. So every request waits its turn at a shared pace; a block slows the
+# pace, clean responses speed it back up; a wait is capped; a page gets at most
+# 2 tries in the main pass and one more at the end of the run.
+PDP_MIN_INTERVAL = 0.5      # floor: seconds between any two /products/ requests
+PDP_MAX_INTERVAL = 6.0      # ceiling once blocks have forced the pace down
+PDP_INTERVAL_STEP = 0.75    # added to the interval after each block
+PDP_INTERVAL_DECAY = 0.9    # multiplier applied after each clean response
+PDP_BLOCK_MAX_WAIT = 15.0   # cap: a challenge outlasts any wait worth making
+PDP_BLOCK_SLEEP = 5.0       # wait when the server gives no Retry-After
+PDP_GETS_PER_TRY = 2        # HTTP GETs per try
+PDP_TRIES_PER_PAGE = 2      # tries per page across the whole run
+BLOCK_STATUSES = {403, 429}
+TRANSIENT_STATUSES = {500, 502, 503, 504}
 
 # A product is dropped when its description (GraphQL text OR the product-page
 # description) contains any of these.
@@ -161,26 +194,106 @@ def setup_logger() -> logging.Logger:
 
 
 def build_session() -> requests.Session:
+    # No automatic urllib3 retries: they honoured a 60s Retry-After five times
+    # per address. Retries are handled by request_with_retry / _get_with_backoff.
     warnings.simplefilter("ignore", InsecureRequestWarning)
     session = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
     session.headers.update(HEADERS)
     session.verify = False
     return session
 
 
-def request_json(session: requests.Session, url: str, logger: logging.Logger) -> Dict[str, Any]:
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+def request_with_retry(session: requests.Session, method: str, url: str, logger: logging.Logger,
+                       max_retries: int = 3, **kwargs: Any) -> requests.Response:
+    """GraphQL calls (Good American's request_with_retry): 429/5xx retried after 1s, 2s, 4s."""
+    response = None
+    for attempt in range(max_retries):
+        response = session.request(method, url, timeout=40, **kwargs)
+        if response.status_code in {429} | TRANSIENT_STATUSES and attempt + 1 < max_retries:
+            logger.warning("Retrying %s %s (HTTP %s)", method, url, response.status_code)
+            time.sleep(2 ** attempt)
+            continue
+        break
+    return response
+
+
+# ---- product-page fetching (Good American method) ------------------------
+_PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "last": 0.0}
+_PAGE_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
+_PAGE_TRIES: Dict[Tuple[str, str], int] = {}
+_PAGES_BLOCKED: Set[Tuple[str, str]] = set()   # (kind, handle) never read because of a block / error
+_REQUEST_COUNTS: Dict[str, int] = {"http_gets": 0, "blocked": 0}
+
+
+def _pace_request() -> None:
+    """Hold every /products/ request to the current shared interval."""
+    wait = _PACE["last"] + _PACE["interval"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
+
+
+def _is_bot_challenge(response: requests.Response) -> bool:
+    return any(m in (response.text or "")[:5000].lower() for m in CHALLENGE_MARKERS)
+
+
+def _get_with_backoff(session: requests.Session, url: str, logger: logging.Logger) -> Optional[requests.Response]:
+    """Paced GET. A block (403/429) or server error slows the pace for every
+    later request and gets ONE capped wait and retry - never a long sleep."""
+    response = None
+    for attempt in range(PDP_GETS_PER_TRY):
+        _pace_request()
+        _REQUEST_COUNTS["http_gets"] += 1
+        try:
+            response = session.get(url, timeout=30)
+        except requests.RequestException as exc:
+            logger.warning("Request error for %s: %s", url, exc)
+            response = None
+        status = response.status_code if response is not None else None
+        if status is not None and status not in BLOCK_STATUSES and status not in TRANSIENT_STATUSES:
+            _PACE["interval"] = max(PDP_MIN_INTERVAL, _PACE["interval"] * PDP_INTERVAL_DECAY)
+            return response
+        if status in BLOCK_STATUSES:
+            _REQUEST_COUNTS["blocked"] += 1
+        _PACE["interval"] = min(PDP_MAX_INTERVAL, _PACE["interval"] + PDP_INTERVAL_STEP)
+        if attempt + 1 >= PDP_GETS_PER_TRY:
+            break
+        retry_after = (response.headers.get("Retry-After", "") if response is not None else "").strip()
+        wait = float(retry_after) if retry_after.replace(".", "", 1).isdigit() else PDP_BLOCK_SLEEP * (attempt + 1)
+        wait = min(wait, PDP_BLOCK_MAX_WAIT)
+        kind = ("Bot challenge" if response is not None and _is_bot_challenge(response) else
+                "Blocked" if status in BLOCK_STATUSES else "Server error" if status else "Connection error")
+        logger.warning("%s (HTTP %s) on %s; waiting %.0fs (pace now %.1fs)", kind, status, url, wait, _PACE["interval"])
+        time.sleep(wait)
+    return response
+
+
+def fetch_page(session: requests.Session, handle: str, kind: str, logger: logging.Logger) -> Optional[str]:
+    """Product page ("html") or product .json ("json"), fetched once and cached.
+    A blocked or failed page is NOT cached, so the end-of-run pass can try again;
+    a page that was really answered (200, 404...) is cached for the whole run."""
+    key = (kind, handle)
+    if key in _PAGE_CACHE:
+        return _PAGE_CACHE[key]
+    if _PAGE_TRIES.get(key, 0) >= PDP_TRIES_PER_PAGE:
+        return None
+    _PAGE_TRIES[key] = _PAGE_TRIES.get(key, 0) + 1
+    url = f"{SITE_HOST}/products/{handle}" + (".json" if kind == "json" else "")
+    response = _get_with_backoff(session, url, logger)
+    status = response.status_code if response is not None else None
+    blocked = status is None or status in BLOCK_STATUSES or status in TRANSIENT_STATUSES
+    if status == 200 and kind == "html" and html_looks_blocked(response.text):
+        blocked = True
+    if blocked:
+        _PAGES_BLOCKED.add(key)
+        logger.warning("Could not read %s for %s (HTTP %s); will try again at the end", kind, handle, status)
+        return None
+    _PAGES_BLOCKED.discard(key)
+    text = response.text if status == 200 else None
+    if status != 200:
+        logger.warning("%s for %s returned HTTP %s", kind, handle, status)
+    _PAGE_CACHE[key] = text
+    return text
 
 
 def fmt_duration(seconds: float) -> str:
@@ -893,7 +1006,11 @@ def fetch_graphql_products(session: requests.Session, logger: logging.Logger) ->
             while True:
                 page += 1
                 payload = {"query": query, "variables": {"handle": handle, "cursor": cursor}}
-                resp = session.post(endpoint, json=payload, headers=headers, timeout=40, verify=False)
+                try:
+                    resp = request_with_retry(session, "POST", endpoint, logger, json=payload, headers=headers)
+                except requests.RequestException as exc:
+                    logger.warning("GraphQL request failed %s: %s", endpoint, exc)
+                    break
                 if resp.status_code != 200:
                     logger.warning("GraphQL request failed %s: %s", endpoint, resp.text[:200])
                     break
@@ -983,30 +1100,55 @@ def fetch_graphql_products(session: requests.Session, logger: logging.Logger) ->
 
 
 def fetch_product_json(session: requests.Session, handle: str, logger: logging.Logger) -> Dict[str, Any]:
-    for host in BASE_HOSTS:
-        try:
-            url = f"{host}/products/{handle}.json"
-            resp = session.get(url, timeout=30, verify=False)
-            resp.raise_for_status()
-            return resp.json().get("product", {})
-        except Exception as exc:
-            logger.warning("Product JSON fetch failed %s (%s)", host, exc)
-    return {}
+    text = fetch_page(session, handle, "json", logger)
+    if not text:
+        return {}
+    try:
+        return json.loads(text).get("product", {}) or {}
+    except ValueError:
+        logger.warning("Product .json for %s was not JSON", handle)
+        return {}
 
 
 def fetch_pdp_html(session: requests.Session, handle: str, logger: logging.Logger) -> str:
-    for host in BASE_HOSTS:
-        try:
-            url = f"{host}/products/{handle}"
-            resp = session.get(url, timeout=30, verify=False)
-            resp.raise_for_status()
-            if html_looks_blocked(resp.text):
-                logger.warning("PDP looks blocked by bot protection at %s (title: %s)", host, page_title(resp.text))
-                continue
-            return resp.text
-        except Exception as exc:
-            logger.warning("PDP fetch failed %s (%s)", host, exc)
-    return ""
+    return fetch_page(session, handle, "html", logger) or ""
+
+
+def fetch_all_pages(session: requests.Session, handles: List[str], logger: logging.Logger
+                    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Product .json + product page for every handle, with progress/ETA.
+    Pages the site blocked get one more try at the end, once the pace has backed off."""
+    json_cache: Dict[str, Dict[str, Any]] = {}
+    pdp_cache: Dict[str, str] = {}
+
+    def run_pass(todo: List[str], label: str) -> None:
+        start = time.monotonic()
+        for i, handle in enumerate(todo, start=1):
+            if not json_cache.get(handle):
+                json_cache[handle] = fetch_product_json(session, handle, logger)
+            if not pdp_cache.get(handle):
+                pdp_cache[handle] = fetch_pdp_html(session, handle, logger)
+            elapsed = time.monotonic() - start
+            eta = elapsed / i * (len(todo) - i)
+            logger.info("%s %s/%s (%s) - elapsed %s, ETA %s", label, i, len(todo), handle, fmt_duration(elapsed), fmt_duration(eta))
+
+    run_pass(handles, "Product pages")
+    retry = sorted({h for _, h in _PAGES_BLOCKED})
+    if retry:
+        logger.info("Second try for %s handle(s) the site blocked: %s", len(retry), ", ".join(retry))
+        run_pass(retry, "Second try")
+
+    logger.info("Product pages: %s HTTP requests, %s blocked; final pace %.1fs between requests",
+                _REQUEST_COUNTS["http_gets"], _REQUEST_COUNTS["blocked"], _PACE["interval"])
+    missing_json = sorted(h for k, h in _PAGES_BLOCKED if k == "json")
+    missing_html = sorted(h for k, h in _PAGES_BLOCKED if k == "html")
+    if missing_json:
+        logger.warning("Product .json NEVER read for %s handle(s) - their Quantity Available, Barcode, "
+                       "Published/Created At are missing: %s", len(missing_json), ", ".join(missing_json))
+    if missing_html:
+        logger.warning("Product page NEVER read for %s handle(s) - their Description falls back to GraphQL and "
+                       "Rise / Inseam / Leg Opening / Country are blank: %s", len(missing_html), ", ".join(missing_html))
+    return json_cache, pdp_cache
 
 
 # --------------------------------------------------------------------------
@@ -1409,16 +1551,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     session = build_session()
     variants, product_options = fetch_graphql_products(session, logger)
 
-    json_cache: Dict[str, Dict[str, Any]] = {}
-    pdp_cache: Dict[str, str] = {}
     handles = list(dict.fromkeys(v.handle for v in variants))
-    step_start = time.monotonic()
-    for i, handle in enumerate(handles, start=1):
-        json_cache[handle] = fetch_product_json(session, handle, logger)
-        pdp_cache[handle] = fetch_pdp_html(session, handle, logger)
-        elapsed = time.monotonic() - step_start
-        eta = elapsed / i * (len(handles) - i)
-        logger.info("Product pages %s/%s (%s) - elapsed %s, ETA %s", i, len(handles), handle, fmt_duration(elapsed), fmt_duration(eta))
+    json_cache, pdp_cache = fetch_all_pages(session, handles, logger)
 
     rows = build_rows(variants, product_options, json_cache, pdp_cache, logger)
     apply_inseam_label_multi(rows, pdp_cache, logger)
