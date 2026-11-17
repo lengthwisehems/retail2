@@ -4,8 +4,9 @@ How to write a new brand scraper, or change an existing one, so that every brand
 the database the same shape. Written from the eight scrapers already in the repo
 (Good American, Ramy Brook, AMO, AG Jeans, Paige, Edyson, AYR, Citizens of Humanity).
 
-Read Part 6 before you start on a brand that is already live: several conventions are
-currently inconsistent between scrapers, and those need a decision rather than a guess.
+Field names, formats and examples come from `Database_build_outline` - that document is
+the source of truth for what the database expects, and this one says how a scraper should
+produce it. Read Part 6 before touching a brand that is already live.
 
 ---
 
@@ -125,20 +126,34 @@ Inseam Style   Cropped, Ankle, Full Length
 Rise Label     Low, Mid, High
 ```
 
-Note **"Straight from Knee"** - lower-case "from". Good American currently writes
-"Straight **F**rom" and is the only one; see Part 6.
+Note **"Straight from Knee"** - lower-case "from". This is the correct form. Good
+American currently writes "Straight **F**rom" and is the only scraper that does; that is a
+bug to fix, not a variant to copy.
 
 ## Straight-leg buckets
 
-From Leg Opening, in inches:
+From Leg Opening, in inches. The lower boundary is 15.5 everywhere; **the upper boundary
+varies by brand and is expected to** - different brands cut a "straight" differently, so
+the number is tuned per brand against their actual fits.
 
 ```
-< 15.5        Straight from Knee
-15.5 - 17.0   Straight from Knee/Thigh
-> 17.0        Straight from Thigh
+< 15.5         Straight from Knee
+15.5 - <upper> Straight from Knee/Thigh
+> <upper>      Straight from Thigh
 ```
 
-The upper bound currently differs between scrapers (17.0 vs 17.5). See Part 6.
+What the existing scrapers use:
+
+|brand|upper boundary|
+|-|-|
+|Ramy Brook|`<= 17.0`|
+|Paige|`<= 17.0`|
+|Good American|`<= 17.0`|
+|AMO|`< 17.5`|
+|Edyson|`< 17.5`|
+
+For a new brand, start at 17.0, then check the result against a dozen styles on their
+site and move it if their straights run wide. **Say in a comment which it is and why.**
 
 ## Inseam Label
 
@@ -187,14 +202,15 @@ the run. That is why the database treats Multi as sticky.
 |pipe separator|always ` \| ` - one space either side, never doubled, never missing|
 |`90s`|lower-case `s`, always. Never `90S`|
 |tags|joined with `, `|
-|dates|`M/D/YYYY`|
-|date + time|`M/D/YYYY H:MM:SS AM/PM`, **US Central**|
+|dates|`MM/DD/YYYY` - zero-padded|
+|date + time|`MM/DD/YYYY HH:MM:SS` - zero-padded, **24-hour, no AM/PM**|
+|prices|`$178.00` - leading `$`, always 2 decimals (`$1,234.56` above a thousand)|
+|measurements|plain decimals, no units and no inch marks: `27.125`, `9.87`, `19.125`|
+|quantities|plain integers, no separators: `123`, `3425`|
 |quotes and dashes|straight ASCII only - replace curly quotes and en/em dashes|
 |accents|strip them (`KHLOÉ` -> `KHLOE`)|
 |whitespace|collapse runs of spaces; strip leading/trailing; no non-breaking spaces|
 |sizes|**always text, never numeric.** `00` must not become `0`; both are real sizes|
-
-Price format currently differs between scrapers. See Part 6.
 
 ## Brackets and markers
 
@@ -244,24 +260,36 @@ fetch it once and cache it for the run.
 
 ---
 
-# 6. Decisions needed - currently inconsistent
+# 6. Known outliers to fix
 
-These genuinely differ between the existing scrapers. Pick one of each and apply it
-everywhere; do not copy whichever neighbour you happened to open.
+These are existing scrapers that disagree with the rules above. They are bugs, not
+alternatives - do not copy them into a new brand.
 
-|thing|current state|
-|-|-|
-|**Straight bucket upper bound**|`<= 17.0` in Ramy Brook and Paige; `< 17.5` in AMO and Edyson. Good American uses `15.5 - 17`|
-|**"Straight from" casing**|seven scrapers write `Straight from Knee`; **Good American writes `Straight From Knee`** and is the outlier|
-|**Price format**|`$1,234.56` in Ramy Brook and Edyson; `1234.56` in AMO; raw value in Paige|
-|**Date zero-padding**|`M/D/YYYY` in Ramy Brook, Edyson, AG Jeans; `MM/DD/YYYY` in Paige|
-|**Leg Opening / Rise**|carried by most brands, absent from Good American|
+|scraper|what is wrong|should be|
+|-|-|-|
+|**Good American**|writes `Straight From Knee` (capital F)|`Straight from Knee` - every other scraper|
+|**Good American**|dates as `M/D/YYYY` (`11/2/2026`)|`MM/DD/YYYY` (`11/02/2026`)|
+|**Good American**|`Updated At` as `M/D/YYYY h:MM:SS AM/PM` Central|`MM/DD/YYYY HH:MM:SS`, and the column is not in the database at all|
+|**Good American**|price as the raw Shopify amount (`158.0`)|`$158.00`|
+|**AMO**|price as `1234.56`|`$1,234.56`|
+|**Paige**|price passed through unformatted|`$1,234.56`|
+|**Ramy Brook, Edyson, AG Jeans**|dates as `M/D/YYYY`|`MM/DD/YYYY`|
 
----
+The casing one matters most: `Jean Style` is grouped across brands, so Good American's
+`Straight From Knee` splits those styles away from every other brand's
+`Straight from Knee`. It is a one-line change, but it rewrites historical values, so do it
+with the data migration rather than in the middle of one.
+
+**Not an outlier:** Good American carries no `Leg Opening` or `Rise` because the brand
+does not publish those measurements. A missing column for a brand that genuinely has no
+such data is correct; do not invent one.
 
 # 7. Housekeeping
 
-* `Output/` beside the script; file named `BRAND_YYYY-MM-DD_HH-MM-SS.csv`, brand upper-case.
+* `Output/` beside the script; file named `BRAND_YYYY-MM-DD_HH-MM-SS.csv`, brand
+  upper-case. The database stores this as `source_file_name`, so the shape is fixed.
+* **Only emit columns the database has.** `Updated At` is not a database field - Good
+  American emits it and it goes nowhere.
 * A log file per brand; log phase boundaries, counts, and anything skipped.
 * Keep brand-specific word lists (filter words, excluded product types, style keywords)
   **in named constants at the top of the file**, not buried in the logic.
@@ -293,6 +321,8 @@ Inseam Label Multi = Multi but no PETITE/LONG/REGULAR        none
 Style Name in ALL CAPS, no colour, no size                   every row
 derived values spelled exactly as Part 3                     every row
 size '00' still '00', not '0'                                every row
+dates MM/DD/YYYY, datetimes MM/DD/YYYY HH:MM:SS               every row
+prices formatted $###.##                                     every row
 rows where a page could not be read                          reported, not blank
 SKU_BRAND_NO_SIZE written to any output column               none
 ```
