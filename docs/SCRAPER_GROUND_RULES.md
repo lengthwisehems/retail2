@@ -1,111 +1,163 @@
 # Brand scraper ground rules
 
 How to write a new brand scraper, or change an existing one, so that every brand lands in
-the database the same shape. Written from the eight scrapers already in the repo
-(Good American, Ramy Brook, AMO, AG Jeans, Paige, Edyson, AYR, Citizens of Humanity).
+the database the same shape. Written from the scrapers already in the repo (Good American,
+Ramy Brook, AMO, AG Jeans, Paige, Edyson, AYR, Citizens of Humanity).
 
-Field names, formats and examples come from `Database_build_outline` - that document is
-the source of truth for what the database expects, and this one says how a scraper should
-produce it. Read Part 6 before touching a brand that is already live.
+`Database_build_outline` is the source of truth for **what** the database expects - field
+names, formats, which table each lands in. This document says **how** a scraper should
+produce it. Each brand also has its own instructions, which say the things that genuinely
+differ by brand; where those disagree with this document, the brand instructions win.
+
+---
+
+# 0. Ground rules (non-negotiable)
+
+**Test everything before you share it.** Run the code, read the output, and check the
+output is *correct* - not just that it ran. Only then hand it over, saying what you ran
+and what it showed. List anything you could not test. **Never write "should work".**
+
+**If unsure, ask Carrie. Never assume or guess.** But do not ask what the brand
+instructions already answer, or what you could look up in the database or the code.
+
+**If your output does not match the correction file you were given, ask for a decision.**
+It will not be obvious whether the code or the file is right, and guessing picks one at
+random. Two things in those files are instructions, not values:
+
+* `REMOVE` - the item should not be in the output at all.
+* `FILL WITH LATEST VALUES` - fill from the GraphQL/JSON response. Never write the literal
+  text `FILL WITH LATEST VALUES`.
+
+**Never print, echo, log or save credentials** - SQL password, blob SAS URL or connection
+string. Read them from environment variables or `getpass`. Not into a log file, not into
+an error message, not into a committed file.
+
+**Script usability.** These are standing preferences, not nice-to-haves:
+
+* runs from Windows Command Prompt with one command - paste the file path and go
+* every log line starts with a **Central-time** timestamp
+* long steps show **progress and an ETA**
+* **dry run first**: the real run only happens on a second, explicit command
 
 ---
 
 # 1. The output contract
 
-One CSV per run, one row per variant (SKU) per run. These 28 columns appear in every
-existing scraper and are the minimum:
+One CSV per run, **one row per variant (SKU) per run**. Do not collapse sizes; style-level
+values repeat on every row of the style.
 
-```
-Style Id        Handle          Published At    Created At      Product
-Style Name      Product Type    Tags            Vendor          Description
-Variant Title   Color           Size            Inseam          Price
-Compare at Price                Available for Sale              Quantity Available
-Quantity of style               SKU - Shopify   SKU - Brand     Barcode
-Image URL       SKU URL         Jean Style      Inseam Label    Inseam Style
-Rise Label
-```
+Every column the database accepts is below, grouped as `Database_build_outline` groups
+them. A brand emits what it actually has - a column it cannot source is left out, not
+invented. Never rename a column to suit one brand: the database loads them by name.
 
-Add these when the brand exposes them; most scrapers carry them:
+**Style identifier** - `Style Id`, `Handle`, `Product`, `Style Name`,
+`Style Name - Grouping`, `Color`
 
-```
-Rise            Leg Opening     Product Line    Hem Style       Stretch
-Color - Simplified              Color - Standardized            Country Produced
-Returns         Daily Sales     Purchase Reset Date
-Quantity Available (Instore Inventory)          Quantity Available (Online Inventory)
-Production Cost                 Site Exclusive
-```
+**Variant identifier** - `SKU - Shopify`, `SKU - Brand`, `Barcode`, `Size`, `Variant Title`
 
-**Use the column order above**, then the optional ones. Never rename an existing column to
-suit one brand - the database loads them by name.
+**Website info** - `SKU URL`, `Image URL`, `Description`, `Tags`, `Vendor`, `Created At`,
+`Published At`, `Updated At`, `Promo`, `Size Chart`
 
-**One row per variant, always.** Do not collapse sizes. Style-level values (Quantity of
-style, Style Name, Product Line) repeat on every row of the style.
+**Measurements** - `Inseam`, `Rise`, `Back Rise`, `Knee`, `Leg Opening`
+
+**Product filter** - `Jean Style`, `Inseam Label`, `Inseam Style`, `Rise Label`,
+`Hem Style`, `Product Line`, `Product Type`, `Stretch`, `Gender`, `Color - Simplified`,
+`Color - Standardized`
+
+**Production** - `Country Produced`, `Fabric Source`
+
+**Data** - `Price`, `Compare at Price`, `Available for Sale`, `Quantity Available`,
+`Quantity Available (Instore Inventory)`, `Quantity Available (Online Inventory)`,
+`Quantity of style`, `Daily Purchase`, `Returns`, `Notify Me Signups`,
+`Purchase Reset Date`, `Next Shipment`, `Production Cost`, `Review AVG`, `Review Count`,
+`Wishlist count`, `Google Analytics Purchases`, `Google Analytics AVG Revenue`,
+`Google Analytics Total Revenue`
+
+**`Updated At` should be produced for every brand.** Some of the earlier scrapers do not
+emit it yet; that is an oversight, not a convention.
+
+The database derives `Brand`, `Captured Date`, `Captured Date and Time` and
+`Source File Name` from the **file name**, and generates the ID columns and `Imported At`
+itself. A scraper does not emit those.
 
 ---
 
 # 2. The naming model
 
-Four name fields do four different jobs. Getting these confused is the single most common
-source of bad data.
+Four name fields do four different jobs. Confusing them is the most common source of bad
+data.
 
-|field|what it is|
-|-|-|
-|**Product**|the brand's own title, lightly cleaned. Keeps their wording. The length word sits before the pipe: `NEVER FADE GOOD STRAIGHT JEANS PETITE \| BLACK`|
-|**Style Name**|the derived style, ALL CAPS, no colour, no size, no "JEANS"|
-|**Product Title Alt**|the normalised piped title: `NAME \| COLOUR` or `NAME \| COLOUR \| LENGTH`|
-|**Variant Title**|exactly `Product Title Alt` + ` \| ` + `Size`|
+## The separator
 
-Rules that follow from this:
+**The separator varies by brand.** The brand instructions say what it should be, and it
+usually matches whatever the brand itself uses in its variant title. Whatever it is, use
+the same one everywhere in that scraper, with consistent spacing.
 
-* **Variant Title is never built independently.** It is the alt title plus the size. If
-  they disagree, the alt title is right.
-* **The length segment of the alt title is the last segment**, and only `PETITE`, `LONG`
-  or `REGULAR` count. A trailing colour or size means there is no length segment.
-* **`Product` keeps the brand's wording even when it looks wrong.** If the brand calls it
-  `BLACK` and the normalised colour is `BLACK001`, Product says BLACK and the alt title
-  says BLACK001. That is correct, not a bug.
+The examples below use ` | ` because that is what most brands use.
+
+## Variant Title
+
+```
+Product Name (or Alt Title where there is one) | color | inseam | size
+```
+
+The **inseam segment is present only when the style has more than one inseam.** A
+single-inseam style goes straight from colour to size.
+
+## Product
+
+The brand's own product name, with the inseam inserted **after the last word "Jean"/
+"Jeans" but before the colour**, then the colour:
+
+```
+NEVER FADE GOOD STRAIGHT JEANS PETITE | BLACK
+```
+
+`Product` keeps the brand's wording even where it looks wrong. If the brand writes the
+colour as `BLACK` and the normalised colour is `BLACK001`, `Product` says `BLACK` and the
+alt title says `BLACK001`. That is correct, not a bug.
+
+## Product Title Alt
+
+A **heavily cleaned-up** version of the product name, then colour, then inseam:
+
+```
+GOOD LEGS STRAIGHT JEANS | BLACK001 | PETITE
+```
+
+This is the normalised name - the one used for matching and reporting - so it takes the
+cleaned colour and the standard length wording rather than the brand's own phrasing.
+
+## Style Name
+
+The derived style: ALL CAPS, no colour, no size, no "JEANS".
+
+## OLD
+
+`OLD` marks a run of a style that has been superseded by a replacement.
+
+* On **Product Title Alt** it follows the length word where there is one, otherwise the
+  colour: `... | BLUE004 | LONG OLD`.
+* On **`Product` it is never added** - unless the old SKU is still being sold at the same
+  time as the new one, in which case the two must stay distinguishable.
 
 ## Style identity
 
-**`SKU_BRAND_NO_SIZE` identifies a style**, not `product_name`. Two different runs of the
-same jean (an old one being sold off and its replacement) can share a product_name on
-purpose so their sales report together - the stem is what still tells them apart.
-`product_name` is a reporting label. **Never key or group on product_name alone.**
+**How a style is identified varies by brand.** The brand instructions name the style key.
+Do not assume one brand's key works for another - they are built from whatever that
+brand's data actually supports, and plenty of brands use effectively random SKUs.
 
-`SKU_BRAND_NO_SIZE` is a **calculation helper and is never stored in the database.** There
-is no column for it and none should be added: the derivation depends on how a given brand
-structures its SKUs, and plenty of brands use effectively random numbers.
-
-### Deriving it
-
-The goal is the SKU with its size part removed, so every size of one style collapses to a
-single key. The trap: the SKU's trailing segment often **is not** the size. Sizes
-`00-4` ... `28-32 Plus` can appear as `-A` ... `-E`; `XS` ... `3XL` as `-0` ... `-8`.
-
-1. **Group the product's variants by their non-size options** (Colour, and Inseam where
-   present). A style sold in Regular and Long forms **two** groups, not one.
-2. **Take the longest common prefix of each group's SKUs**, cut it back to the last `-`,
-   and drop trailing dashes. Grouping first is what preserves a Long run's inseam token,
-   e.g. the `-35` in `...-35-00-4`.
-3. **Single-SKU group fallback** - no sibling means no shared prefix, so strip the size by
-   text. Try, longest first: the size as-is; spaces removed; spaces as dashes; and for a
-   size ending PLUS/PETITE/LONG, the stem plus `P`/`P`/`L` (so `14-18 PLUS` also tries
-   `14-18P`). If none match, peel the size's tokens off the end one at a time. If nothing
-   matches, keep the SKU unchanged.
-
-This path is common - roughly one group in eight - and a prefix can never produce the
-right answer for it. Test case: `GLSTAF739T-I571-6-12` must give `GLSTAF739T-I571`, not
-`GLSTAF739T-I571-6`.
+What is true everywhere: **`product_name` is a reporting label, not an identifier.** Two
+different runs of the same jean - one being sold off, its replacement - can share a
+product_name on purpose so their sales report together. **Never key or group on
+product_name alone.**
 
 ## Quantity of style
 
 Take `Quantity Available` as an integer; blank, missing or non-numeric is **0**; negatives
 are **kept negative** (oversold reduces the total). Sum across all rows sharing the same
-`SKU_BRAND_NO_SIZE`, regardless of handle or Style Id, **within the same capture**. Write
-the group total onto every row in the group; a row with no stem gets blank.
-
-Because grouping is by stem, a Regular run and a Long run of one style total separately
-while all sizes within a run total together.
+**style identity for that brand**, within the same capture. Write the group total onto
+every row in the group; a row with no style key gets blank.
 
 **This value is a repeated group total, so it must never be SUMmed across rows** by
 anything reading the output.
@@ -114,11 +166,11 @@ anything reading the output.
 
 # 3. Derived fields: exact values
 
-The derived values are compared across brands, so the **spelling and capitalisation must
-match exactly**. Use these strings and no variants:
+These are compared across brands, so **spelling and capitalisation must match exactly**.
+Use these strings and no variants:
 
 ```
-Jean Style     Skinny, Slim, Straight from Knee, Straight from Knee/Thigh,
+Jean Style     Skinny, Tapered, Straight from Knee, Straight from Knee/Thigh,
                Straight from Thigh, Bootcut, Flare, Wide Leg, Barrel, Baggy,
                Boyfriend
 Inseam Label   Regular, Petite, Long
@@ -126,15 +178,13 @@ Inseam Style   Cropped, Ankle, Full Length
 Rise Label     Low, Mid, High
 ```
 
-Note **"Straight from Knee"** - lower-case "from". This is the correct form. Good
-American currently writes "Straight **F**rom" and is the only scraper that does; that is a
-bug to fix, not a variant to copy.
+Note **"Straight from Knee"** - lower-case "from".
 
 ## Straight-leg buckets
 
 From Leg Opening, in inches. The lower boundary is 15.5 everywhere; **the upper boundary
-varies by brand and is expected to** - different brands cut a "straight" differently, so
-the number is tuned per brand against their actual fits.
+varies by brand and is expected to** - brands cut a "straight" differently, so the number
+is tuned per brand against their actual fits.
 
 ```
 < 15.5         Straight from Knee
@@ -152,8 +202,8 @@ What the existing scrapers use:
 |AMO|`< 17.5`|
 |Edyson|`< 17.5`|
 
-For a new brand, start at 17.0, then check the result against a dozen styles on their
-site and move it if their straights run wide. **Say in a comment which it is and why.**
+For a new brand, start at 17.0, then check the result against a dozen styles on their site
+and move it if their straights run wide. **Say in a comment which it is and why.**
 
 ## Inseam Label
 
@@ -165,9 +215,9 @@ Decide in this order, first hit wins:
 4. the **inseam number** as a last resort
 
 Then, **after the alt title is final, make the label agree with it.** If the alt title
-carries a length segment and the label disagrees, the title wins. A stated length beats a
+carries a length segment and the label disagrees, the title wins - a stated length beats a
 measured one. This matters because the length segment can be set by the multi-inseam rule
-long after the label was derived - without this pass a 33.5" flare reads `Long` while its
+long after the label was derived; without this pass a 33.5" flare reads `Long` while its
 own title says `REGULAR`.
 
 Rows whose title has no length segment keep whatever the four-step order produced.
@@ -185,9 +235,9 @@ Rows whose title has no length segment keep whatever the four-step order produce
    it lists sibling pages, **mark every page in that family Multi**, including ones never
    checked. An empty switcher is a real answer meaning "one length only".
 
-Then give every Multi row an explicit length: any Multi row with no length segment gets
-`| REGULAR` appended. That REGULAR means *the member that is not the petite or long one* -
-a position in the family, not a measurement.
+Then give every Multi row an explicit length: any Multi row with no length segment gets a
+`REGULAR` segment appended. That REGULAR means *the member that is not the petite or long
+one* - a position in the family, not a measurement.
 
 **This rule can only ever miss a Multi, never invent one** - a blocked page and a
 single-length page look identical, and a family cannot form if the sibling is absent from
@@ -199,7 +249,7 @@ the run. That is why the database treats Multi as sticky.
 
 |thing|rule|
 |-|-|
-|pipe separator|always ` \| ` - one space either side, never doubled, never missing|
+|separator|per brand (see 2). Consistent spacing, never doubled, never missing|
 |`90s`|lower-case `s`, always. Never `90S`|
 |tags|joined with `, `|
 |dates|`MM/DD/YYYY` - zero-padded|
@@ -212,14 +262,12 @@ the run. That is why the database treats Multi as sticky.
 |whitespace|collapse runs of spaces; strip leading/trailing; no non-breaking spaces|
 |sizes|**always text, never numeric.** `00` must not become `0`; both are real sizes|
 
-## Brackets and markers
+## Brackets
 
-* **A bracketed phrase inside a name is deliberate** - it is there because another item
-  would otherwise share that name and is a different style, e.g.
-  `GOOD LEGS FLARE JEANS [CLEAN HEM] | BLUE004`. **Never strip brackets** and never write
-  a regex that sweeps `\[.*\]`.
-* **`OLD`** appended to an alt title marks a superseded run of a style that has been
-  replaced. It follows the length word when there is one: `... | BLUE004 | LONG OLD`.
+**A bracketed phrase inside a name is deliberate** - it is there because another item would
+otherwise share that name and is a different style, e.g.
+`GOOD LEGS FLARE JEANS [CLEAN HEM] | BLUE004`. **Never strip brackets**, and never write a
+regex that sweeps `\[.*\]`.
 
 ---
 
@@ -243,7 +291,7 @@ Cloudflare's managed challenge. Send `Accept`, `Accept-Language`,
   challenge, a third never helps.
 * **Do not cache a blocked page as "missing".** A later phase should be able to retry it.
 * **Pace globally.** The limit is per-IP and shared by every lookup, so one pacer covers
-  all requests to `/products/`, not one per phase.
+  all requests, not one per phase.
 * **Never add concurrency to work around a 429.** The limit is per-IP; parallel requests
   hit the wall faster.
 
@@ -260,37 +308,12 @@ fetch it once and cache it for the run.
 
 ---
 
-# 6. Known outliers to fix
-
-These are existing scrapers that disagree with the rules above. They are bugs, not
-alternatives - do not copy them into a new brand.
-
-|scraper|what is wrong|should be|
-|-|-|-|
-|**Good American**|writes `Straight From Knee` (capital F)|`Straight from Knee` - every other scraper|
-|**Good American**|dates as `M/D/YYYY` (`11/2/2026`)|`MM/DD/YYYY` (`11/02/2026`)|
-|**Good American**|`Updated At` as `M/D/YYYY h:MM:SS AM/PM` Central|`MM/DD/YYYY HH:MM:SS`, and the column is not in the database at all|
-|**Good American**|price as the raw Shopify amount (`158.0`)|`$158.00`|
-|**AMO**|price as `1234.56`|`$1,234.56`|
-|**Paige**|price passed through unformatted|`$1,234.56`|
-|**Ramy Brook, Edyson, AG Jeans**|dates as `M/D/YYYY`|`MM/DD/YYYY`|
-
-The casing one matters most: `Jean Style` is grouped across brands, so Good American's
-`Straight From Knee` splits those styles away from every other brand's
-`Straight from Knee`. It is a one-line change, but it rewrites historical values, so do it
-with the data migration rather than in the middle of one.
-
-**Not an outlier:** Good American carries no `Leg Opening` or `Rise` because the brand
-does not publish those measurements. A missing column for a brand that genuinely has no
-such data is correct; do not invent one.
-
-# 7. Housekeeping
+# 6. Housekeeping
 
 * `Output/` beside the script; file named `BRAND_YYYY-MM-DD_HH-MM-SS.csv`, brand
-  upper-case. The database stores this as `source_file_name`, so the shape is fixed.
-* **Only emit columns the database has.** `Updated At` is not a database field - Good
-  American emits it and it goes nowhere.
-* A log file per brand; log phase boundaries, counts, and anything skipped.
+  upper-case. The database reads this as `source_file_name`, so the shape is fixed.
+* A log file per brand. Every line starts with a Central-time timestamp. Log phase
+  boundaries, counts, and anything skipped.
 * Keep brand-specific word lists (filter words, excluded product types, style keywords)
   **in named constants at the top of the file**, not buried in the logic.
 * Match on **whole words**, case-insensitively, when filtering by keyword. A plain
@@ -298,7 +321,7 @@ such data is correct; do not invent one.
 * Comment the **why**, not the what - especially where a rule looks wrong but is
   deliberate.
 
-# 8. Things not to do
+# 7. Things not to do
 
 * **Do not guess.** Where the evidence does not resolve, leave the field blank and report
   the row. A wrong value is worse than an empty one.
@@ -306,26 +329,29 @@ such data is correct; do not invent one.
 * **Do not trust a cached spreadsheet column.** Recompute from source; formula columns go
   stale.
 * **Do not treat absence as deletion.** A row missing from one run is not a dead product.
-* **Do not store helper values** (`SKU_BRAND_NO_SIZE`) in the database.
+* **Do not store calculation helpers** in the database. If a value exists only to group
+  rows during a calculation, it stays out of the output.
 
-# 9. Before you call it done
+# 8. Before you call it done
 
 Run it twice and diff the two outputs. Only volatile columns (quantities, availability,
 tags, prices, image URLs, timestamps) should differ. Then check:
 
 ```
 any 90S (capital S) anywhere                                 none
-double spaces, or pipe spacing other than ' | '              none
-Variant Title = Product Title Alt + ' | ' + Size             every row
-Inseam Label Multi = Multi but no PETITE/LONG/REGULAR        none
+double spaces, or inconsistent separator spacing             none
+Variant Title follows the order in 2                         every row
+Inseam Label Multi = Multi but no length segment             none
 Style Name in ALL CAPS, no colour, no size                   every row
-derived values spelled exactly as Part 3                     every row
+derived values spelled exactly as 3                          every row
 size '00' still '00', not '0'                                every row
-dates MM/DD/YYYY, datetimes MM/DD/YYYY HH:MM:SS               every row
+dates MM/DD/YYYY, datetimes MM/DD/YYYY HH:MM:SS              every row
 prices formatted $###.##                                     every row
 rows where a page could not be read                          reported, not blank
-SKU_BRAND_NO_SIZE written to any output column               none
+credentials anywhere in the log or output                    none
 ```
 
-Spot-check ten styles against the live site by hand, including one multi-inseam style and
-one whose name the brand has recently changed.
+Then spot-check ten styles against the live site by hand, including one multi-inseam style
+and one whose name the brand has recently changed. If you were given a correction file,
+check your output against it and raise anything that disagrees rather than resolving it
+yourself.
