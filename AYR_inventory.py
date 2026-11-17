@@ -61,7 +61,7 @@ EXCLUDED_TAGS = [
     "sweats-men", "Sweaters", "Woven Shirts", "ss tees", "Jackets", "Jackets - Men",
     "Woven Shirts - Men", "cashmere", "sweatsuit", "Outerwear", "Knits", "Knits - Men",
     "Shorts", "coat", "polo", "sweat pants", "sweatpant", "sweatpants", "sweatshirt",
-    "tees", "rugby", "tank", "flare", "accessories", "belt", "Skirts", "suit",
+    "tees", "rugby", "tank", "accessories", "belt", "Skirts", "suit",
     "gender-neutral", "raglan", "Dresses", "bomber", "hoodie", "Blazers", "scoopneck",
     "striped T's", "cardigan", "vest", "dress", "turtleneck", "bandana", "scarf",
     "beanie", "hats", "tie",
@@ -90,6 +90,7 @@ SIZE_LIST = {
     ] + [str(n) for n in range(22, 41)]
 }
 INSEAM_LETTERS = {"S": "Petite", "R": "Regular", "L": "Long"}
+DESCRIPTION_HEADINGS_TO_SKIP = {"product description", "sizing"}
 LENGTH_WORDS = ("petite", "long", "regular")
 
 
@@ -567,15 +568,23 @@ def numeric_inseam_labels(values: Sequence[str], description: str) -> Dict[str, 
 # Derived columns
 # --------------------------------------------------------------------------
 def normalize_color_snippet(description: str, color: str) -> str:
-    desc_lower = description.lower()
-    idx = desc_lower.find(color.lower())
-    if idx == -1:
+    """Text the description writes for THIS color only, e.g. "Caviar: Velvety soft
+    denim in a beautiful washed black." -> "caviar: velvety soft ... washed black".
+    The color must be the label before a colon, alone or in a list of color
+    names ("Beep Beep, Tell Me: ..."). A sentence that only mentions the color
+    ("Skyscraper, Russell, and Fade to Black all have ... creasing") is ignored.
+    """
+    if not description or not color:
         return ""
-    snippet = desc_lower[idx:]
-    end = snippet.find(".")
-    if end != -1:
-        snippet = snippet[: end]
-    return snippet
+    name = r"[A-Z][\w'\u2019]*(?:\s+[\w'\u2019]+){0,3}"
+    pattern = re.compile(
+        rf"(?<![\w])({re.escape(color)}(?:\s*(?:,|&|\band\b)\s*{name})*)\s*:\s*([^.]*)",
+        re.IGNORECASE,
+    )
+    m = pattern.search(description)
+    if not m:
+        return ""
+    return f"{color}: {m.group(2)}".lower().strip()
 
 
 def derive_color_simplified(snippet: str) -> str:
@@ -1067,6 +1076,9 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
     for handle in dict.fromkeys(v.handle for v in variants):
         children = pdp_child_values(pdp_cache.get(handle, ""))
         if children:
+            # Leave out the "Product Description" and "Sizing" headings (Material /
+            # Care / Made In headings stay), per Carrie 11/17.
+            children = [c for c in children if c.strip().lower() not in DESCRIPTION_HEADINGS_TO_SKIP]
             raw = "; ".join(children)
         else:
             raw = next(v.description for v in variants if v.handle == handle)
@@ -1129,10 +1141,13 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
         clean_title = strip_final_sale(var.product_title)
         color = var.color.strip()
 
-        # Product: title / Color [/ Petite|Regular|Long when the variant's inseam is S/R/L]
-        product_field = f"{clean_title} / {color}" if color else clean_title
+        # Product: title / [Petite|Regular|Long when the variant's inseam is S/R/L /] Color
+        product_parts = [clean_title]
         if code.upper() in INSEAM_LETTERS:
-            product_field = f"{product_field} / {INSEAM_LETTERS[code.upper()]}"
+            product_parts.append(INSEAM_LETTERS[code.upper()])
+        if color:
+            product_parts.append(color)
+        product_field = " / ".join(product_parts)
 
         # Product Title Alt: title / Color / Inseam Label (only when the product really has a length option)
         alt_parts = [clean_title] + ([color] if color else []) + ([inseam_label] if has_length else [])
