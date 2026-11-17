@@ -12,6 +12,7 @@ progress and an ETA.
 import argparse
 import csv
 import json
+import os
 import logging
 import re
 import sys
@@ -84,6 +85,24 @@ PDP_GETS_PER_TRY = 2        # HTTP GETs per try
 PDP_TRIES_PER_PAGE = 2      # tries per page across the whole run
 BLOCK_STATUSES = {403, 429}
 TRANSIENT_STATUSES = {500, 502, 503, 504}
+
+# Real-browser fallback (same as retail_PDP_probe.py). When the site blocks plain
+# requests from this computer, a real Chrome reads the pages instead. It starts
+# hidden; if that is blocked too it reopens in a VISIBLE Chrome window - if a
+# "verify you are human" box shows there, click it (the run waits up to 60s).
+BROWSER_FALLBACK_ENABLED = True
+BLOCKS_BEFORE_BROWSER = 2       # blocked pages in a row before switching to the browser
+BROWSER_HEADLESS = True
+BROWSER_RETRY_VISIBLE = True
+BROWSER_CHALLENGE_WAIT_MS = 20000
+BROWSER_VISIBLE_WAIT_MS = 60000
+BROWSER_RENDER_TIMEOUT_MS = 45000
+# Only needed when Chrome / Playwright's Chromium can't be found (left blank normally).
+BROWSER_EXECUTABLE_PATH = os.environ.get("AYR_BROWSER_EXECUTABLE", "")
+# Backup: every product page read successfully is saved here. If a page can't be
+# read today, the last saved copy is used for Description / measurements / country.
+# Quantities (the .json) are NEVER reused - they must be read fresh.
+PDP_SAVE_DIR = OUTPUT_DIR / "AYR_saved_product_pages"
 
 # A product is dropped when its description (GraphQL text OR the product-page
 # description) contains any of these.
@@ -222,7 +241,8 @@ _PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "last": 0.0}
 _PAGE_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
 _PAGE_TRIES: Dict[Tuple[str, str], int] = {}
 _PAGES_BLOCKED: Set[Tuple[str, str]] = set()   # (kind, handle) never read because of a block / error
-_REQUEST_COUNTS: Dict[str, int] = {"http_gets": 0, "blocked": 0}
+_REQUEST_COUNTS: Dict[str, int] = {"http_gets": 0, "blocked": 0, "browser_reads": 0}
+_STATE: Dict[str, Any] = {"use_browser": False, "consecutive_blocks": 0, "browser": None}
 
 
 def _pace_request() -> None:
@@ -268,32 +288,278 @@ def _get_with_backoff(session: requests.Session, url: str, logger: logging.Logge
     return response
 
 
+def switch_to_browser(logger: logging.Logger, reason: str) -> bool:
+    """Stop sending plain requests (each blocked one can extend the block) and
+    read the remaining pages through a real browser."""
+    if _STATE["use_browser"]:
+        return True
+    if not BROWSER_FALLBACK_ENABLED:
+        return False
+    logger.warning("%s Switching to a real browser for the rest of the run (no more plain requests).", reason)
+    _STATE["use_browser"] = True
+    if _STATE["browser"] is None:
+        _STATE["browser"] = BrowserSession(logger)
+    return True
+
+
 def fetch_page(session: requests.Session, handle: str, kind: str, logger: logging.Logger) -> Optional[str]:
     """Product page ("html") or product .json ("json"), fetched once and cached.
-    A blocked or failed page is NOT cached, so the end-of-run pass can try again;
-    a page that was really answered (200, 404...) is cached for the whole run."""
+    A blocked or failed page is NOT cached, so a later pass can try again;
+    a page that was really answered (200, 404...) is cached for the whole run.
+    Plain requests first; after BLOCKS_BEFORE_BROWSER blocked pages in a row the
+    run switches to the real browser."""
     key = (kind, handle)
     if key in _PAGE_CACHE:
         return _PAGE_CACHE[key]
-    if _PAGE_TRIES.get(key, 0) >= PDP_TRIES_PER_PAGE:
-        return None
-    _PAGE_TRIES[key] = _PAGE_TRIES.get(key, 0) + 1
     url = f"{SITE_HOST}/products/{handle}" + (".json" if kind == "json" else "")
-    response = _get_with_backoff(session, url, logger)
-    status = response.status_code if response is not None else None
+
+    if _STATE["use_browser"]:
+        browser = _STATE["browser"]
+        tries_key = ("browser",) + key
+        if browser is None or browser.unavailable or _PAGE_TRIES.get(tries_key, 0) >= 1:
+            return None
+        _PAGE_TRIES[tries_key] = 1
+        text, status = browser.fetch_text(url, f"{SITE_HOST}/products/{handle}")
+        _REQUEST_COUNTS["browser_reads"] += 1
+    else:
+        if _PAGE_TRIES.get(key, 0) >= PDP_TRIES_PER_PAGE:
+            return None
+        _PAGE_TRIES[key] = _PAGE_TRIES.get(key, 0) + 1
+        response = _get_with_backoff(session, url, logger)
+        status = response.status_code if response is not None else None
+        text = response.text if response is not None else None
+
     blocked = status is None or status in BLOCK_STATUSES or status in TRANSIENT_STATUSES
-    if status == 200 and kind == "html" and html_looks_blocked(response.text):
+    if status == 200 and kind == "html" and html_looks_blocked(text or ""):
         blocked = True
     if blocked:
         _PAGES_BLOCKED.add(key)
-        logger.warning("Could not read %s for %s (HTTP %s); will try again at the end", kind, handle, status)
+        logger.warning("Could not read %s for %s (HTTP %s)%s", kind, handle, status,
+                       "" if _STATE["use_browser"] else "; will try again later")
+        if not _STATE["use_browser"]:
+            _STATE["consecutive_blocks"] += 1
+            if _STATE["consecutive_blocks"] >= BLOCKS_BEFORE_BROWSER:
+                switch_to_browser(logger, f"AYR blocked {_STATE['consecutive_blocks']} pages in a row from this computer.")
         return None
+    _STATE["consecutive_blocks"] = 0
     _PAGES_BLOCKED.discard(key)
-    text = response.text if status == 200 else None
     if status != 200:
         logger.warning("%s for %s returned HTTP %s", kind, handle, status)
+        text = None
     _PAGE_CACHE[key] = text
+    if text and kind == "html":
+        save_product_page(handle, text, logger)
     return text
+
+
+def save_product_page(handle: str, html: str, logger: logging.Logger) -> None:
+    try:
+        PDP_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        (PDP_SAVE_DIR / f"{handle}.html").write_text(html, encoding="utf-8")
+    except Exception as exc:
+        logger.info("Could not save product page for %s: %s", handle, exc)
+
+
+def load_saved_product_page(handle: str) -> Tuple[str, str]:
+    """(html, saved date) of the last good copy of a product page, or ("", "")."""
+    path = PDP_SAVE_DIR / f"{handle}.html"
+    try:
+        html = path.read_text(encoding="utf-8")
+        saved = datetime.fromtimestamp(path.stat().st_mtime, tz=CENTRAL_TZ).strftime("%Y-%m-%d %H:%M")
+        return html, saved
+    except Exception:
+        return "", ""
+
+
+# ---- real browser (from retail_PDP_probe.py) -----------------------------
+def load_sync_playwright(logger: logging.Logger):
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        logger.warning(
+            "Playwright is not installed, so the browser fallback is unavailable (%s). "
+            "Install it with: pip install playwright  then: playwright install chromium", exc)
+        return None
+    return sync_playwright
+
+
+class BrowserSession:
+    """One real browser shared by the whole run (same as retail_PDP_probe.py).
+
+    A bot check passed once stays passed (its cookies carry over). Pages and
+    .json are read with fetch() from inside an open AYR page, so every request
+    carries the browser's cookies. Starts hidden; if the hidden browser is
+    blocked it reopens visibly so a person can click "verify you are human".
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self._playwright = None
+        self._browser = None
+        self.context = None
+        self.visible = False
+        self.force_visible = not BROWSER_HEADLESS
+        self.unavailable = False
+        self.anchor = None
+
+    def _launch(self, visible: bool) -> bool:
+        if self.context is not None and self.visible == visible:
+            return True
+        self._shutdown()
+        sync_playwright = load_sync_playwright(self.logger)
+        if sync_playwright is None:
+            self.unavailable = True
+            return False
+        self._playwright = sync_playwright().start()
+        mode = "visible window" if visible else "headless"
+        attempts = ([("custom", BROWSER_EXECUTABLE_PATH)] if BROWSER_EXECUTABLE_PATH else []) + [("chrome", None), (None, None)]
+        for channel, exe in attempts:
+            name = "Chrome at AYR_BROWSER_EXECUTABLE" if exe else ("Google Chrome" if channel else "Playwright Chromium")
+            kwargs: Dict[str, Any] = {"headless": not visible, "args": ["--disable-blink-features=AutomationControlled"]}
+            if exe:
+                kwargs["executable_path"] = exe
+            elif channel:
+                kwargs["channel"] = channel
+            try:
+                self._browser = self._playwright.chromium.launch(**kwargs)
+            except Exception as exc:
+                self.logger.info("Could not start %s (%s): %s", name, mode, str(exc).strip().splitlines()[0])
+                continue
+            self.logger.info("Browser started: %s (%s)", name, mode)
+            break
+        if self._browser is None:
+            self._shutdown()
+            self.unavailable = True
+            return False
+        major = (self._browser.version or "124").split(".")[0]
+        user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+        extra_headers = {
+            "sec-ch-ua": f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not_A Brand";v="24"',
+            "sec-ch-ua-platform": '"Windows"',
+        }
+        self.context = self._browser.new_context(user_agent=user_agent, locale="en-US",
+                                                 viewport={"width": 1366, "height": 900},
+                                                 extra_http_headers=extra_headers)
+        self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self.visible = visible
+        return True
+
+    def _shutdown(self) -> None:
+        for closer in (self._browser, self._playwright):
+            if closer is None:
+                continue
+            try:
+                closer.close() if closer is self._browser else closer.stop()
+            except Exception:
+                pass
+        self._browser = None
+        self._playwright = None
+        self.context = None
+        self.anchor = None
+
+    def close(self) -> None:
+        self._shutdown()
+
+    def _wait_until_clear(self, page, nav_status: Dict[str, Optional[int]], label: str, wait_ms: int) -> bool:
+        deadline = time.monotonic() + wait_ms / 1000
+        announced = False
+        while True:
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+            status = nav_status.get("status")
+            blocked = not html or html_looks_blocked(html) or (status is not None and status in BLOCK_STATUSES)
+            if not blocked:
+                if announced:
+                    self.logger.info("Browser got past the block for %s", label)
+                return True
+            if time.monotonic() > deadline:
+                self.logger.warning("Browser still blocked after %.0fs (HTTP %s, page title: '%s'): %s",
+                                    wait_ms / 1000, status, page_title(html), label)
+                return False
+            if not announced:
+                self.logger.info("Browser is blocked for %s (HTTP %s, page title: '%s'); waiting up to %.0fs for it to clear",
+                                 label, status, page_title(html), wait_ms / 1000)
+                announced = True
+            page.wait_for_timeout(1000)
+
+    def open_page(self, url: str):
+        """Open url and wait out any block. Returns the page, or None if still blocked."""
+        if self.unavailable:
+            return None
+        modes = [True] if self.force_visible else ([False, True] if BROWSER_RETRY_VISIBLE else [False])
+        for visible in modes:
+            if not self._launch(visible):
+                if self.unavailable:
+                    return None
+                continue
+            page = self.context.new_page()
+            nav_status: Dict[str, Optional[int]] = {"status": None}
+
+            def on_response(response, page=page, nav_status=nav_status) -> None:
+                try:
+                    if response.request.is_navigation_request() and response.frame == page.main_frame:
+                        nav_status["status"] = response.status
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+            try:
+                _pace_request()
+                page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_RENDER_TIMEOUT_MS)
+                wait_ms = BROWSER_VISIBLE_WAIT_MS if visible else BROWSER_CHALLENGE_WAIT_MS
+                if self._wait_until_clear(page, nav_status, url, wait_ms):
+                    return page
+            except Exception as exc:
+                self.logger.warning("Browser could not load %s: %s", url, str(exc).strip().splitlines()[0])
+            try:
+                page.close()
+            except Exception:
+                pass
+            if not visible and True in modes:
+                self.logger.warning("The hidden browser was blocked; reopening in a visible Chrome window. "
+                                    "If a 'verify you are human' box appears there, click it.")
+                self.force_visible = True
+        return None
+
+    def _fetch_in_page(self, url: str) -> Tuple[Optional[str], Optional[int]]:
+        _pace_request()
+        try:
+            result = self.anchor.evaluate(
+                """async (url) => {
+                    const r = await fetch(url, {credentials: 'same-origin'});
+                    return {status: r.status, text: await r.text()};
+                }""", url)
+            return result.get("text"), result.get("status")
+        except Exception as exc:
+            self.logger.warning("Browser fetch failed for %s: %s", url, str(exc).strip().splitlines()[0])
+            return None, None
+
+    def fetch_text(self, url: str, anchor_url: str) -> Tuple[Optional[str], Optional[int]]:
+        """(text, HTTP status) of url read through the browser. On a block the
+        AYR page is reopened once (waiting out the check, visibly if needed)."""
+        for attempt in range(2):
+            if self.anchor is None:
+                self.anchor = self.open_page(anchor_url)
+                if self.anchor is None:
+                    return None, None
+            text, status = self._fetch_in_page(url)
+            blocked = status is None or status in BLOCK_STATUSES or status in TRANSIENT_STATUSES or \
+                (status == 200 and not url.endswith(".json") and html_looks_blocked(text or ""))
+            if not blocked:
+                _PACE["interval"] = max(PDP_MIN_INTERVAL, _PACE["interval"] * PDP_INTERVAL_DECAY)
+                return text, status
+            _PACE["interval"] = min(PDP_MAX_INTERVAL, _PACE["interval"] + PDP_INTERVAL_STEP)
+            self.logger.warning("Browser read of %s was blocked (HTTP %s)%s", url, status,
+                                "; reopening the AYR page" if attempt == 0 else "")
+            try:
+                self.anchor.close()
+            except Exception:
+                pass
+            self.anchor = None
+        return text, status
 
 
 def fmt_duration(seconds: float) -> str:
@@ -1114,41 +1380,71 @@ def fetch_pdp_html(session: requests.Session, handle: str, logger: logging.Logge
     return fetch_page(session, handle, "html", logger) or ""
 
 
-def fetch_all_pages(session: requests.Session, handles: List[str], logger: logging.Logger
-                    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
-    """Product .json + product page for every handle, with progress/ETA.
-    Pages the site blocked get one more try at the end, once the pace has backed off."""
+def fetch_all_pages(session: requests.Session, handles: List[str], logger: logging.Logger, use_browser: bool = False
+                    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str], List[str]]:
+    """Product .json (quantities - read FIRST, they matter most) then product pages.
+
+    1. Plain requests, Good American pacing. After BLOCKS_BEFORE_BROWSER blocked
+       pages in a row, the rest of the run uses a real browser.
+    2. Anything still unread gets one more try (through the browser if the run
+       has switched, otherwise plain requests once the pace has backed off; if
+       that still fails, through the browser).
+    3. A product page that still can't be read uses its last saved copy.
+    Returns (json by handle, page html by handle, handles whose .json was never read).
+    """
     json_cache: Dict[str, Dict[str, Any]] = {}
     pdp_cache: Dict[str, str] = {}
+    if use_browser:
+        switch_to_browser(logger, "--browser was given.")
 
-    def run_pass(todo: List[str], label: str) -> None:
+    def run_pass(todo: List[str], kind: str, label: str) -> None:
         start = time.monotonic()
         for i, handle in enumerate(todo, start=1):
-            if not json_cache.get(handle):
+            if kind == "json" and not json_cache.get(handle):
                 json_cache[handle] = fetch_product_json(session, handle, logger)
-            if not pdp_cache.get(handle):
+            if kind == "html" and not pdp_cache.get(handle):
                 pdp_cache[handle] = fetch_pdp_html(session, handle, logger)
             elapsed = time.monotonic() - start
             eta = elapsed / i * (len(todo) - i)
             logger.info("%s %s/%s (%s) - elapsed %s, ETA %s", label, i, len(todo), handle, fmt_duration(elapsed), fmt_duration(eta))
 
-    run_pass(handles, "Product pages")
-    retry = sorted({h for _, h in _PAGES_BLOCKED})
-    if retry:
-        logger.info("Second try for %s handle(s) the site blocked: %s", len(retry), ", ".join(retry))
-        run_pass(retry, "Second try")
+    def unread(kind: str) -> List[str]:
+        return [h for h in handles if (kind, h) in _PAGES_BLOCKED]
 
-    logger.info("Product pages: %s HTTP requests, %s blocked; final pace %.1fs between requests",
-                _REQUEST_COUNTS["http_gets"], _REQUEST_COUNTS["blocked"], _PACE["interval"])
-    missing_json = sorted(h for k, h in _PAGES_BLOCKED if k == "json")
-    missing_html = sorted(h for k, h in _PAGES_BLOCKED if k == "html")
+    try:
+        run_pass(handles, "json", "Quantities (.json)")
+        run_pass(handles, "html", "Product pages")
+        for attempt in (1, 2):
+            todo_json, todo_html = unread("json"), unread("html")
+            if not todo_json and not todo_html:
+                break
+            if attempt == 2 and not _STATE["use_browser"]:
+                if not switch_to_browser(logger, "Some pages are still blocked after the second try."):
+                    break
+            logger.info("Retrying %s .json and %s product page(s) the site blocked%s", len(todo_json), len(todo_html),
+                        " (real browser)" if _STATE["use_browser"] else "")
+            run_pass(todo_json, "json", "Retry quantities")
+            run_pass(todo_html, "html", "Retry product pages")
+    finally:
+        if _STATE["browser"] is not None:
+            _STATE["browser"].close()
+
+    logger.info("Product pages: %s plain requests (%s blocked), %s read through the browser; final pace %.1fs",
+                _REQUEST_COUNTS["http_gets"], _REQUEST_COUNTS["blocked"], _REQUEST_COUNTS["browser_reads"], _PACE["interval"])
+
+    for handle in unread("html"):
+        html, saved = load_saved_product_page(handle)
+        if html:
+            pdp_cache[handle] = html
+            logger.warning("Product page for %s could not be read today; using the copy saved %s "
+                           "(Description / measurements / country only - quantities are never reused)", handle, saved)
+        else:
+            logger.warning("Product page for %s could not be read and there is no saved copy: its Description falls "
+                           "back to GraphQL and Rise / Inseam / Leg Opening / Country are blank", handle)
+    missing_json = unread("json")
     if missing_json:
-        logger.warning("Product .json NEVER read for %s handle(s) - their Quantity Available, Barcode, "
-                       "Published/Created At are missing: %s", len(missing_json), ", ".join(missing_json))
-    if missing_html:
-        logger.warning("Product page NEVER read for %s handle(s) - their Description falls back to GraphQL and "
-                       "Rise / Inseam / Leg Opening / Country are blank: %s", len(missing_html), ", ".join(missing_html))
-    return json_cache, pdp_cache
+        logger.error("Quantities (.json) could NOT be read for %s style(s): %s", len(missing_json), ", ".join(missing_json))
+    return json_cache, pdp_cache, missing_json
 
 
 # --------------------------------------------------------------------------
@@ -1543,6 +1839,7 @@ def apply_old_listing_markers(rows: List[Dict[str, Any]], logger: logging.Logger
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="AYR inventory scraper")
     parser.add_argument("--dry-run", action="store_true", help="do everything but write no CSV; print a preview instead")
+    parser.add_argument("--browser", action="store_true", help="read product pages through a real browser from the start")
     args = parser.parse_args(argv)
 
     logger = setup_logger()
@@ -1552,7 +1849,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     variants, product_options = fetch_graphql_products(session, logger)
 
     handles = list(dict.fromkeys(v.handle for v in variants))
-    json_cache, pdp_cache = fetch_all_pages(session, handles, logger)
+    json_cache, pdp_cache, missing_json = fetch_all_pages(session, handles, logger, use_browser=args.browser)
+    if missing_json and not args.dry_run:
+        logger.error("No CSV written: Quantity Available is required and could not be read for %s. "
+                     "AYR is blocking this computer - try again later (or run with --browser).", ", ".join(missing_json))
+        sys.exit(1)
 
     rows = build_rows(variants, product_options, json_cache, pdp_cache, logger)
     apply_inseam_label_multi(rows, pdp_cache, logger)
