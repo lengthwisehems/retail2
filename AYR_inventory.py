@@ -104,6 +104,14 @@ BROWSER_EXECUTABLE_PATH = os.environ.get("AYR_BROWSER_EXECUTABLE", "")
 # Quantities (the .json) are NEVER reused - they must be read fresh.
 PDP_SAVE_DIR = OUTPUT_DIR / "AYR_saved_product_pages"
 
+# Reviews: AYR uses Klaviyo Reviews. Klaviyo serves them from its own address
+# (not www.ayr.com), so these requests never count against an AYR block.
+KLAVIYO_COMPANY_ID = "bBZNFC"   # AYR's public Klaviyo site id (in every AYR page)
+KLAVIYO_REVIEWS_URL = "https://fast.a.klaviyo.com/reviews/api/client_reviews/{pid}/"
+REVIEWS_PAGE_SIZE = 50          # Klaviyo's maximum per request
+REVIEWS_PAGE_CAP = 550          # Klaviyo stops paging a product's list here
+REVIEWS_INTERVAL = 0.25         # seconds between review requests
+
 # A product is dropped when its description (GraphQL text OR the product-page
 # description) contains any of these.
 BANNED_DESC_TERMS = ["skirt", "shorts", "jacket"]
@@ -1552,6 +1560,8 @@ OUTPUT_HEADERS = [
     "Color - Standardized",
     "Fabric Source",
     "Country Produced",
+    "Review AVG",
+    "Review Count",
 ]
 
 
@@ -1696,6 +1706,8 @@ def build_rows(variants: List[VariantRow], product_options: Dict[str, Dict[str, 
             # helper keys (not written)
             "_raw_title": var.product_title,
             "_title_key": clean_title.upper(),
+            "Review AVG": "",
+            "Review Count": "",
             "_color_key": color.upper(),
             "_title_had_final_sale": title_has_final_sale(var.product_title),
             "_final_sale": is_promo(var.product_title, var.handle),
@@ -1746,6 +1758,134 @@ def finalize_rows(out: List[Dict[str, Any]]) -> None:
         totals[(r["Style Id"], r["_color_key"], r["Inseam Label"])] += int(r["Quantity Available"] or 0)
     for r in out:
         r["Quantity of style"] = totals[(r["Style Id"], r["_color_key"], r["Inseam Label"])]
+
+
+def _reviews_get(session: requests.Session, pid: str, logger: logging.Logger, offset: int = 0,
+                 variant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    params = {"product_id": pid, "company_id": KLAVIYO_COMPANY_ID, "limit": REVIEWS_PAGE_SIZE, "offset": offset,
+              "sort": 0, "filter": "", "type": "reviews", "media": "false"}
+    if variant_id:
+        params["variant_id"] = variant_id
+    for attempt in range(3):
+        time.sleep(REVIEWS_INTERVAL)
+        try:
+            resp = session.get(KLAVIYO_REVIEWS_URL.format(pid=pid), params=params, timeout=30,
+                               headers={"Accept": "application/json"})
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("Reviews request for %s returned HTTP %s", pid, resp.status_code)
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("Reviews request for %s failed: %s", pid, exc)
+        time.sleep(2 ** attempt)
+    return None
+
+
+def fetch_product_reviews(session: requests.Session, pid: str, logger: logging.Logger
+                          ) -> Optional[Dict[str, Dict[Any, Tuple[str, float]]]]:
+    """Every review of a style that names the variant bought, as
+    {variant id: {review id: (variant title, rating)}}. None if Klaviyo can't be read.
+
+    Klaviyo lists at most 550 reviews per style and many older reviews name no
+    variant, so: page the newest reviews (where the variant-tagged ones are),
+    then fetch any variant still short of Klaviyo's own per-variant count
+    directly with its variant filter (no 550 cap there)."""
+    first = _reviews_get(session, pid, logger)
+    if first is None:
+        return None
+    expected = {str(v.get("product_variant_external_id")): int(v.get("total") or 0)
+                for v in (first.get("variant_counts") or []) if v.get("product_variant_external_id")}
+    got: Dict[str, Dict[Any, Tuple[str, float]]] = defaultdict(dict)
+
+    def take(payload: Dict[str, Any]) -> None:
+        for r in payload.get("reviews") or []:
+            pv = r.get("product_variant") or {}
+            vid = str(r.get("product_variant_external_id") or pv.get("external_id") or "")
+            if not vid or r.get("rating") is None:
+                continue
+            got[vid][r.get("id")] = (pv.get("title") or "", float(r["rating"]))
+
+    take(first)
+    payload, offset = first, 0
+    want = sum(expected.values())
+    while payload.get("has_more") and offset + REVIEWS_PAGE_SIZE < REVIEWS_PAGE_CAP \
+            and sum(len(v) for v in got.values()) < want:
+        offset += REVIEWS_PAGE_SIZE
+        payload = _reviews_get(session, pid, logger, offset=offset)
+        if payload is None:
+            return None
+        take(payload)
+    for vid, total in expected.items():
+        off = 0
+        while len(got[vid]) < total:
+            payload = _reviews_get(session, pid, logger, offset=off, variant_id=vid)
+            if payload is None:
+                return None
+            take(payload)
+            if not payload.get("has_more"):
+                break
+            off += REVIEWS_PAGE_SIZE
+        if len(got[vid]) < total:
+            logger.warning("Reviews for variant %s of %s: Klaviyo counts %s, read %s", vid, pid, total, len(got[vid]))
+    return {vid: revs for vid, revs in got.items() if revs}
+
+
+def fetch_all_reviews(session: requests.Session, style_ids: List[str], logger: logging.Logger
+                      ) -> Dict[str, Optional[Dict[str, Dict[Any, Tuple[str, float]]]]]:
+    out: Dict[str, Optional[Dict[str, Dict[Any, Tuple[str, float]]]]] = {}
+    start = time.monotonic()
+    for i, pid in enumerate(style_ids, start=1):
+        out[pid] = fetch_product_reviews(session, pid, logger)
+        n = sum(len(v) for v in (out[pid] or {}).values())
+        elapsed = time.monotonic() - start
+        logger.info("Reviews %s/%s (style %s: %s with a variant) - elapsed %s, ETA %s", i, len(style_ids), pid,
+                    n if out[pid] is not None else "FAILED", fmt_duration(elapsed),
+                    fmt_duration(elapsed / i * (len(style_ids) - i)))
+    return out
+
+
+def apply_review_stats(rows: List[Dict[str, Any]], reviews: Dict[str, Optional[Dict[str, Dict[Any, Tuple[str, float]]]]],
+                       product_options: Dict[str, Dict[str, Any]], variants: List["VariantRow"], logger: logging.Logger) -> None:
+    """Review AVG / Review Count per style id + color + inseam label (same key as
+    Quantity of style). Only reviews that name the variant bought can be placed."""
+    current = {v.variant_id: v for v in variants}
+    desc_by_style = {r["Style Id"]: r["Description"] for r in rows}
+    stats: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    unplaced = 0
+    for pid, by_variant in reviews.items():
+        if not by_variant:
+            continue
+        opts = product_options.get(pid, {})
+        cidx, iidx = opts.get("color_idx"), opts.get("inseam_idx")
+        mapping = None
+        for vid, revs in by_variant.items():
+            for title, rating in revs.values():
+                if vid in current:
+                    color, code = current[vid].color, current[vid].inseam_code
+                else:
+                    parts = [p.strip() for p in title.split(" / ")] if title else []
+                    color = parts[cidx] if cidx is not None and cidx < len(parts) else ""
+                    code = parts[iidx] if iidx is not None and iidx < len(parts) else ""
+                    if not parts:
+                        unplaced += 1
+                        continue
+                code = (code or "").strip()
+                if code.upper() in INSEAM_LETTERS:
+                    label = INSEAM_LETTERS[code.upper()]
+                elif code:
+                    if mapping is None:
+                        mapping = numeric_inseam_labels(opts.get("inseam_values", []), desc_by_style.get(pid, ""))
+                    label = mapping.get(code, "")
+                else:
+                    label = "Regular"
+                stats[(pid, to_plain_text(color).strip().upper(), label)].append(rating)
+    for r in rows:
+        if reviews.get(r["Style Id"]) is None:
+            continue  # Klaviyo could not be read for this style: leave blank
+        ratings = stats.get((r["Style Id"], r["_color_key"], r["Inseam Label"]), [])
+        r["Review Count"] = len(ratings)
+        r["Review AVG"] = f"{sum(ratings) / len(ratings):.2f}" if ratings else ""
+    if unplaced:
+        logger.info("Reviews: %s review(s) named a variant that no longer exists and has no title; not counted", unplaced)
 
 
 def _parse_dt(value: str) -> Optional[datetime]:
@@ -1854,11 +1994,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         logger.error("No CSV written: Quantity Available is required and could not be read for %s. "
                      "AYR is blocking this computer - try again later (or run with --browser).", ", ".join(missing_json))
         sys.exit(1)
+    style_ids = list(dict.fromkeys(v.product_id for v in variants))
+    reviews = fetch_all_reviews(session, style_ids, logger)
 
     rows = build_rows(variants, product_options, json_cache, pdp_cache, logger)
     apply_inseam_label_multi(rows, pdp_cache, logger)
     finalize_rows(rows)
     apply_old_listing_markers(rows, logger)
+    apply_review_stats(rows, reviews, product_options, variants, logger)
     plain_text_rows(rows)
 
     if args.dry_run:
