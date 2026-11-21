@@ -23,6 +23,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BRAND = "GOODAMERICAN"
 LOG_PATH = BASE_DIR / f"{BRAND.lower()}_run.log"
 
+# Cloudflare blocks with 403 as readily as 429, so both mean "blocked, unknown"
+# rather than an answer. Handling only 429 loses every 403 page silently: the
+# handle gets cached as unreadable and never reaches the end-of-run report.
+BLOCKED_STATUSES = frozenset({429, 403})
+
 HOST_ROTATION = [
     "checkout.goodamerican.com",
     "good-american.myshopify.com",
@@ -599,7 +604,7 @@ def request_with_retry(
             json=payload,
             timeout=30,
         )
-        if response.status_code in {429, 500, 502, 503, 504}:
+        if response.status_code in BLOCKED_STATUSES | {500, 502, 503, 504}:
             sleep_for = 2 ** attempt
             logging.warning("Retrying %s %s (status %s)", method, url, response.status_code)
             time.sleep(sleep_for)
@@ -2491,8 +2496,8 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
             logging.warning("PDP HTTP %s for %s", status, handle)
     except Exception as exc:  # noqa: BLE001
         logging.warning("PDP fetch failed for %s: %s", handle, exc)
-    if status == 429:
-        # Deliberately not cached. A throttled page is not a missing one, and
+    if status in BLOCKED_STATUSES:
+        # Deliberately not cached. A blocked page is not a missing one, and
         # caching the empty result would lose the handle for the whole run even
         # after the pacer has backed off far enough to read it.
         _PDP_THROTTLED.add(handle)
@@ -2530,7 +2535,7 @@ def _get_with_backoff(session, url, **kwargs):
         _pace_pdp_request()
         _REQUEST_COUNTS["http_gets"] += 1
         response = session.get(url, timeout=30, **kwargs)
-        if response.status_code != 429:
+        if response.status_code not in BLOCKED_STATUSES:
             _PACE["interval"] = max(PDP_MIN_INTERVAL,
                                     _PACE["interval"] * PDP_INTERVAL_DECAY)
             return response
@@ -2548,7 +2553,8 @@ def _get_with_backoff(session, url, **kwargs):
         # nothing but a slower run.
         wait = min(wait, PDP_429_MAX_WAIT)
         logging.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
-                        "Bot challenge (429)" if challenge else "Rate limited (429)",
+                        f"Bot challenge ({response.status_code})" if challenge
+                        else f"Blocked ({response.status_code})",
                         url, wait, _PACE["interval"])
         time.sleep(wait)
     return response
@@ -2642,7 +2648,7 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
                                      allow_redirects=True)
         if response.status_code != 200:
             logging.warning("Size guide HTTP %s for %s", response.status_code, handle)
-            if response.status_code != 429:
+            if response.status_code not in BLOCKED_STATUSES:
                 _SIZE_GUIDE_CACHE[handle] = ""
             return ""
 
