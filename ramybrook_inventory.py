@@ -25,7 +25,12 @@ warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWar
 # Configuration
 # ---------------------------------------------------------------------------
 GRAPHQL_URL   = "https://ramybrook-ocm-dev.myshopify.com/api/unstable/graphql.json"
-GRAPHQL_TOKEN = "78e4e572d236efcd96d9d3a6853f27c1"
+# Tried in order. The first has inventory access; the backup only returns
+# product data, in which case inventory falls back to Algolia.
+GRAPHQL_TOKENS = [
+    "bccb7998f634f1518fd6959f60d8e60c",
+    "78e4e572d236efcd96d9d3a6853f27c1",
+]
 PDP_HOST      = "https://www.ramybrook.com"
 HOST_ROTATION = ["https://www.ramybrook.com", "https://ramybrook-ocm-dev.myshopify.com"]
 COLLECTION_HANDLE = "jeans"
@@ -804,10 +809,21 @@ query RamyBrookProducts($cursor: String) {
 """
 
 
-def fetch_graphql_products(session: requests.Session) -> List[Dict]:
+class ScrapeError(RuntimeError):
+    """Raised when the scrape can't produce a trustworthy CSV."""
+
+
+def _fetch_graphql_with_token(session: requests.Session, token: str) -> List[Dict]:
+    """Fetch every page of the jeans collection with one token.
+
+    Raises ScrapeError on any failure, so a partial product list is never
+    returned. ACCESS_DENIED errors (e.g. a token without inventory scope)
+    are not fatal: those fields come back null and Algolia fills them.
+    """
     products: List[Dict] = []
     cursor = None
     page = 0
+    denied_fields: Set[str] = set()
     while True:
         page += 1
         variables: Dict = {"cursor": cursor} if cursor else {}
@@ -815,27 +831,30 @@ def fetch_graphql_products(session: requests.Session) -> List[Dict]:
             resp = session.post(
                 GRAPHQL_URL,
                 headers={
-                    "X-Shopify-Storefront-Access-Token": GRAPHQL_TOKEN,
+                    "X-Shopify-Storefront-Access-Token": token,
                     "Content-Type": "application/json",
                 },
                 json={"query": _GRAPHQL_QUERY, "variables": variables},
                 timeout=45,
             )
             resp.raise_for_status()
-        except requests.RequestException as exc:
-            LOGGER.error("GraphQL request failed (page %s): %s", page, exc)
-            break
-        payload = resp.json()
+            payload = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise ScrapeError(f"GraphQL request failed (page {page}): {exc}") from exc
         if payload.get("errors"):
-            fatal = [e for e in payload["errors"]
-                     if "ACCESS_DENIED" not in str(e.get("extensions", {}).get("code", ""))]
+            fatal = []
+            for e in payload["errors"]:
+                if "ACCESS_DENIED" in str((e.get("extensions") or {}).get("code", "")):
+                    path = e.get("path") or []
+                    if path:
+                        denied_fields.add(str(path[-1]))
+                else:
+                    fatal.append(e)
             if fatal:
-                LOGGER.error("GraphQL fatal errors: %s", fatal)
-                break
+                raise ScrapeError(f"GraphQL errors (page {page}): {fatal}")
         data = (payload.get("data") or {}).get("collection") or {}
         if not data:
-            LOGGER.warning("No collection data on page %s", page)
-            break
+            raise ScrapeError(f"No 'jeans' collection data returned (page {page})")
         block = data.get("products", {})
         for node in block.get("nodes", []):
             products.append(node)
@@ -845,8 +864,32 @@ def fetch_graphql_products(session: requests.Session) -> List[Dict]:
         cursor = page_info.get("endCursor")
         log("GraphQL page %s: %s products so far", page, len(products))
         time.sleep(SLEEP)
-    log("GraphQL fetch complete: %s product nodes", len(products))
+    if denied_fields:
+        LOGGER.warning("GraphQL token has no access to %s; using Algolia inventory instead",
+                       ", ".join(sorted(denied_fields)))
     return products
+
+
+def fetch_graphql_products(session: requests.Session) -> List[Dict]:
+    """Try each token in GRAPHQL_TOKENS in turn; raise ScrapeError if all fail."""
+    failures: List[str] = []
+    for i, token in enumerate(GRAPHQL_TOKENS, start=1):
+        label = f"token {i}/{len(GRAPHQL_TOKENS)} ({token[:6]}…)"
+        try:
+            products = _fetch_graphql_with_token(session, token)
+        except ScrapeError as exc:
+            LOGGER.warning("GraphQL %s failed: %s", label, exc)
+            failures.append(f"{label}: {exc}")
+            continue
+        if not products:
+            LOGGER.warning("GraphQL %s returned 0 products", label)
+            failures.append(f"{label}: 0 products")
+            continue
+        if i > 1:
+            LOGGER.warning("Primary GraphQL token failed; using backup %s", label)
+        log("GraphQL fetch complete with %s: %s product nodes", label, len(products))
+        return products
+    raise ScrapeError("All GraphQL tokens failed — " + " | ".join(failures))
 
 # ---------------------------------------------------------------------------
 # Algolia — fetch all variants (distinct=false) for the jeans collection
@@ -924,6 +967,17 @@ def algolia_inventory(hit: Dict) -> Tuple[str, str, str]:
     online    = int(loc.get(ONLINE_LOCATION) or 0)
     incoming  = int(loc.get(INCOMING_LOCATION) or 0)
     return str(instore), str(online), str(incoming)
+
+
+def algolia_total_quantity(hit: Dict) -> Optional[int]:
+    """Instore + Online + Incoming from an Algolia hit, or None if there is no hit.
+
+    Used for 'Quantity Available' when GraphQL returns no quantityAvailable.
+    """
+    if not hit or not isinstance(hit.get("locations_inventory"), dict):
+        return None
+    instore, online, incoming = algolia_inventory(hit)
+    return int(instore) + int(online) + int(incoming)
 
 # ---------------------------------------------------------------------------
 # Swym wishlist counts
@@ -1244,6 +1298,9 @@ class RamyBrookScraper:
 
         log("Building rows and fetching Next Shipment from PDPs...")
         seen_skus: Set[str] = set()
+        algolia_qty_variants = 0   # Quantity Available filled from Algolia
+        missing_qty_variants = 0   # no quantity from GraphQL or Algolia
+        algolia_style_totals = 0   # Quantity of style summed from variant rows
         for idx, product in enumerate(products, start=1):
             handle = product.get("handle") or ""
             if not handle:
@@ -1283,6 +1340,7 @@ class RamyBrookScraper:
             jean_style = derive_jean_style(title, desc, leg_opening)
             rise_label = derive_rise_label(title, desc, tags_str)
 
+            product_row_start = len(rows)
             for v in variants:
                 v_id_full   = v.get("id") or ""
                 sku_shopify = v_id_full.replace("gid://shopify/ProductVariant/", "")
@@ -1316,6 +1374,13 @@ class RamyBrookScraper:
                            or algolia_map.get(v.get("sku") or "")
                            or {})
                 instore_qty, online_qty, incoming_qty = algolia_inventory(alg_hit)
+                if qty_avail is None:
+                    alg_total = algolia_total_quantity(alg_hit)
+                    if alg_total is not None:
+                        qty_str = str(alg_total)
+                        algolia_qty_variants += 1
+                    else:
+                        missing_qty_variants += 1
                 roc = alg_hit.get("recently_ordered_count")
                 ga_purchases = str(roc) if roc is not None else ""
 
@@ -1392,6 +1457,16 @@ class RamyBrookScraper:
                 _set(row, "Color - Standardized", color_std)
                 rows.append(row)
 
+            # No GraphQL totalInventory → sum this style's Quantity Available
+            if total_inv is None:
+                product_rows = rows[product_row_start:]
+                qtys = [_col(r, "Quantity Available") for r in product_rows]
+                if product_rows and all(q != "" for q in qtys):
+                    style_total = str(sum(int(q) for q in qtys))
+                    for r in product_rows:
+                        _set(r, "Quantity of style", style_total)
+                    algolia_style_totals += 1
+
             # Backfill Algolia step-4 Jean Style if still blank after variants loop
             if algolia_cats:
                 for row in rows[-(len(variants)):]:
@@ -1403,6 +1478,16 @@ class RamyBrookScraper:
 
             if idx % 5 == 0 or idx == len(products):
                 log("Progress: %s/%s products (%s rows)", idx, len(products), len(rows))
+
+        if algolia_qty_variants:
+            LOGGER.warning("Quantity Available from Algolia (Instore+Online+Incoming) for "
+                           "%s/%s variants; Quantity of style summed for %s styles",
+                           algolia_qty_variants, len(rows), algolia_style_totals)
+        if missing_qty_variants:
+            LOGGER.warning("No Quantity Available from GraphQL or Algolia for %s variants",
+                           missing_qty_variants)
+        if not rows:
+            raise ScrapeError("No rows generated")
 
         # Post-processing
         log("Post-processing: petite inseam rule...")
@@ -1443,7 +1528,11 @@ class RamyBrookScraper:
 
 
 def main() -> None:
-    RamyBrookScraper().run()
+    try:
+        RamyBrookScraper().run()
+    except ScrapeError as exc:
+        LOGGER.error("Ramy Brook scrape FAILED — no CSV written: %s", exc)
+        raise SystemExit(f"ERROR: Ramy Brook scrape failed, no CSV written: {exc}")
 
 
 if __name__ == "__main__":
