@@ -349,9 +349,18 @@ def _pace_request():
 toward the floor after clean responses. A one-way ratchet is what turned one bad page into
 a 27-minute run: the pace climbed to 5.6s and stayed there for the remaining 150 requests.
 
-## 5.4 A 429 is usually a bot challenge, not a rate limit
+## 5.4 A 429 **or a 403** is usually a bot challenge, not a rate limit
 
-Check the body. If it contains Cloudflare's interstitial, waiting will not clear it:
+**This is the one that is always forgotten.** The site runs Shopify behind Cloudflare, and
+Cloudflare blocks with **403 as readily as 429**. Everything in this section applies to
+both status codes. A scraper that handles only 429 will sail through its 429s and then
+quietly lose every page Cloudflare answered with a 403.
+
+```python
+BLOCKED_STATUSES = (429, 403)
+```
+
+Check the body too. If it contains Cloudflare's interstitial, waiting will not clear it:
 
 ```python
 def _is_bot_challenge(response):
@@ -375,7 +384,7 @@ def _get_with_backoff(session, url, **kwargs):
     for attempt in range(RETRIES):
         _pace_request()
         response = session.get(url, timeout=30, **kwargs)
-        if response.status_code != 429:
+        if response.status_code not in BLOCKED_STATUSES:
             _PACE["interval"] = max(PDP_MIN_INTERVAL,
                                     _PACE["interval"] * PDP_INTERVAL_DECAY)
             return response
@@ -388,13 +397,15 @@ def _get_with_backoff(session, url, **kwargs):
                 else BASE_SLEEP * (attempt + 1))
         wait = min(wait, PDP_429_MAX_WAIT)
         logging.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
-                        "Bot challenge (429)" if _is_bot_challenge(response)
-                        else "Rate limited (429)", url, wait, _PACE["interval"])
+                        f"Bot challenge ({response.status_code})"
+                        if _is_bot_challenge(response)
+                        else f"Blocked ({response.status_code})",
+                        url, wait, _PACE["interval"])
         time.sleep(wait)
     return response
 ```
 
-## 5.5 Tell the four outcomes apart
+## 5.5 Tell the outcomes apart
 
 A page that could not be read is **not** a page that says nothing. Keep the status, not
 just the HTML:
@@ -403,11 +414,21 @@ just the HTML:
 |-|-|-|
 |200|read it|cache the HTML|
 |404|the product is genuinely gone|cache it; safe to act on|
-|429|blocked - unknown|**do not cache**, so a later phase can retry|
+|**429 or 403**|blocked - unknown|**do not cache**, so a later phase can retry|
 |other / timeout|unknown|cache nothing conclusive; never read as "gone"|
 
-**Never cache a 429 as "missing".** Caching the empty result loses the handle for the
-whole run even after the pacer has backed off far enough to read it.
+**Never cache a 429 or a 403 as "missing".** Caching the empty result loses the handle for
+the whole run even after the pacer has backed off far enough to read it.
+
+```python
+if status in BLOCKED_STATUSES:
+    _PDP_THROTTLED.add(handle)
+    return None          # deliberately not cached
+```
+
+A 403 is the easy one to get wrong here, because it reads like a permissions error rather
+than a block - so it tends to fall through into the "cache the failure" path and the
+handle is lost for the rest of the run.
 
 **Never infer deletion from an empty result.** Good American drops delisted products by
 checking the PDP, and that check requires *exactly* 404:
@@ -491,6 +512,9 @@ If the log still shows challenges, raise it. If the brand never challenges, lowe
 * **Do not rotate hosts to dodge the limit.** Good American's `checkout.` and
   `.myshopify.com` hosts both redirect to `www`, so they share one limiter. Check before
   assuming alternates are independent.
+* **Do not handle 429 and forget 403.** They are the same event from Cloudflare's point
+  of view. Test it: if the brand will not give you a 403, force one and check the handle
+  ends up in the "never read" report rather than silently cached.
 * **Do not let a failure write a blank.** An unreadable page must leave the field
   untouched and be reported, never fill it with "".
 * **Do not keep a global ratchet.** See 5.3.
