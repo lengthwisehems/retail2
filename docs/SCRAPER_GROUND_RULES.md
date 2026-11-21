@@ -291,42 +291,213 @@ regex that sweeps `\[.*\]`.
 
 ---
 
-# 5. Fetching
+# 5. Fetching product pages (PDPs)
 
-Most brands are Shopify behind Cloudflare. The rules below came out of debugging a run
-that took 27 minutes and lost 20 styles.
+Most brands are Shopify behind Cloudflare. Nearly every scraper that reads product pages
+has had trouble here; Good American is the one that runs smoothly, and this is what it
+does. Follow it literally - each rule below exists because its absence caused a specific
+failure.
 
-**Send browser headers, not a bare User-Agent.** A lone UA is a known trigger for
-Cloudflare's managed challenge. Send `Accept`, `Accept-Language`,
-`Upgrade-Insecure-Requests`, the `Sec-Fetch-*` set and `sec-ch-ua`.
+## 5.1 One cached fetch per page, shared by everything
 
-**A 429 is usually a bot challenge, not a rate limit.** Check the body: if it is the
-"Verifying your connection" interstitial, waiting does not clear it. Specifically:
+**Fetch each product page once per run and let every field read the same copy.** Good
+American reads four different things off the PDP - a size-guide heading, sister-variant
+links, inseam siblings, and whether the page still exists. Fetching per-lookup instead of
+per-page tripled the request count, which is what provoked the blocking in the first
+place.
 
-* **Cap the wait.** Do not honour a long `Retry-After` in full - the server assumes a rate
-  limit it will forgive, and a challenge is not forgiven on a timer.
-* **Pace in both directions.** Slow down after a challenge, and **decay back to the floor**
-  after clean responses. A one-way ratchet turns one bad page into a slow whole run.
-* **Cap attempts per page** across the run. Two is enough: one retry catches a lifted
-  challenge, a third never helps.
-* **Do not cache a blocked page as "missing".** A later phase should be able to retry it.
-* **Pace globally.** The limit is per-IP and shared by every lookup, so one pacer covers
-  all requests, not one per phase.
-* **Never add concurrency to work around a 429.** The limit is per-IP; parallel requests
+```python
+_PDP_PAGE_CACHE   = {}   # handle -> html (or None)
+_PDP_STATUS_CACHE = {}   # handle -> HTTP status, so 404 != failure
+_PDP_THROTTLED    = set()# handles blocked by the challenge, deliberately uncached
+_PDP_ATTEMPTS     = {}   # handle -> requests spent, across the whole run
+```
+
+## 5.2 Only fetch when the cheaper source has already failed
+
+The PDP is the last resort, not the first. Gate every lookup on the field still being
+empty after the collection/GraphQL data has been used:
+
+```python
+pending = sorted({r["Handle"] for r in rows if not r["Inseam"].strip()})
+```
+
+Good American ends up fetching ~150 pages for ~900 products because of this. Fetching
+every product's page is the difference between a two-minute run and a blocked one.
+
+## 5.3 Pace every request globally
+
+One pacer for **all** requests to the site, not one per phase - the limit is per-IP and
+every phase draws on the same budget.
+
+```python
+PDP_MIN_INTERVAL   = 0.5   # floor: seconds between any two requests
+PDP_MAX_INTERVAL   = 6.0   # ceiling once challenges have forced the pace down
+PDP_INTERVAL_STEP  = 0.75  # added after each 429
+PDP_INTERVAL_DECAY = 0.9   # multiplier after each clean response
+PDP_429_MAX_WAIT   = 15.0  # cap on any single wait
+PDP_HANDLE_ATTEMPTS = 2    # requests per handle for the whole run
+
+def _pace_request():
+    wait = _PACE["last"] + _PACE["interval"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
+```
+
+**The pace must adapt in both directions.** Slow down after a challenge, and decay back
+toward the floor after clean responses. A one-way ratchet is what turned one bad page into
+a 27-minute run: the pace climbed to 5.6s and stayed there for the remaining 150 requests.
+
+## 5.4 A 429 is usually a bot challenge, not a rate limit
+
+Check the body. If it contains Cloudflare's interstitial, waiting will not clear it:
+
+```python
+def _is_bot_challenge(response):
+    return "Verifying your connection" in (response.text or "")[:2000]
+```
+
+This distinction drives everything else:
+
+* **Cap the wait.** The server's `Retry-After` assumes a rate limit it will forgive - a
+  challenge is not forgiven on a timer. One run honoured `Retry-After: 60` six times on a
+  single handle and got the challenge back every time. Honour the header, but capped.
+* **Cap attempts per handle at two,** across the whole run. One retry catches a lifted
+  challenge; a third never helped, and without the cap a blocked page gets re-requested by
+  every phase that wants it.
+* **Never add concurrency to get around it.** The limit is per-IP, so parallel requests
   hit the wall faster.
 
-**Never let a failed request look like an answer.** A 404 means gone; a 429, a 500 or a
-timeout means unknown. Distinguish them, and never write a blank value that a successful
-read would have filled.
+```python
+def _get_with_backoff(session, url, **kwargs):
+    response = None
+    for attempt in range(RETRIES):
+        _pace_request()
+        response = session.get(url, timeout=30, **kwargs)
+        if response.status_code != 429:
+            _PACE["interval"] = max(PDP_MIN_INTERVAL,
+                                    _PACE["interval"] * PDP_INTERVAL_DECAY)
+            return response
+        _PACE["interval"] = min(PDP_MAX_INTERVAL,
+                                _PACE["interval"] + PDP_INTERVAL_STEP)
+        if attempt + 1 >= RETRIES:
+            break
+        retry_after = response.headers.get("Retry-After", "").strip()
+        wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
+                else BASE_SLEEP * (attempt + 1))
+        wait = min(wait, PDP_429_MAX_WAIT)
+        logging.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
+                        "Bot challenge (429)" if _is_bot_challenge(response)
+                        else "Rate limited (429)", url, wait, _PACE["interval"])
+        time.sleep(wait)
+    return response
+```
 
-**Report what was lost.** End the run with a line naming any page that could not be read,
-so a degraded run does not look like a clean one. Also log the real request count and how
-many were challenged.
+## 5.5 Tell the four outcomes apart
 
-**Fetch a page once and share it.** If several derived fields read the same product page,
-fetch it once and cache it for the run.
+A page that could not be read is **not** a page that says nothing. Keep the status, not
+just the HTML:
 
----
+|status|meaning|what to do|
+|-|-|-|
+|200|read it|cache the HTML|
+|404|the product is genuinely gone|cache it; safe to act on|
+|429|blocked - unknown|**do not cache**, so a later phase can retry|
+|other / timeout|unknown|cache nothing conclusive; never read as "gone"|
+
+**Never cache a 429 as "missing".** Caching the empty result loses the handle for the
+whole run even after the pacer has backed off far enough to read it.
+
+**Never infer deletion from an empty result.** Good American drops delisted products by
+checking the PDP, and that check requires *exactly* 404:
+
+```python
+def pdp_is_missing(session, handle):
+    fetch_product_page(session, handle)
+    return _PDP_STATUS_CACHE.get(handle) == 404
+```
+
+Before that, a transient 500 or timeout silently dropped live styles from the output.
+
+## 5.6 Send browser headers
+
+A lone `User-Agent` is a known trigger for the managed challenge - a real Chrome never
+sends one without the rest:
+
+```python
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"',
+}
+```
+
+## 5.7 Lazy-loaded content: use the section endpoint, not a browser
+
+Content behind a click - a size guide, a measurements drawer - is usually not in the page
+HTML. On Shopify it can be fetched directly with the Section Rendering API rather than
+driving a browser:
+
+```
+https://<site>/products/<handle>?sections=<section-id>
+```
+
+Find the section id in the page's own loader markup. **Do not send
+`Accept: application/json`** - Shopify answers that with an empty section body; the
+browser's default Accept is what returns the rendered markup. Count these as requests and
+pace them like any other.
+
+## 5.8 Report what the run actually did
+
+End every run with the real numbers and, separately, the losses - a degraded run must not
+look like a clean one:
+
+```
+Product pages downloaded: 153 (plus 27 size-guide section requests); 182 HTTP GETs
+in total, 2 of them rate-limited; final pace 0.5s between requests
+```
+
+```python
+if _PDP_THROTTLED:
+    logging.warning("PDP never read for %s handle(s) (blocked by the bot challenge, "
+                    "so their derived fields fall back to weaker evidence): %s",
+                    len(_PDP_THROTTLED), ", ".join(sorted(_PDP_THROTTLED)))
+```
+
+That second line is how you tell a clean run from one that quietly lost data. Check it
+before trusting any field that comes off the PDP.
+
+## 5.9 Make the pace tunable
+
+How readily the challenge fires depends on the IP, so the floor is a starting point, not a
+constant. Expose it:
+
+```python
+parser.add_argument("--pdp-interval", type=float, default=PDP_MIN_INTERVAL)
+```
+
+If the log still shows challenges, raise it. If the brand never challenges, lower it.
+
+## 5.10 What not to do
+
+* **Do not rotate hosts to dodge the limit.** Good American's `checkout.` and
+  `.myshopify.com` hosts both redirect to `www`, so they share one limiter. Check before
+  assuming alternates are independent.
+* **Do not let a failure write a blank.** An unreadable page must leave the field
+  untouched and be reported, never fill it with "".
+* **Do not keep a global ratchet.** See 5.3.
+* **Do not copy an unthrottled scraper's approach because it looks faster.** One scraper
+  in this repo makes an unpaced request per product with no 429 handling at all; measured
+  against its own site it silently dropped ~7% of pages, because a raised exception there
+  returns an empty record and the run carries on looking fine.
 
 # 6. Housekeeping
 
@@ -368,6 +539,8 @@ size '00' still '00', not '0'                                every row
 dates MM/DD/YYYY, datetimes MM/DD/YYYY HH:MM:SS              every row
 prices formatted $###.##                                     every row
 rows where a page could not be read                          reported, not blank
+the run's final pace is back near the floor                  (a stuck pace means 5.3)
+product pages fetched vs products in the run                 far fewer (see 5.2)
 credentials anywhere in the log or output                    none
 ```
 
