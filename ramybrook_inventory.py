@@ -813,7 +813,8 @@ _PDP_BLOCK_KIND: Dict[str, str] = {}
 # Fetch attempts per handle, so a page the challenge keeps blocking costs two
 # attempts rather than being re-requested indefinitely.
 _PDP_ATTEMPTS: Dict[str, int] = {}
-_PDP_COUNTS: Dict[str, int] = {"pdp_pages": 0, "pages_read": 0, "http_gets": 0, "blocked": 0}
+_PDP_COUNTS: Dict[str, int] = {"pdp_pages": 0, "pages_read": 0, "http_gets": 0, "blocked": 0,
+                               "browser_pages": 0, "browser_read": 0}
 # "floor" is what clean responses decay back to; --pdp-interval sets it.
 _PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "floor": PDP_MIN_INTERVAL, "last": 0.0}
 
@@ -979,103 +980,261 @@ def parse_next_shipment(page: str, handle: str) -> Optional[str]:
     return _reformat_shipment_date(str(raw)) if raw else ""
 
 
+# ---------------------------------------------------------------------------
+# Browser (Playwright) fallback for product pages
+# ---------------------------------------------------------------------------
+# Ramy Brook's Cloudflare answers plain HTTP requests from some connections
+# with a 403 "Verify your browser" challenge on nearly every product page. That
+# challenge needs JavaScript to run in a real browser, so no header set gets
+# past it. When plain requests keep getting blocked, the remaining pages are
+# opened in a real browser instead: once the challenge clears, its clearance
+# cookie covers the following pages in the same browser session.
+PDP_BROWSER_CHALLENGE_WAIT = 30.0   # seconds to let a challenge clear (or be clicked)
+PDP_BROWSER_NAV_TIMEOUT_MS = 45000
+_CHALLENGE_TITLES = ("just a moment", "verify your browser", "verifying your connection",
+                     "attention required")
+
+
+class BrowserFetcher:
+    """One real browser, one tab, pages loaded one at a time at the global pace."""
+
+    def __init__(self, headless: bool) -> None:
+        self.headless = headless
+        self.unavailable_reason: Optional[str] = None
+        self._pw = None
+        self._browser = None
+        self._page = None
+        self._told_user = False
+
+    def _start(self) -> bool:
+        if self._page is not None:
+            return True
+        if self.unavailable_reason:
+            return False
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:  # noqa: BLE001
+            self.unavailable_reason = (f"Playwright is not installed ({exc}). Install it with: "
+                                       "pip install playwright  then  playwright install chromium")
+            return False
+        try:
+            self._pw = sync_playwright().start()
+            args = ["--disable-blink-features=AutomationControlled"]
+            launch_error = None
+            # A real installed Chrome passes Cloudflare's check more readily than
+            # Playwright's bundled Chromium, so try it first.
+            for kwargs in ({"channel": "chrome"}, {}):
+                try:
+                    self._browser = self._pw.chromium.launch(headless=self.headless,
+                                                             args=args, **kwargs)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    launch_error = exc
+            if self._browser is None:
+                raise RuntimeError(launch_error)
+            context_kwargs: Dict = {"locale": "en-US", "viewport": {"width": 1366, "height": 900}}
+            if self.headless:
+                # Headless Chrome announces itself as "HeadlessChrome"; drop that.
+                major = (self._browser.version or "124").split(".")[0]
+                context_kwargs["user_agent"] = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+            context = self._browser.new_context(**context_kwargs)
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            # Images, video and fonts aren't needed to read the product record.
+            context.route("**/*", lambda route: route.abort()
+                          if route.request.resource_type in ("image", "media", "font")
+                          else route.continue_())
+            self._page = context.new_page()
+            log("Browser fallback started (%s, %s)", self._browser.version,
+                "headless" if self.headless else "visible window")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.unavailable_reason = f"browser could not be started: {exc}"
+            self.close()
+            return False
+
+    def fetch(self, handle: str) -> Tuple[str, Optional[str]]:
+        """Returns (outcome, html): outcome is 'read', 'gone', 'blocked' or 'failed'."""
+        if not self._start():
+            return "failed", None
+        url = f"{PDP_HOST}/products/{handle}"
+        _pace_pdp_request()
+        _PDP_COUNTS["browser_pages"] += 1
+        try:
+            response = self._page.goto(url, wait_until="domcontentloaded",
+                                       timeout=PDP_BROWSER_NAV_TIMEOUT_MS)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Browser could not load %s: %s", handle, exc)
+            return "failed", None
+        status = response.status if response else None
+        deadline = time.monotonic() + PDP_BROWSER_CHALLENGE_WAIT
+        while True:
+            try:
+                page_html = self._page.content()
+                title = (self._page.title() or "").strip().lower()
+            except Exception:  # noqa: BLE001 -- page navigating (challenge reload)
+                page_html, title = "", ""
+            if page_html and pdp_main_product(page_html, handle) is not None:
+                _PACE["interval"] = max(_PACE["floor"], _PACE["interval"] * PDP_INTERVAL_DECAY)
+                return "read", page_html
+            challenged = any(t in title for t in _CHALLENGE_TITLES)
+            if status == 404 and not challenged:
+                return "gone", None
+            if challenged and not self.headless and not self._told_user:
+                LOGGER.warning("Cloudflare is checking the browser. If a 'Verify you are "
+                               "human' box appears in the browser window, click it once.")
+                self._told_user = True
+            if time.monotonic() >= deadline:
+                _PACE["interval"] = min(max(PDP_MAX_INTERVAL, _PACE["floor"]),
+                                        _PACE["interval"] + PDP_INTERVAL_STEP)
+                return ("blocked" if challenged or status in PDP_BLOCK_STATUSES
+                        else "failed"), None
+            self._page.wait_for_timeout(1000)
+
+    def close(self) -> None:
+        for closer in (lambda: self._browser and self._browser.close(),
+                       lambda: self._pw and self._pw.stop()):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+        self._page = self._browser = self._pw = None
+
+
 def _fmt_eta(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     return f"{seconds // 60}m{seconds % 60:02d}s"
 
 
-def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict[str, List[str]]:
+def fill_next_shipment(session: requests.Session, rows: List[List[str]],
+                       browser_mode: str = "auto", headless: bool = False) -> Dict[str, List[str]]:
     """Read Next Shipment off each product's PDP and write it onto its rows.
 
-    Next Shipment is not in GraphQL or Algolia, so every product with a blank
-    Next Shipment needs its page. Returns the handles that could not be read,
-    by reason, for the end-of-run report. Unread handles stay blank.
+    Next Shipment is not in GraphQL, Algolia, the collection page or the
+    product .json, so every product with a blank Next Shipment needs its page.
+    browser_mode: 'auto' = plain requests first, real browser for pages they
+    can't get; 'always' = browser only; 'never' = plain requests only.
+    Returns the handles that could not be read, by reason. Unread handles
+    stay blank.
     """
     pending = sorted({_col(r, "Handle") for r in rows
                       if _col(r, "Handle") and not _col(r, "Next Shipment")})
     values: Dict[str, str] = {}
-    unparsed: List[str] = []
-    not_attempted: List[str] = []
-    started = time.monotonic()
+    # Final outcome per handle: read / gone / blocked / browser_blocked /
+    # failed / no_record / not_attempted. Later attempts overwrite earlier ones.
+    outcome: Dict[str, str] = {h: "not_attempted" for h in pending}
     total = len(pending)
-    streak = {"blocked": 0}
 
-    def _site_refusing() -> bool:
-        return streak["blocked"] >= PDP_MAX_CONSECUTIVE_BLOCKS
-
-    def _read(handle: str) -> None:
-        page = fetch_product_page(session, handle)
-        if handle in _PDP_THROTTLED:
-            streak["blocked"] += 1
-            if _site_refusing():
-                LOGGER.warning("%s product pages in a row were blocked (%s); "
-                               "not requesting any more this run",
-                               streak["blocked"], _PDP_BLOCK_KIND.get(handle, "blocked"))
-        else:
-            streak["blocked"] = 0
+    def _record(handle: str, page: Optional[str], how: str) -> None:
         if page is None:
+            outcome[handle] = how
             return
         value = parse_next_shipment(page, handle)
         if value is None:
-            if handle not in unparsed:
-                unparsed.append(handle)
+            outcome[handle] = "no_record"
         else:
             values[handle] = value
+            outcome[handle] = "read"
 
-    for i, handle in enumerate(pending, start=1):
-        if _site_refusing():
-            not_attempted.append(handle)
-            continue
-        _read(handle)
-        if i % 10 == 0 or i == total:
+    def _progress(label: str, i: int, n: int, started: float) -> None:
+        if i % 10 == 0 or i == n:
             elapsed = time.monotonic() - started
-            log("PDP %s/%s read (elapsed %s, ETA %s, pace %.1fs)", i, total,
-                _fmt_eta(elapsed), _fmt_eta(elapsed / i * (total - i)), _PACE["interval"])
+            log("%s %s/%s (elapsed %s, ETA %s, pace %.1fs)", label, i, n,
+                _fmt_eta(elapsed), _fmt_eta(elapsed / i * (n - i)), _PACE["interval"])
 
-    # One more try for pages a challenge blocked; the pace has had time to back
-    # off, and challenges often lift. PDP_HANDLE_ATTEMPTS stops a third.
-    # Skipped when the site has been refusing every request: retrying would
-    # just add more blocked requests.
-    if _PDP_THROTTLED and not _site_refusing():
-        retry = sorted(_PDP_THROTTLED)
-        log("Retrying %s blocked PDP(s) once...", len(retry))
-        for handle in retry:
-            if _site_refusing():
+    # Phase 1: plain HTTP requests, stopped once the site is clearly refusing them.
+    if browser_mode != "always":
+        streak = 0
+        started = time.monotonic()
+        for i, handle in enumerate(pending, start=1):
+            page = fetch_product_page(session, handle)
+            if handle in _PDP_THROTTLED:
+                _record(handle, None, "blocked")
+                streak += 1
+            else:
+                status = _PDP_STATUS_CACHE.get(handle)
+                _record(handle, page, "gone" if status == 404 else "failed")
+                streak = 0
+            _progress("PDP", i, total, started)
+            if streak >= PDP_MAX_CONSECUTIVE_BLOCKS:
+                LOGGER.warning("%s product pages in a row were blocked (%s); no more "
+                               "plain requests this run", streak,
+                               _PDP_BLOCK_KIND.get(handle, "blocked"))
                 break
-            _read(handle)
+        # Without a browser to fall back on, give blocked pages one more plain try
+        # if the site wasn't refusing everything.
+        if browser_mode == "never" and _PDP_THROTTLED and streak < PDP_MAX_CONSECUTIVE_BLOCKS:
+            retry = sorted(_PDP_THROTTLED)
+            log("Retrying %s blocked PDP(s) once...", len(retry))
+            for handle in retry:
+                page = fetch_product_page(session, handle)
+                if handle not in _PDP_THROTTLED:
+                    _record(handle, page, "gone" if _PDP_STATUS_CACHE.get(handle) == 404
+                            else "failed")
+
+    # Phase 2: real browser for everything plain requests couldn't get.
+    if browser_mode != "never":
+        todo = [h for h in pending
+                if outcome[h] in ("blocked", "not_attempted", "failed")]
+        if todo:
+            log("Opening %s product page(s) in a browser...", len(todo))
+            fetcher = BrowserFetcher(headless=headless)
+            try:
+                streak = 0
+                started = time.monotonic()
+                for i, handle in enumerate(todo, start=1):
+                    result, page = fetcher.fetch(handle)
+                    if fetcher.unavailable_reason:
+                        LOGGER.warning("Browser fallback unavailable: %s", fetcher.unavailable_reason)
+                        break
+                    if result == "read":
+                        _PDP_THROTTLED.discard(handle)
+                        _PDP_COUNTS["browser_read"] += 1
+                        _record(handle, page, "read")
+                        streak = 0
+                    else:
+                        _record(handle, None, {"blocked": "browser_blocked"}.get(result, result))
+                        streak = streak + 1 if result == "blocked" else 0
+                    _progress("Browser PDP", i, len(todo), started)
+                    if streak >= PDP_MAX_CONSECUTIVE_BLOCKS:
+                        LOGGER.warning("Cloudflare kept blocking the browser too (%s pages in "
+                                       "a row); giving up on product pages this run", streak)
+                        break
+            finally:
+                fetcher.close()
 
     for row in rows:
         handle = _col(row, "Handle")
         if handle in values:
             _set(row, "Next Shipment", values[handle])
 
-    return {
-        "blocked": sorted(_PDP_THROTTLED),
-        "not_attempted": sorted(not_attempted),
-        "gone_404": sorted(h for h in pending if _PDP_STATUS_CACHE.get(h) == 404),
-        "failed": sorted(h for h in pending
-                         if h in _PDP_STATUS_CACHE
-                         and _PDP_STATUS_CACHE[h] not in (200, 404)),
-        "no_product_json": sorted(unparsed),
-    }
+    problems: Dict[str, List[str]] = {}
+    for handle, result in outcome.items():
+        if result != "read":
+            problems.setdefault(result, []).append(handle)
+    return {k: sorted(v) for k, v in problems.items()}
 
 
 def report_pdp_run(problems: Dict[str, List[str]]) -> None:
     """End-of-run PDP numbers, with losses reported separately so a degraded
     run doesn't look like a clean one."""
-    log("Product pages read: %s of %s attempted; %s HTTP GETs to /products/ in "
-        "total, %s of them blocked (403/429); final pace %.1fs between requests",
+    log("Product pages read: %s by plain request (%s attempted, %s HTTP GETs, %s "
+        "blocked) + %s in the browser (%s attempted); final pace %.1fs",
         _PDP_COUNTS["pages_read"], _PDP_COUNTS["pdp_pages"], _PDP_COUNTS["http_gets"],
-        _PDP_COUNTS["blocked"], _PACE["interval"])
+        _PDP_COUNTS["blocked"], _PDP_COUNTS["browser_read"],
+        _PDP_COUNTS["browser_pages"], _PACE["interval"])
     kinds = sorted(set(_PDP_BLOCK_KIND.values()))
     if kinds:
-        LOGGER.warning("How the site blocked us: %s", "; ".join(kinds))
+        LOGGER.warning("How the site blocked plain requests: %s", "; ".join(kinds))
     messages = {
-        "blocked": "PDP never read (blocked by the site)",
+        "blocked": "PDP blocked (plain request; browser not used)",
+        "browser_blocked": "PDP blocked even in the browser",
         "not_attempted": "PDP not requested (stopped after repeated blocks)",
-        "gone_404": "PDP returned 404 (product page gone)",
-        "failed": "PDP could not be read (other HTTP error or timeout)",
-        "no_product_json": "PDP read but its product record was not found",
+        "gone": "PDP returned 404 (product page gone)",
+        "failed": "PDP could not be read (other HTTP error, timeout or no browser)",
+        "no_record": "PDP read but its product record was not found",
     }
     for key, message in messages.items():
         if problems.get(key):
@@ -1598,9 +1757,12 @@ def apply_color_inference(rows: List[List[str]]) -> None:
 # ---------------------------------------------------------------------------
 
 class RamyBrookScraper:
-    def __init__(self, pdp_headers: str = "browser") -> None:
+    def __init__(self, pdp_headers: str = "browser", pdp_browser: str = "auto",
+                 pdp_headless: bool = False) -> None:
         self.session = make_session()
         self.pdp_session = make_pdp_session(pdp_headers)
+        self.pdp_browser = pdp_browser
+        self.pdp_headless = pdp_headless
         self.pdp_problems: Dict[str, List[str]] = {}
 
     def build_rows(self) -> List[List[str]]:
@@ -1822,7 +1984,8 @@ class RamyBrookScraper:
             raise ScrapeError("No rows generated")
 
         log("Fetching Next Shipment from product pages...")
-        self.pdp_problems = fill_next_shipment(self.pdp_session, rows)
+        self.pdp_problems = fill_next_shipment(self.pdp_session, rows,
+                                               self.pdp_browser, self.pdp_headless)
 
         # Post-processing
         log("Post-processing: petite inseam rule...")
@@ -1874,6 +2037,13 @@ def parse_args() -> argparse.Namespace:
                         default="browser",
                         help="headers sent to product pages (default browser); "
                              "run ramybrook_pdp_probe.py to see which the site accepts")
+    parser.add_argument("--pdp-browser", choices=["auto", "always", "never"], default="auto",
+                        help="auto (default): plain requests first, a real browser "
+                             "(Playwright) for pages the site blocks; always: browser "
+                             "only; never: plain requests only")
+    parser.add_argument("--pdp-headless", action="store_true",
+                        help="run the fallback browser without a visible window "
+                             "(Cloudflare blocks hidden browsers more often)")
     return parser.parse_args()
 
 
@@ -1881,8 +2051,10 @@ def main() -> None:
     args = parse_args()
     _PACE["interval"] = _PACE["floor"] = max(0.0, args.pdp_interval)
     try:
-        log("PDP headers: %s; PDP interval floor: %.1fs", args.pdp_headers, _PACE["floor"])
-        RamyBrookScraper(args.pdp_headers).run()
+        log("PDP headers: %s; browser fallback: %s%s; PDP interval floor: %.1fs",
+            args.pdp_headers, args.pdp_browser, " (headless)" if args.pdp_headless else "",
+            _PACE["floor"])
+        RamyBrookScraper(args.pdp_headers, args.pdp_browser, args.pdp_headless).run()
     except ScrapeError as exc:
         LOGGER.error("Ramy Brook scrape FAILED — no CSV written: %s", exc)
         raise SystemExit(f"ERROR: Ramy Brook scrape failed, no CSV written: {exc}")
