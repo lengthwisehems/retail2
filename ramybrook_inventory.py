@@ -2,6 +2,7 @@
 """Ramy Brook inventory scraper — Storefront GraphQL + Algolia + Swym + PDP."""
 from __future__ import annotations
 
+import argparse
 import csv
 import html
 import json
@@ -12,6 +13,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 import urllib3
@@ -31,8 +33,9 @@ GRAPHQL_TOKENS = [
     "bccb7998f634f1518fd6959f60d8e60c",
     "78e4e572d236efcd96d9d3a6853f27c1",
 ]
+# Product pages are only ever fetched from www: the other hosts share its rate
+# limiter, so rotating between them would not get around a block.
 PDP_HOST      = "https://www.ramybrook.com"
-HOST_ROTATION = ["https://www.ramybrook.com", "https://ramybrook-ocm-dev.myshopify.com"]
 COLLECTION_HANDLE = "jeans"
 
 ALGOLIA_APP_ID    = "A3H9DJFT2H"
@@ -56,8 +59,43 @@ INSTORE_LOCATIONS = ["31061344320", "31223316544", "60898017344", "64122552384"]
 ONLINE_LOCATION   = "30839832640"
 INCOMING_LOCATION = "60935602240"
 
-PDP_RETRIES    = 3
-PDP_RETRY_DELAY = 2.0
+# Product-page (PDP) fetching. Next Shipment is only published on the PDP, so
+# every product page is read once per run. Most Shopify sites sit behind
+# Cloudflare, where a 429 is usually a bot challenge that waiting won't clear.
+# So the pace is global and adapts both ways, waits are capped, and each
+# handle gets at most two tries in the whole run. Same approach as
+# Goodamerican_inventory.py.
+PDP_MIN_INTERVAL    = 0.5   # floor: seconds between any two /products/ requests
+PDP_MAX_INTERVAL    = 6.0   # ceiling once challenges have forced the pace down
+PDP_INTERVAL_STEP   = 0.75  # added to the interval after each 429
+PDP_INTERVAL_DECAY  = 0.9   # multiplier applied after each clean response
+PDP_429_MAX_WAIT    = 15.0  # cap: a challenge outlasts any wait worth making
+PDP_HANDLE_ATTEMPTS = 2     # fetch attempts per handle across the whole run
+PDP_GET_RETRIES     = 2     # GETs per attempt (one retry after a 429)
+PDP_429_SLEEP       = 5.0   # wait after a 429 with no usable Retry-After
+
+# A real Chrome never sends a User-Agent without the rest of these; a lone
+# User-Agent is a well-known trigger for Cloudflare's managed challenge.
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/122.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": ('"Chromium";v="122", "Not(A:Brand";v="24", '
+                  '"Google Chrome";v="122"'),
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
 SLEEP = 0.3
 
 BASE_DIR   = Path(__file__).resolve().parent
@@ -69,7 +107,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # CSV headers
 # ---------------------------------------------------------------------------
 CSV_HEADERS = [
-    "Style Id", "Handle", "Published At", "Created At",
+    "Style Id", "Handle", "Published At", "Created At", "Updated At",
     "Product", "Style Name", "Product Type", "Tags", "Vendor",
     "Description", "Variant Title", "Color", "Size",
     "Rise", "Inseam", "Leg Opening",
@@ -220,13 +258,25 @@ def clean_description(raw: str) -> str:
 
 
 def format_date(value: Optional[str]) -> str:
+    """ISO timestamp -> 'MM/DD/YYYY' (zero-padded, date as Shopify states it)."""
     if not value:
         return ""
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return value
-    return f"{dt.month}/{dt.day}/{dt.year}"
+    return dt.strftime("%m/%d/%Y")
+
+
+def format_datetime_central(value: Optional[str]) -> str:
+    """ISO timestamp -> 'MM/DD/YYYY HH:MM:SS' (24-hour) in US Central time."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    return dt.astimezone(CENTRAL_TZ).strftime("%m/%d/%Y %H:%M:%S")
 
 
 def format_price(value) -> str:
@@ -728,25 +778,242 @@ def _reformat_shipment_date(raw: str) -> str:
     return raw
 
 
-def fetch_next_shipment(session: requests.Session, handle: str) -> str:
-    url = f"{PDP_HOST}/products/{handle}"
-    for attempt in range(PDP_RETRIES):
+# ---------------------------------------------------------------------------
+# Product page (PDP) fetching
+# ---------------------------------------------------------------------------
+
+_PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
+# Status per handle, so a missing page (404) can be told apart from a failed
+# request. Only an exact 404 means the product is gone.
+_PDP_STATUS_CACHE: Dict[str, Optional[int]] = {}
+# Handles whose PDP was blocked (429). Deliberately kept out of the caches so a
+# later pass can retry, and reported at the end so a run that lost data says so.
+_PDP_THROTTLED: Set[str] = set()
+# Fetch attempts per handle, so a page the challenge keeps blocking costs two
+# attempts rather than being re-requested indefinitely.
+_PDP_ATTEMPTS: Dict[str, int] = {}
+_PDP_COUNTS: Dict[str, int] = {"pdp_pages": 0, "http_gets": 0, "rate_limited": 0}
+# "floor" is what clean responses decay back to; --pdp-interval sets it.
+_PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "floor": PDP_MIN_INTERVAL, "last": 0.0}
+
+
+def make_pdp_session() -> requests.Session:
+    """Session for www product pages: browser headers, no automatic retries.
+
+    The shared session's urllib3 Retry would silently retry 429s and honour any
+    Retry-After in full, which is exactly what a bot challenge punishes. Here
+    _get_with_backoff handles 429s itself.
+    """
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    return session
+
+
+def _pace_pdp_request() -> None:
+    """Hold every /products/ request to the current global interval."""
+    wait = _PACE["last"] + _PACE["interval"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
+
+
+def _is_bot_challenge(response) -> bool:
+    """True for Cloudflare's interstitial rather than a real rate limit."""
+    return "Verifying your connection" in (response.text or "")[:2000]
+
+
+def _get_with_backoff(session: requests.Session, url: str, **kwargs):
+    """Paced GET. On a 429: slow the global pace, wait (capped), retry once.
+
+    The pace adapts in both directions -- clean responses decay it back toward
+    the floor -- so one bad patch does not slow the rest of the run.
+    """
+    response = None
+    for attempt in range(PDP_GET_RETRIES):
+        _pace_pdp_request()
+        _PDP_COUNTS["http_gets"] += 1
+        response = session.get(url, timeout=30, **kwargs)
+        if response.status_code != 429:
+            _PACE["interval"] = max(_PACE["floor"],
+                                    _PACE["interval"] * PDP_INTERVAL_DECAY)
+            return response
+        _PDP_COUNTS["rate_limited"] += 1
+        _PACE["interval"] = min(max(PDP_MAX_INTERVAL, _PACE["floor"]),
+                                _PACE["interval"] + PDP_INTERVAL_STEP)
+        if attempt + 1 >= PDP_GET_RETRIES:
+            break
+        retry_after = response.headers.get("Retry-After", "").strip()
+        wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
+                else PDP_429_SLEEP * (attempt + 1))
+        # Retry-After assumes a rate limit the server will forgive; a challenge
+        # is not forgiven on a timer, so a long wait only slows the run.
+        wait = min(wait, PDP_429_MAX_WAIT)
+        LOGGER.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
+                       "Bot challenge (429)" if _is_bot_challenge(response)
+                       else "Rate limited (429)", url, wait, _PACE["interval"])
+        time.sleep(wait)
+    return response
+
+
+def fetch_product_page(session: requests.Session, handle: str) -> Optional[str]:
+    """The PDP HTML, fetched once per handle and shared by every lookup.
+
+    Returns None when the page could not be read; check _PDP_STATUS_CACHE /
+    _PDP_THROTTLED for why. A 429 is never cached as "missing".
+    """
+    if handle in _PDP_PAGE_CACHE:
+        return _PDP_PAGE_CACHE[handle]
+    if _PDP_ATTEMPTS.get(handle, 0) >= PDP_HANDLE_ATTEMPTS:
+        return None
+    _PDP_ATTEMPTS[handle] = _PDP_ATTEMPTS.get(handle, 0) + 1
+    page: Optional[str] = None
+    status: Optional[int] = None
+    try:
+        _PDP_COUNTS["pdp_pages"] += 1
+        response = _get_with_backoff(session, f"{PDP_HOST}/products/{handle}")
+        status = response.status_code
+        if status == 200:
+            page = response.text
+        else:
+            LOGGER.warning("PDP HTTP %s for %s", status, handle)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("PDP fetch failed for %s: %s", handle, exc)
+    if status == 429:
+        _PDP_THROTTLED.add(handle)
+        return None
+    _PDP_THROTTLED.discard(handle)
+    _PDP_PAGE_CACHE[handle] = page
+    _PDP_STATUS_CACHE[handle] = status
+    return page
+
+
+def pdp_is_missing(session: requests.Session, handle: str) -> bool:
+    """True only when the PDP genuinely 404s -- never for a failed request."""
+    fetch_product_page(session, handle)
+    return _PDP_STATUS_CACHE.get(handle) == 404
+
+
+_MAIN_PRODUCT_JSON_RE = re.compile(
+    r'<script[^>]*data-product-main-product-json[^>]*>(.*?)</script>', re.S)
+
+
+def pdp_main_product(page: str, handle: str) -> Optional[Dict]:
+    """The page's own product record, or None if it can't be found.
+
+    The page also embeds other products (the 'cross_sell' list inside this
+    same record, plus recommendation blocks), each with its own
+    nextIncomingDate. So read the top-level record and check its handle,
+    never the first match anywhere on the page.
+    """
+    candidates: List[Dict] = []
+    m = _MAIN_PRODUCT_JSON_RE.search(page)
+    if m:
         try:
-            resp = session.get(url, timeout=30, verify=False)
-            if resp.status_code != 200:
-                if attempt < PDP_RETRIES - 1:
-                    time.sleep(PDP_RETRY_DELAY * (attempt + 1))
-                continue
-            m = re.search(r'"nextIncomingDate"\s*:\s*"([^"]+)"', resp.text)
-            if m:
-                return _reformat_shipment_date(m.group(1))
-            return ""
-        except Exception as exc:
-            LOGGER.warning("next_shipment fetch failed for %s (attempt %s): %s",
-                           handle, attempt + 1, exc)
-            if attempt < PDP_RETRIES - 1:
-                time.sleep(PDP_RETRY_DELAY * (attempt + 1))
-    return ""
+            candidates.append(json.loads(m.group(1)))
+        except ValueError:
+            pass
+    # Fallback: the theme also assigns the same record to window.BARREL.product
+    pos = page.find("window.BARREL.product")
+    if pos != -1:
+        brace = page.find("{", pos)
+        if brace != -1:
+            try:
+                candidates.append(json.JSONDecoder().raw_decode(page, brace)[0])
+            except ValueError:
+                pass
+    for data in candidates:
+        if isinstance(data, dict) and data.get("handle") == handle:
+            return data
+    return None
+
+
+def parse_next_shipment(page: str, handle: str) -> Optional[str]:
+    """Formatted Next Shipment ('' when the product has none), or None when
+    the page's product record could not be read."""
+    product = pdp_main_product(page, handle)
+    if product is None:
+        return None
+    raw = product.get("nextIncomingDate")
+    return _reformat_shipment_date(str(raw)) if raw else ""
+
+
+def _fmt_eta(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict[str, List[str]]:
+    """Read Next Shipment off each product's PDP and write it onto its rows.
+
+    Next Shipment is not in GraphQL or Algolia, so every product with a blank
+    Next Shipment needs its page. Returns the handles that could not be read,
+    by reason, for the end-of-run report. Unread handles stay blank.
+    """
+    pending = sorted({_col(r, "Handle") for r in rows
+                      if _col(r, "Handle") and not _col(r, "Next Shipment")})
+    values: Dict[str, str] = {}
+    unparsed: List[str] = []
+    started = time.monotonic()
+    total = len(pending)
+
+    def _read(handle: str) -> None:
+        page = fetch_product_page(session, handle)
+        if page is None:
+            return
+        value = parse_next_shipment(page, handle)
+        if value is None:
+            if handle not in unparsed:
+                unparsed.append(handle)
+        else:
+            values[handle] = value
+
+    for i, handle in enumerate(pending, start=1):
+        _read(handle)
+        if i % 10 == 0 or i == total:
+            elapsed = time.monotonic() - started
+            log("PDP %s/%s read (elapsed %s, ETA %s, pace %.1fs)", i, total,
+                _fmt_eta(elapsed), _fmt_eta(elapsed / i * (total - i)), _PACE["interval"])
+
+    # One more try for pages a challenge blocked; the pace has had time to back
+    # off, and challenges often lift. PDP_HANDLE_ATTEMPTS stops a third.
+    if _PDP_THROTTLED:
+        retry = sorted(_PDP_THROTTLED)
+        log("Retrying %s blocked PDP(s) once...", len(retry))
+        for handle in retry:
+            _read(handle)
+
+    for row in rows:
+        handle = _col(row, "Handle")
+        if handle in values:
+            _set(row, "Next Shipment", values[handle])
+
+    return {
+        "blocked": sorted(_PDP_THROTTLED),
+        "gone_404": sorted(h for h in pending if _PDP_STATUS_CACHE.get(h) == 404),
+        "failed": sorted(h for h in pending
+                         if h in _PDP_STATUS_CACHE
+                         and _PDP_STATUS_CACHE[h] not in (200, 404)),
+        "no_product_json": sorted(unparsed),
+    }
+
+
+def report_pdp_run(problems: Dict[str, List[str]]) -> None:
+    """End-of-run PDP numbers, with losses reported separately so a degraded
+    run doesn't look like a clean one."""
+    log("Product pages downloaded: %s; %s HTTP GETs to /products/ in total, "
+        "%s of them rate-limited; final pace %.1fs between requests",
+        _PDP_COUNTS["pdp_pages"], _PDP_COUNTS["http_gets"],
+        _PDP_COUNTS["rate_limited"], _PACE["interval"])
+    messages = {
+        "blocked": "PDP never read (blocked by the bot challenge); Next Shipment left blank",
+        "gone_404": "PDP returned 404 (product page gone); Next Shipment left blank",
+        "failed": "PDP could not be read (error/timeout); Next Shipment left blank",
+        "no_product_json": "PDP read but its product record was not found; Next Shipment left blank",
+    }
+    for key, message in messages.items():
+        if problems.get(key):
+            LOGGER.warning("%s for %s handle(s): %s", message, len(problems[key]),
+                           ", ".join(problems[key]))
 
 # ---------------------------------------------------------------------------
 # HTTP session
@@ -780,6 +1047,7 @@ query RamyBrookProducts($cursor: String) {
         handle
         title
         createdAt
+        updatedAt
         publishedAt
         productType
         tags
@@ -1265,13 +1533,8 @@ def apply_color_inference(rows: List[List[str]]) -> None:
 class RamyBrookScraper:
     def __init__(self) -> None:
         self.session = make_session()
-        self._next_shipment_cache: Dict[str, str] = {}
-
-    def _next_shipment(self, handle: str) -> str:
-        if handle not in self._next_shipment_cache:
-            self._next_shipment_cache[handle] = fetch_next_shipment(self.session, handle)
-            time.sleep(SLEEP)
-        return self._next_shipment_cache[handle]
+        self.pdp_session = make_pdp_session()
+        self.pdp_problems: Dict[str, List[str]] = {}
 
     def build_rows(self) -> List[List[str]]:
         rows: List[List[str]] = []
@@ -1296,7 +1559,7 @@ class RamyBrookScraper:
         log("Fetching Swym wishlist counts...")
         wishlist_map = fetch_swym_wishlist_map(self.session, products)
 
-        log("Building rows and fetching Next Shipment from PDPs...")
+        log("Building rows...")
         seen_skus: Set[str] = set()
         algolia_qty_variants = 0   # Quantity Available filled from Algolia
         missing_qty_variants = 0   # no quantity from GraphQL or Algolia
@@ -1310,7 +1573,8 @@ class RamyBrookScraper:
             title        = product.get("title") or ""
             published_at = format_date(product.get("publishedAt"))
             created_at   = format_date(product.get("createdAt"))
-            tags         = product.get("tags") or []
+            updated_at   = format_datetime_central(product.get("updatedAt"))
+            tags        = product.get("tags") or []
             tags_str     = join_tags(tags)
             vendor       = product.get("vendor") or ""
             product_type = product.get("productType") or ""
@@ -1330,7 +1594,7 @@ class RamyBrookScraper:
             # (collected per-variant below; we use the first hit found for the product)
             algolia_cats: List[str] = []
 
-            next_shipment = self._next_shipment(handle)
+            next_shipment = ""   # filled from the PDP by fill_next_shipment()
 
             variants = (product.get("variants") or {}).get("nodes") or []
             if not variants:
@@ -1407,6 +1671,7 @@ class RamyBrookScraper:
                 _set(row, "Handle",              handle)
                 _set(row, "Published At",        published_at)
                 _set(row, "Created At",          created_at)
+                _set(row, "Updated At",          updated_at)
                 _title = title.replace("Boot Cut", "Bootcut")
                 if " | " in _title:
                     _set(row, "Product", _title.replace(" | ", " - "))
@@ -1489,6 +1754,9 @@ class RamyBrookScraper:
         if not rows:
             raise ScrapeError("No rows generated")
 
+        log("Fetching Next Shipment from product pages...")
+        self.pdp_problems = fill_next_shipment(self.pdp_session, rows)
+
         # Post-processing
         log("Post-processing: petite inseam rule...")
         apply_petite_inseam_rule(rows)
@@ -1521,13 +1789,26 @@ class RamyBrookScraper:
     def run(self) -> Path:
         log("=== Ramy Brook inventory run started ===")
         rows = self.build_rows()
+        report_pdp_run(self.pdp_problems)
         path = self.write_csv(rows)
         log("=== Run complete: %s ===", path)
         print(f"Done — {path}")
         return path
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ramy Brook jeans inventory scraper.")
+    # How readily the site challenges depends on the IP, so the pace is
+    # tunable: raise it if the log shows 429s, lower it if it never does.
+    parser.add_argument("--pdp-interval", type=float, default=PDP_MIN_INTERVAL,
+                        help="seconds between product-page requests "
+                             f"(default {PDP_MIN_INTERVAL})")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    _PACE["interval"] = _PACE["floor"] = max(0.0, args.pdp_interval)
     try:
         RamyBrookScraper().run()
     except ScrapeError as exc:
