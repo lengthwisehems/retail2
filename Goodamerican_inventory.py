@@ -23,6 +23,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 BRAND = "GOODAMERICAN"
 LOG_PATH = BASE_DIR / f"{BRAND.lower()}_run.log"
 
+# Cloudflare blocks with 403 as readily as 429, so both mean "blocked, unknown"
+# rather than an answer. Handling only 429 loses every 403 page silently: the
+# handle gets cached as unreadable and never reaches the end-of-run report.
+BLOCKED_STATUSES = frozenset({429, 403})
+
 HOST_ROTATION = [
     "checkout.goodamerican.com",
     "good-american.myshopify.com",
@@ -532,16 +537,19 @@ CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 
 def parse_datetime_central(value: Optional[str]) -> str:
-    """ISO timestamp -> 'M/D/YYYY H:MM:SS AM/PM' in US Central time."""
+    """ISO timestamp -> 'MM/DD/YYYY HH:MM:SS' in US Central time.
+
+    24-hour and zero-padded, matching the database's datetime format. The
+    clock stays Central because that is the timezone every other captured
+    timestamp is recorded in.
+    """
     if not value:
         return ""
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return ""
-    local = dt.astimezone(CENTRAL_TZ)
-    return (f"{local.month}/{local.day}/{local.year} "
-            f"{local.strftime('%I:%M:%S %p').lstrip('0')}")
+    return dt.astimezone(CENTRAL_TZ).strftime("%m/%d/%Y %H:%M:%S")
 
 
 def parse_date(value: Optional[str]) -> str:
@@ -555,10 +563,21 @@ def parse_date(value: Optional[str]) -> str:
 
 
 def format_month_day_year(value: datetime) -> str:
+    """MM/DD/YYYY, zero-padded, which is the format the database stores."""
+    return value.strftime("%m/%d/%Y")
+
+
+def format_price(value) -> str:
+    """Shopify's raw amount -> '$158.00', the format the database stores.
+
+    A blank stays blank: an absent compareAtPrice is not a price of zero.
+    """
+    if value in (None, ""):
+        return ""
     try:
-        return value.strftime("%-m/%-d/%Y")
-    except ValueError:
-        return value.strftime("%#m/%#d/%Y")
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def extract_gid_suffix(gid: Optional[str]) -> str:
@@ -585,7 +604,7 @@ def request_with_retry(
             json=payload,
             timeout=30,
         )
-        if response.status_code in {429, 500, 502, 503, 504}:
+        if response.status_code in BLOCKED_STATUSES | {500, 502, 503, 504}:
             sleep_for = 2 ** attempt
             logging.warning("Retrying %s %s (status %s)", method, url, response.status_code)
             time.sleep(sleep_for)
@@ -956,7 +975,7 @@ def determine_jean_style(title: str, description: str) -> str:
     elif any(word in desc_norm for word in ["barrel", "bowed", "bow leg", "horseshoe"]):
         style = "Barrel"
     elif "slim straight" in title_norm or "slim straight" in desc_norm:
-        style = "Straight From Knee"
+        style = "Straight from Knee"
     elif "straight" in title_norm or "straight" in desc_norm:
         style = "Straight"
 
@@ -982,7 +1001,7 @@ def determine_jean_style(title: str, description: str) -> str:
         "straight jeans flatter every curve",
     ]
     if style in {"", "Straight"} and any(phrase in desc_norm for phrase in knee_phrases):
-        style = "Straight From Knee"
+        style = "Straight from Knee"
 
     thigh_phrases = [
         "loose straight legs",
@@ -994,12 +1013,12 @@ def determine_jean_style(title: str, description: str) -> str:
         "we took everything khloe loves about our denim",
     ]
     if style in {"", "Straight"} and any(phrase in desc_norm for phrase in thigh_phrases):
-        style = "Straight From Thigh"
+        style = "Straight from Thigh"
     if style in {"", "Straight"} and "relaxed fit" in desc_norm and "straight" in desc_norm:
-        style = "Straight From Thigh"
+        style = "Straight from Thigh"
 
     if style in {"", "Straight"} and "straight" in title_norm and "relax" in title_norm:
-        style = "Straight From Thigh"
+        style = "Straight from Thigh"
     if style in {"", "Straight"} and "wide" in desc_norm:
         style = "Wide Leg"
 
@@ -1756,9 +1775,9 @@ def compute_naming(product_title: str, jean_style_first_word: str = "",
 # ---------------------------------------------------------------------------
 # Jean Style
 # ---------------------------------------------------------------------------
-NON_TAPER_STYLES = {"Straight From Knee/Thigh", "Bootcut", "Wide Leg",
-                    "Boyfriend", "Baggy", "Flare", "Straight From Thigh"}
-TAPER_STYLES = {"Taper", "Tapered", "Skinny", "Barrel", "Straight From Knee"}
+NON_TAPER_STYLES = {"Straight from Knee/Thigh", "Bootcut", "Wide Leg",
+                    "Boyfriend", "Baggy", "Flare", "Straight from Thigh"}
+TAPER_STYLES = {"Taper", "Tapered", "Skinny", "Barrel", "Straight from Knee"}
 
 
 def _kn(value: str) -> str:
@@ -1786,20 +1805,20 @@ def jean_style_from_title(title: str) -> str:
     if has("tapered", "relaxed skinny") or " mom " in t:
         return "Tapered"
     if has("good icon"):
-        return "Straight From Knee/Thigh"
+        return "Straight from Knee/Thigh"
     if (has("cigarette", "slim straight", "soft stretch ponte", "good boy")
             or (has("compression") and has("straight"))
             or (has("curve") and has("straight"))):
-        return "Straight From Knee"
+        return "Straight from Knee"
     if has("good icon", "good true straight", "vintage straight"):
-        return "Straight From Knee/Thigh"
+        return "Straight from Knee/Thigh"
     if has("good 90", "oversized straight", "relaxed straight",
            "standard straight", "the khloe"):
-        return "Straight From Thigh"
+        return "Straight from Thigh"
     if has("baggy"):
         return "Baggy"
     if has("straight"):
-        return "Straight From Knee"
+        return "Straight from Knee"
     return ""
 
 
@@ -1807,7 +1826,7 @@ def jean_style_from_title_and_desc(title: str, description: str) -> str:
     t, d = _kn(title), _kn(description)
     if "straight" in t and any(k in d for k in
                                ("slim straight", "slim, straight", "curve")):
-        return "Straight From Knee"
+        return "Straight from Knee"
     return ""
 
 
@@ -1824,9 +1843,9 @@ def jean_style_from_desc(description: str) -> str:
     if has("relaxed wide legs", "wide relaxed legs", "wide leg", "wide legs"):
         return "Wide Leg"
     if has("vintage inspired straight legs"):
-        return "Straight From Knee"
+        return "Straight from Knee"
     if (has("relaxed") and has("straight")) or has("straight leg from thigh"):
-        return "Straight From Thigh"
+        return "Straight from Thigh"
     if has("baggy"):
         return "Baggy"
     if has("taper", "tapering", "tapered"):
@@ -2477,8 +2496,8 @@ def fetch_product_page(session, handle: str) -> Optional[str]:
             logging.warning("PDP HTTP %s for %s", status, handle)
     except Exception as exc:  # noqa: BLE001
         logging.warning("PDP fetch failed for %s: %s", handle, exc)
-    if status == 429:
-        # Deliberately not cached. A throttled page is not a missing one, and
+    if status in BLOCKED_STATUSES:
+        # Deliberately not cached. A blocked page is not a missing one, and
         # caching the empty result would lose the handle for the whole run even
         # after the pacer has backed off far enough to read it.
         _PDP_THROTTLED.add(handle)
@@ -2516,7 +2535,7 @@ def _get_with_backoff(session, url, **kwargs):
         _pace_pdp_request()
         _REQUEST_COUNTS["http_gets"] += 1
         response = session.get(url, timeout=30, **kwargs)
-        if response.status_code != 429:
+        if response.status_code not in BLOCKED_STATUSES:
             _PACE["interval"] = max(PDP_MIN_INTERVAL,
                                     _PACE["interval"] * PDP_INTERVAL_DECAY)
             return response
@@ -2534,7 +2553,8 @@ def _get_with_backoff(session, url, **kwargs):
         # nothing but a slower run.
         wait = min(wait, PDP_429_MAX_WAIT)
         logging.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
-                        "Bot challenge (429)" if challenge else "Rate limited (429)",
+                        f"Bot challenge ({response.status_code})" if challenge
+                        else f"Blocked ({response.status_code})",
                         url, wait, _PACE["interval"])
         time.sleep(wait)
     return response
@@ -2628,7 +2648,7 @@ def fetch_size_guide_inseam(session, handle: str, product_title: str) -> str:
                                      allow_redirects=True)
         if response.status_code != 200:
             logging.warning("Size guide HTTP %s for %s", response.status_code, handle)
-            if response.status_code != 429:
+            if response.status_code not in BLOCKED_STATUSES:
                 _SIZE_GUIDE_CACHE[handle] = ""
             return ""
 
@@ -3045,8 +3065,9 @@ def build_rows(
                 "Color": color_value,
                 "Size": size_value,
                 "Inseam": inseam_value,
-                "Price": (variant.get("price") or {}).get("amount", ""),
-                "Compare at Price": (variant.get("compareAtPrice") or {}).get("amount", ""),
+                "Price": format_price((variant.get("price") or {}).get("amount", "")),
+                "Compare at Price": format_price(
+                    (variant.get("compareAtPrice") or {}).get("amount", "")),
                 "Promo": extract_promo(tags),
                 "Available for Sale": str(variant.get("availableForSale", "")),
                 "Quantity Available": str(variant.get("quantityAvailable", "")),
