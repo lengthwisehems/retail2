@@ -61,18 +61,25 @@ INCOMING_LOCATION = "60935602240"
 
 # Product-page (PDP) fetching. Next Shipment is only published on the PDP, so
 # every product page is read once per run. Most Shopify sites sit behind
-# Cloudflare, where a 429 is usually a bot challenge that waiting won't clear.
-# So the pace is global and adapts both ways, waits are capped, and each
-# handle gets at most two tries in the whole run. Same approach as
-# Goodamerican_inventory.py.
+# Cloudflare, where a block comes back as a 403 or 429 bot challenge that
+# waiting won't clear. So the pace is global and adapts both ways, waits are
+# capped, each handle gets at most two tries in the whole run, and the phase
+# stops once the site is clearly refusing us. Same approach as
+# Goodamerican_inventory.py, plus 403 handling and the consecutive-block stop.
 PDP_MIN_INTERVAL    = 0.5   # floor: seconds between any two /products/ requests
-PDP_MAX_INTERVAL    = 6.0   # ceiling once challenges have forced the pace down
-PDP_INTERVAL_STEP   = 0.75  # added to the interval after each 429
+PDP_MAX_INTERVAL    = 6.0   # ceiling once blocks have forced the pace down
+PDP_INTERVAL_STEP   = 0.75  # added to the interval after each block
 PDP_INTERVAL_DECAY  = 0.9   # multiplier applied after each clean response
-PDP_429_MAX_WAIT    = 15.0  # cap: a challenge outlasts any wait worth making
+PDP_BLOCK_MAX_WAIT  = 15.0  # cap: a challenge outlasts any wait worth making
 PDP_HANDLE_ATTEMPTS = 2     # fetch attempts per handle across the whole run
-PDP_GET_RETRIES     = 2     # GETs per attempt (one retry after a 429)
-PDP_429_SLEEP       = 5.0   # wait after a 429 with no usable Retry-After
+PDP_GET_RETRIES     = 2     # GETs per attempt (one retry after a block)
+PDP_BLOCK_SLEEP     = 5.0   # wait after a block with no usable Retry-After
+# Ramy Brook's Cloudflare answers a blocked request with 403 as well as 429.
+PDP_BLOCK_STATUSES  = (403, 429)
+# After this many pages in a row are blocked, stop requesting product pages for
+# the rest of the run: retrying a site that is refusing us only makes the
+# block worse and turns a one-minute run into ten. Remaining pages are reported.
+PDP_MAX_CONSECUTIVE_BLOCKS = 5
 
 # A real Chrome never sends a User-Agent without the rest of these; a lone
 # User-Agent is a well-known trigger for Cloudflare's managed challenge.
@@ -93,6 +100,16 @@ BROWSER_HEADERS = {
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
 }
+
+# What the scraper sent before the ground-rules rewrite: a User-Agent only.
+MINIMAL_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+}
+# Chosen with --pdp-headers. Which one a site's bot protection accepts depends
+# on the machine making the request; ramybrook_pdp_probe.py tests both.
+PDP_HEADER_PROFILES = {"browser": BROWSER_HEADERS, "minimal": MINIMAL_HEADERS}
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 
@@ -786,26 +803,30 @@ _PDP_PAGE_CACHE: Dict[str, Optional[str]] = {}
 # Status per handle, so a missing page (404) can be told apart from a failed
 # request. Only an exact 404 means the product is gone.
 _PDP_STATUS_CACHE: Dict[str, Optional[int]] = {}
-# Handles whose PDP was blocked (429). Deliberately kept out of the caches so a
-# later pass can retry, and reported at the end so a run that lost data says so.
+# Handles whose PDP was blocked (403/429). Deliberately kept out of the caches
+# so a later pass can retry, and reported at the end so a run that lost data
+# says so.
 _PDP_THROTTLED: Set[str] = set()
+# Kind of block seen per handle (e.g. "HTTP 403, Cloudflare challenge"), so the
+# log says *how* the site refused, not just that it did.
+_PDP_BLOCK_KIND: Dict[str, str] = {}
 # Fetch attempts per handle, so a page the challenge keeps blocking costs two
 # attempts rather than being re-requested indefinitely.
 _PDP_ATTEMPTS: Dict[str, int] = {}
-_PDP_COUNTS: Dict[str, int] = {"pdp_pages": 0, "http_gets": 0, "rate_limited": 0}
+_PDP_COUNTS: Dict[str, int] = {"pdp_pages": 0, "pages_read": 0, "http_gets": 0, "blocked": 0}
 # "floor" is what clean responses decay back to; --pdp-interval sets it.
 _PACE: Dict[str, float] = {"interval": PDP_MIN_INTERVAL, "floor": PDP_MIN_INTERVAL, "last": 0.0}
 
 
-def make_pdp_session() -> requests.Session:
+def make_pdp_session(profile: str = "browser") -> requests.Session:
     """Session for www product pages: browser headers, no automatic retries.
 
     The shared session's urllib3 Retry would silently retry 429s and honour any
     Retry-After in full, which is exactly what a bot challenge punishes. Here
-    _get_with_backoff handles 429s itself.
+    _get_with_backoff handles blocks itself.
     """
     session = requests.Session()
-    session.headers.update(BROWSER_HEADERS)
+    session.headers.update(PDP_HEADER_PROFILES[profile])
     return session
 
 
@@ -817,13 +838,29 @@ def _pace_pdp_request() -> None:
     _PACE["last"] = time.monotonic()
 
 
-def _is_bot_challenge(response) -> bool:
-    """True for Cloudflare's interstitial rather than a real rate limit."""
-    return "Verifying your connection" in (response.text or "")[:2000]
+def describe_block(response) -> str:
+    """Short description of how the site refused a request, for the log."""
+    headers = {k.lower(): v for k, v in (response.headers or {}).items()}
+    body = (response.text or "")[:5000]
+    if headers.get("cf-mitigated"):
+        kind = f"Cloudflare {headers['cf-mitigated']}"
+    elif "Verifying your connection" in body:
+        kind = "Shopify bot check (Verifying your connection)"
+    elif "Just a moment" in body or "challenge-platform" in body:
+        kind = "Cloudflare challenge page"
+    else:
+        title = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
+        if title:
+            title_text = re.sub(r"\s+", " ", title.group(1)).strip()[:60]
+            kind = f"page titled '{title_text}'"
+        else:
+            kind = f"{len(response.text or '')}-byte response"
+    return f"HTTP {response.status_code}, {kind}"
 
 
 def _get_with_backoff(session: requests.Session, url: str, **kwargs):
-    """Paced GET. On a 429: slow the global pace, wait (capped), retry once.
+    """Paced GET. On a block (403/429): slow the global pace, wait (capped),
+    retry once.
 
     The pace adapts in both directions -- clean responses decay it back toward
     the floor -- so one bad patch does not slow the rest of the run.
@@ -833,24 +870,24 @@ def _get_with_backoff(session: requests.Session, url: str, **kwargs):
         _pace_pdp_request()
         _PDP_COUNTS["http_gets"] += 1
         response = session.get(url, timeout=30, **kwargs)
-        if response.status_code != 429:
+        if response.status_code not in PDP_BLOCK_STATUSES:
             _PACE["interval"] = max(_PACE["floor"],
                                     _PACE["interval"] * PDP_INTERVAL_DECAY)
             return response
-        _PDP_COUNTS["rate_limited"] += 1
+        _PDP_COUNTS["blocked"] += 1
         _PACE["interval"] = min(max(PDP_MAX_INTERVAL, _PACE["floor"]),
                                 _PACE["interval"] + PDP_INTERVAL_STEP)
         if attempt + 1 >= PDP_GET_RETRIES:
             break
         retry_after = response.headers.get("Retry-After", "").strip()
         wait = (float(retry_after) if retry_after.replace(".", "", 1).isdigit()
-                else PDP_429_SLEEP * (attempt + 1))
+                else PDP_BLOCK_SLEEP * (attempt + 1))
         # Retry-After assumes a rate limit the server will forgive; a challenge
         # is not forgiven on a timer, so a long wait only slows the run.
-        wait = min(wait, PDP_429_MAX_WAIT)
-        LOGGER.warning("%s on %s; waiting %.1fs (pace now %.1fs)",
-                       "Bot challenge (429)" if _is_bot_challenge(response)
-                       else "Rate limited (429)", url, wait, _PACE["interval"])
+        wait = min(wait, PDP_BLOCK_MAX_WAIT)
+        LOGGER.warning("Blocked (%s) on %s; waiting %.1fs then retrying once "
+                       "(pace now %.1fs)", describe_block(response), url, wait,
+                       _PACE["interval"])
         time.sleep(wait)
     return response
 
@@ -859,7 +896,7 @@ def fetch_product_page(session: requests.Session, handle: str) -> Optional[str]:
     """The PDP HTML, fetched once per handle and shared by every lookup.
 
     Returns None when the page could not be read; check _PDP_STATUS_CACHE /
-    _PDP_THROTTLED for why. A 429 is never cached as "missing".
+    _PDP_THROTTLED for why. A block (403/429) is never cached as "missing".
     """
     if handle in _PDP_PAGE_CACHE:
         return _PDP_PAGE_CACHE[handle]
@@ -874,14 +911,19 @@ def fetch_product_page(session: requests.Session, handle: str) -> Optional[str]:
         status = response.status_code
         if status == 200:
             page = response.text
+            _PDP_COUNTS["pages_read"] += 1
+        elif status in PDP_BLOCK_STATUSES:
+            _PDP_BLOCK_KIND[handle] = describe_block(response)
+            LOGGER.warning("PDP blocked for %s (%s)", handle, _PDP_BLOCK_KIND[handle])
         else:
             LOGGER.warning("PDP HTTP %s for %s", status, handle)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("PDP fetch failed for %s: %s", handle, exc)
-    if status == 429:
+    if status in PDP_BLOCK_STATUSES:
         _PDP_THROTTLED.add(handle)
         return None
     _PDP_THROTTLED.discard(handle)
+    _PDP_BLOCK_KIND.pop(handle, None)
     _PDP_PAGE_CACHE[handle] = page
     _PDP_STATUS_CACHE[handle] = status
     return page
@@ -953,11 +995,24 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict
                       if _col(r, "Handle") and not _col(r, "Next Shipment")})
     values: Dict[str, str] = {}
     unparsed: List[str] = []
+    not_attempted: List[str] = []
     started = time.monotonic()
     total = len(pending)
+    streak = {"blocked": 0}
+
+    def _site_refusing() -> bool:
+        return streak["blocked"] >= PDP_MAX_CONSECUTIVE_BLOCKS
 
     def _read(handle: str) -> None:
         page = fetch_product_page(session, handle)
+        if handle in _PDP_THROTTLED:
+            streak["blocked"] += 1
+            if _site_refusing():
+                LOGGER.warning("%s product pages in a row were blocked (%s); "
+                               "not requesting any more this run",
+                               streak["blocked"], _PDP_BLOCK_KIND.get(handle, "blocked"))
+        else:
+            streak["blocked"] = 0
         if page is None:
             return
         value = parse_next_shipment(page, handle)
@@ -968,6 +1023,9 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict
             values[handle] = value
 
     for i, handle in enumerate(pending, start=1):
+        if _site_refusing():
+            not_attempted.append(handle)
+            continue
         _read(handle)
         if i % 10 == 0 or i == total:
             elapsed = time.monotonic() - started
@@ -976,10 +1034,14 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict
 
     # One more try for pages a challenge blocked; the pace has had time to back
     # off, and challenges often lift. PDP_HANDLE_ATTEMPTS stops a third.
-    if _PDP_THROTTLED:
+    # Skipped when the site has been refusing every request: retrying would
+    # just add more blocked requests.
+    if _PDP_THROTTLED and not _site_refusing():
         retry = sorted(_PDP_THROTTLED)
         log("Retrying %s blocked PDP(s) once...", len(retry))
         for handle in retry:
+            if _site_refusing():
+                break
             _read(handle)
 
     for row in rows:
@@ -989,6 +1051,7 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict
 
     return {
         "blocked": sorted(_PDP_THROTTLED),
+        "not_attempted": sorted(not_attempted),
         "gone_404": sorted(h for h in pending if _PDP_STATUS_CACHE.get(h) == 404),
         "failed": sorted(h for h in pending
                          if h in _PDP_STATUS_CACHE
@@ -1000,20 +1063,24 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]]) -> Dict
 def report_pdp_run(problems: Dict[str, List[str]]) -> None:
     """End-of-run PDP numbers, with losses reported separately so a degraded
     run doesn't look like a clean one."""
-    log("Product pages downloaded: %s; %s HTTP GETs to /products/ in total, "
-        "%s of them rate-limited; final pace %.1fs between requests",
-        _PDP_COUNTS["pdp_pages"], _PDP_COUNTS["http_gets"],
-        _PDP_COUNTS["rate_limited"], _PACE["interval"])
+    log("Product pages read: %s of %s attempted; %s HTTP GETs to /products/ in "
+        "total, %s of them blocked (403/429); final pace %.1fs between requests",
+        _PDP_COUNTS["pages_read"], _PDP_COUNTS["pdp_pages"], _PDP_COUNTS["http_gets"],
+        _PDP_COUNTS["blocked"], _PACE["interval"])
+    kinds = sorted(set(_PDP_BLOCK_KIND.values()))
+    if kinds:
+        LOGGER.warning("How the site blocked us: %s", "; ".join(kinds))
     messages = {
-        "blocked": "PDP never read (blocked by the bot challenge); Next Shipment left blank",
-        "gone_404": "PDP returned 404 (product page gone); Next Shipment left blank",
-        "failed": "PDP could not be read (error/timeout); Next Shipment left blank",
-        "no_product_json": "PDP read but its product record was not found; Next Shipment left blank",
+        "blocked": "PDP never read (blocked by the site)",
+        "not_attempted": "PDP not requested (stopped after repeated blocks)",
+        "gone_404": "PDP returned 404 (product page gone)",
+        "failed": "PDP could not be read (other HTTP error or timeout)",
+        "no_product_json": "PDP read but its product record was not found",
     }
     for key, message in messages.items():
         if problems.get(key):
-            LOGGER.warning("%s for %s handle(s): %s", message, len(problems[key]),
-                           ", ".join(problems[key]))
+            LOGGER.warning("%s; Next Shipment left blank for %s handle(s): %s",
+                           message, len(problems[key]), ", ".join(problems[key]))
 
 # ---------------------------------------------------------------------------
 # HTTP session
@@ -1531,9 +1598,9 @@ def apply_color_inference(rows: List[List[str]]) -> None:
 # ---------------------------------------------------------------------------
 
 class RamyBrookScraper:
-    def __init__(self) -> None:
+    def __init__(self, pdp_headers: str = "browser") -> None:
         self.session = make_session()
-        self.pdp_session = make_pdp_session()
+        self.pdp_session = make_pdp_session(pdp_headers)
         self.pdp_problems: Dict[str, List[str]] = {}
 
     def build_rows(self) -> List[List[str]]:
@@ -1803,6 +1870,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pdp-interval", type=float, default=PDP_MIN_INTERVAL,
                         help="seconds between product-page requests "
                              f"(default {PDP_MIN_INTERVAL})")
+    parser.add_argument("--pdp-headers", choices=sorted(PDP_HEADER_PROFILES),
+                        default="browser",
+                        help="headers sent to product pages (default browser); "
+                             "run ramybrook_pdp_probe.py to see which the site accepts")
     return parser.parse_args()
 
 
@@ -1810,7 +1881,8 @@ def main() -> None:
     args = parse_args()
     _PACE["interval"] = _PACE["floor"] = max(0.0, args.pdp_interval)
     try:
-        RamyBrookScraper().run()
+        log("PDP headers: %s; PDP interval floor: %.1fs", args.pdp_headers, _PACE["floor"])
+        RamyBrookScraper(args.pdp_headers).run()
     except ScrapeError as exc:
         LOGGER.error("Ramy Brook scrape FAILED — no CSV written: %s", exc)
         raise SystemExit(f"ERROR: Ramy Brook scrape failed, no CSV written: {exc}")
