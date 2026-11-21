@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWar
 # Configuration
 # ---------------------------------------------------------------------------
 GRAPHQL_URL   = "https://ramybrook-ocm-dev.myshopify.com/api/unstable/graphql.json"
-GRAPHQL_TOKEN = "1784dfa5ea23575f610283cb6f728bba"
+GRAPHQL_TOKEN = "78e4e572d236efcd96d9d3a6853f27c1"
 PDP_HOST      = "https://www.ramybrook.com"
 HOST_ROTATION = ["https://www.ramybrook.com", "https://ramybrook-ocm-dev.myshopify.com"]
 COLLECTION_HANDLE = "jeans"
