@@ -93,6 +93,10 @@ itself. A scraper does not emit those.
 Four name fields do four different jobs. Confusing them is the most common source of bad
 data.
 
+This section says **what** each field means. `NAME_GENERATION.md` says **how** one gets
+built: what has to be settled before naming can start, which steps have to run more than
+once, and the order the passes have to run in.
+
 ## The separator
 
 **The separator varies by brand.** The brand instructions say what it should be, and it
@@ -279,8 +283,31 @@ the run. That is why the database treats Multi as sticky.
 |quantities|plain integers, no separators: `123`, `3425`|
 |quotes and dashes|straight ASCII only - replace curly quotes and en/em dashes|
 |accents|strip them (`KHLOÉ` -> `KHLOE`)|
+|hyphens **in a title**|replace with a space (`SOFT-TECH` -> `SOFT TECH`). See below|
+|compound fit words|collapse the two-word spelling (`Boot Cut` -> `Bootcut`). See below|
 |whitespace|collapse runs of spaces; strip leading/trailing; no non-breaking spaces|
 |sizes|**always text, never numeric.** `00` must not become `0`; both are real sizes|
+
+## Light cleaning of the title
+
+The brand's own title needs a light clean **before any keyword matching**, or the matching
+quietly misses. Two cases beyond the usual quotes/accents/whitespace:
+
+- **Hyphens become spaces.** A hyphen is a word separator in brand titles, and keyword
+  tables are written with spaces, so an un-normalised hyphen silently misses *every* match.
+- **Compound fit words collapse to one word**: `Boot Cut` -> `Bootcut`. Brands are
+  inconsistent; the database and the keyword tables use the one-word form.
+
+**Clean the title text, not every field.** Do not run a hyphen replacement over the
+composed output or over the other segment values - **sizes legitimately contain hyphens**,
+where the hyphen is a range, not a word separator (`00-4`, `6-12`, `14-18 PLUS`). Replacing
+it there invents sizes that do not exist.
+
+Do not work around a two-word spelling by adding a bare one-word keyword
+(`Boot` -> `Bootcut`) instead of collapsing it. That gets Jean Style right and corrupts
+both name fields, because the stranded second word has nothing to remove it:
+`GOOD CLASSIC BOOT CUT JEANS` yields a Style Name of `GOOD CLASSIC CUT BOOTCUT` and a
+Product of `GOOD CLASSIC BOOTCUT CUT JEANS`. `NAME_GENERATION.md` §0.4 has the detail.
 
 ## Brackets
 
