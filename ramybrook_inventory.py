@@ -1043,7 +1043,14 @@ class BrowserFetcher:
             return False
         try:
             self._pw = sync_playwright().start()
-            args = ["--disable-blink-features=AutomationControlled"]
+            # Images are switched off inside Chrome itself. Do NOT use
+            # context.route() to block them: that hands every request the page
+            # makes back to Python, and under a Cloudflare challenge (which fires
+            # bursts of requests and reloads) the sync handlers nest inside one
+            # another until Python runs out of memory (MemoryError in
+            # Route.continue_). A 400-request burst nested 263 handlers deep.
+            args = ["--disable-blink-features=AutomationControlled",
+                    "--blink-settings=imagesEnabled=false"]
             launch_error = None
             # A real installed Chrome passes Cloudflare's check more readily than
             # Playwright's bundled Chromium, so try it first.
@@ -1066,10 +1073,6 @@ class BrowserFetcher:
             context = self._browser.new_context(**context_kwargs)
             context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-            # Images, video and fonts aren't needed to read the product record.
-            context.route("**/*", lambda route: route.abort()
-                          if route.request.resource_type in ("image", "media", "font")
-                          else route.continue_())
             self._page = context.new_page()
             log("Browser fallback started (%s, %s)", self._browser.version,
                 "headless" if self.headless else "visible window")
@@ -1115,7 +1118,11 @@ class BrowserFetcher:
                                         _PACE["interval"] + PDP_INTERVAL_STEP)
                 return ("blocked" if challenged or status in PDP_BLOCK_STATUSES
                         else "failed"), None
-            self._page.wait_for_timeout(1000)
+            try:
+                self._page.wait_for_timeout(1000)
+            except Exception as exc:  # noqa: BLE001 -- browser died; don't take the run with it
+                LOGGER.warning("Browser stopped responding on %s: %s", handle, exc)
+                return "failed", None
 
     def close(self) -> None:
         for closer in (lambda: self._browser and self._browser.close(),
@@ -1220,11 +1227,13 @@ def fill_next_shipment(session: requests.Session, rows: List[List[str]],
                         streak = 0
                     else:
                         _record(handle, None, {"blocked": "browser_blocked"}.get(result, result))
-                        streak = streak + 1 if result == "blocked" else 0
+                        # A 404 is a real answer; a block or an error is not.
+                        streak = 0 if result == "gone" else streak + 1
                     _progress("Browser PDP", i, len(todo), started)
                     if streak >= PDP_MAX_CONSECUTIVE_BLOCKS:
-                        LOGGER.warning("Cloudflare kept blocking the browser too (%s pages in "
-                                       "a row); giving up on product pages this run", streak)
+                        LOGGER.warning("The browser could not read %s product pages in a row "
+                                       "(blocked or erroring); giving up on product pages "
+                                       "this run", streak)
                         break
             finally:
                 fetcher.close()
