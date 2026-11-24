@@ -108,7 +108,7 @@ MINIMAL_HEADERS = {
                    "Chrome/124.0.0.0 Safari/537.36"),
 }
 # Chosen with --pdp-headers. Which one a site's bot protection accepts depends
-# on the machine making the request; ramybrook_pdp_probe.py tests both.
+# on the machine making the request.
 PDP_HEADER_PROFILES = {"browser": BROWSER_HEADERS, "minimal": MINIMAL_HEADERS}
 
 CENTRAL_TZ = ZoneInfo("America/Chicago")
@@ -125,7 +125,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 CSV_HEADERS = [
     "Style Id", "Handle", "Published At", "Created At", "Updated At",
-    "Product", "Style Name", "Product Type", "Tags", "Vendor",
+    "Product", "Product Title Alt", "Style Name", "Product Type", "Tags", "Vendor",
     "Description", "Variant Title", "Color", "Size",
     "Rise", "Inseam", "Leg Opening",
     "Price", "Compare at Price", "Available for Sale",
@@ -140,7 +140,7 @@ CSV_HEADERS = [
     "Next Shipment",
     "SKU - Shopify", "SKU - Brand", "Barcode",
     "Image URL", "SKU URL",
-    "Jean Style", "Inseam Label", "Inseam Style", "Rise Label",
+    "Jean Style", "Inseam Label", "Inseam Label Multi", "Inseam Style", "Rise Label",
     "Color - Simplified", "Color - Standardized",
 ]
 
@@ -483,6 +483,8 @@ def extract_color_size(selected_options: List[Dict]) -> Tuple[str, str]:
 # Style Name derivation
 # ---------------------------------------------------------------------------
 
+# Old Style Name rules, replaced by the naming section below. Kept only because
+# backfill_ramybrook_style_info.py still calls it.
 def derive_style_name_base(product_title: str) -> str:
     """Step 1: strip pipe/color suffixes. Step 2: remove styling words."""
     text = (product_title or "")
@@ -976,8 +978,30 @@ def parse_next_shipment(page: str, handle: str) -> Optional[str]:
     product = pdp_main_product(page, handle)
     if product is None:
         return None
+    _remember_fit(handle, product)
     raw = product.get("nextIncomingDate")
     return _reformat_shipment_date(str(raw)) if raw else ""
+
+
+# The PDP's length switcher ("Choose a fit": Regular / Petite / Tall). The
+# buttons are drawn by JavaScript from the product record's "fit" object, so
+# it is read from there: configured=false with no products means the style is
+# sold in one length only. Captured from the same page fetch as Next Shipment.
+_PDP_FIT: Dict[str, Dict] = {}
+FIT_LABEL_TO_LENGTH = {"petite": "Petite", "regular": "Regular", "tall": "Long", "long": "Long"}
+
+
+def _remember_fit(handle: str, product: Dict) -> None:
+    fit = product.get("fit") or {}
+    siblings = []
+    for other in fit.get("products") or []:
+        if isinstance(other, dict) and other.get("handle"):
+            siblings.append((other["handle"], str(other.get("fitLabel") or "")))
+    _PDP_FIT[handle] = {
+        "configured": bool(fit.get("configured")),
+        "current": str(fit.get("label") or fit.get("current") or ""),
+        "siblings": siblings,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1133,7 @@ def _fmt_eta(seconds: float) -> str:
 
 
 def fill_next_shipment(session: requests.Session, rows: List[List[str]],
-                       browser_mode: str = "auto", headless: bool = False) -> Dict[str, List[str]]:
+                       browser_mode: str = "auto", headless: bool = True) -> Dict[str, List[str]]:
     """Read Next Shipment off each product's PDP and write it onto its rows.
 
     Next Shipment is not in GraphQL, Algolia, the collection page or the
@@ -1280,7 +1304,6 @@ query RamyBrookProducts($cursor: String) {
         vendor
         description
         onlineStoreUrl
-        totalInventory
         featuredImage { url }
         variants(first: 250) {
           nodes {
@@ -1389,68 +1412,77 @@ def fetch_graphql_products(session: requests.Session) -> List[Dict]:
 # Algolia — fetch all variants (distinct=false) for the jeans collection
 # ---------------------------------------------------------------------------
 
-def fetch_algolia_variant_map(session: requests.Session) -> Dict[str, Dict]:
-    """Return map: variant Shopify ID (str) → Algolia hit.
+ALGOLIA_HITS_PER_PAGE = 1000   # Algolia's maximum; the jeans collection fits in one page
+ALGOLIA_FETCH_ATTEMPTS = 3
 
-    Queries all pages of the jeans collection (distinct=false so every
-    variant record is returned).  Rotates through ALGOLIA_HOSTS for each
-    page request.
+
+def _algolia_fetch_all(session: requests.Session, host: str, headers: Dict) -> Tuple[List[Dict], int]:
+    """Every hit of the jeans collection from ONE host, plus Algolia's nbHits.
+
+    One page where possible: results paged across requests (worse, across
+    replicas) can shift between requests as records update, so some hits fall
+    between pages and others repeat -- a run once lost 30 of 755 variants.
     """
-    by_id: Dict[str, Dict] = {}
+    import urllib.parse
+    hits: List[Dict] = []
     page = 0
+    nb_hits = 0
+    while True:
+        params = "&".join([
+            "distinct=false",
+            f"hitsPerPage={ALGOLIA_HITS_PER_PAGE}",
+            f"page={page}",
+            f"filters={urllib.parse.quote(ALGOLIA_COLLECTION_FILTER)}",
+        ])
+        resp = session.post(host, headers=headers, json={"params": params}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        nb_hits = int(data.get("nbHits") or 0)
+        hits.extend(data.get("hits", []))
+        page += 1
+        if page >= int(data.get("nbPages") or 1) or not data.get("hits"):
+            return hits, nb_hits
+        time.sleep(SLEEP)
+
+
+def fetch_algolia_variant_map(session: requests.Session) -> Dict[str, Dict]:
+    """Return map: variant Shopify ID / product ID / SKU (str) -> Algolia hit.
+
+    All variant records of the jeans collection (distinct=false). Tries the
+    hosts in turn until one returns as many unique records as Algolia says
+    exist; if none does, uses the most complete result and warns.
+    """
     headers = {
         "X-Algolia-Application-Id": ALGOLIA_APP_ID,
         "X-Algolia-API-Key": ALGOLIA_API_KEY,
         "Content-Type": "application/json",
     }
-    import urllib.parse
-    while True:
-        params = "&".join([
-            "distinct=false",
-            "hitsPerPage=200",
-            f"page={page}",
-            f"filters={urllib.parse.quote(ALGOLIA_COLLECTION_FILTER)}",
-        ])
-        url = ALGOLIA_HOSTS[page % len(ALGOLIA_HOSTS)]
+    best: List[Dict] = []
+    best_total = 0
+    for attempt in range(ALGOLIA_FETCH_ATTEMPTS):
+        host = ALGOLIA_HOSTS[attempt % len(ALGOLIA_HOSTS)]
         try:
-            resp = session.post(url, headers=headers,
-                                json={"params": params}, timeout=30)
-            resp.raise_for_status()
-        except Exception as exc:
-            LOGGER.warning("Algolia page %s (%s) failed: %s", page, url, exc)
-            # Try remaining hosts before giving up on this page
-            succeeded = False
-            for fallback in ALGOLIA_HOSTS:
-                if fallback == url:
-                    continue
-                try:
-                    resp = session.post(fallback, headers=headers,
-                                        json={"params": params}, timeout=30)
-                    resp.raise_for_status()
-                    succeeded = True
-                    break
-                except Exception:
-                    pass
-            if not succeeded:
-                break
-        data = resp.json()
-        hits = data.get("hits", [])
-        if not hits:
+            hits, nb_hits = _algolia_fetch_all(session, host, headers)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Algolia fetch from %s failed: %s", host, exc)
+            continue
+        unique = {str(h.get("objectID")): h for h in hits if h.get("objectID") is not None}
+        if len(unique) > len(best):
+            best, best_total = list(unique.values()), nb_hits
+        if nb_hits and len(unique) >= nb_hits:
             break
-        for hit in hits:
-            for key in (
-                str(hit.get("objectID") or ""),
-                str(hit.get("id") or ""),
-                str(hit.get("sku") or ""),
-            ):
-                if key:
-                    by_id[key] = hit
-        nb_pages = data.get("nbPages", 1)
-        page += 1
-        if page >= nb_pages:
-            break
-        time.sleep(SLEEP)
-    log("Algolia variant map: %s entries across %s page(s)", len(by_id), page)
+        LOGGER.warning("Algolia returned %s unique of %s records from %s; retrying",
+                       len(unique), nb_hits, host)
+    if best_total and len(best) < best_total:
+        LOGGER.warning("Algolia map incomplete: %s of %s records", len(best), best_total)
+
+    by_id: Dict[str, Dict] = {}
+    for hit in best:
+        for key in (str(hit.get("objectID") or ""), str(hit.get("id") or ""),
+                    str(hit.get("sku") or "")):
+            if key:
+                by_id[key] = hit
+    log("Algolia variant map: %s records (of %s in the collection)", len(best), best_total)
     return by_id
 
 
@@ -1466,7 +1498,9 @@ def algolia_inventory(hit: Dict) -> Tuple[str, str, str]:
 def algolia_total_quantity(hit: Dict) -> Optional[int]:
     """Instore + Online + Incoming from an Algolia hit, or None if there is no hit.
 
-    Used for 'Quantity Available' when GraphQL returns no quantityAvailable.
+    This is 'Quantity Available', so it always equals the three location
+    columns written from the same hit. (GraphQL's quantityAvailable counts
+    online stock only, so it is used only for a variant Algolia doesn't have.)
     """
     if not hit or not isinstance(hit.get("locations_inventory"), dict):
         return None
@@ -1529,6 +1563,29 @@ def _set(row: List[str], name: str, val: str) -> None:
     row[IDX[name]] = val
 
 
+def apply_quantity_of_style(rows: List[List[str]]) -> None:
+    """Quantity of style = sum of Quantity Available over the rows sharing a
+    Style Id (Ramy Brook's style key: each handle is one style in one inseam).
+
+    Blank or non-numeric counts as 0; negatives stay negative (oversold reduces
+    the total). The group total repeats on every row of the style, so it must
+    never be summed across rows. A row with no Style Id gets blank.
+    """
+    totals: Dict[str, int] = {}
+    for row in rows:
+        sid = _col(row, "Style Id")
+        if not sid:
+            continue
+        try:
+            qty = int(_col(row, "Quantity Available"))
+        except ValueError:
+            qty = 0
+        totals[sid] = totals.get(sid, 0) + qty
+    for row in rows:
+        sid = _col(row, "Style Id")
+        _set(row, "Quantity of style", str(totals[sid]) if sid else "")
+
+
 def apply_petite_inseam_rule(rows: List[List[str]]) -> None:
     """Blank inseam for petite/cropped/ankle/sneaker-length when a normal sibling shares same Style Name + Color + Inseam."""
     PETITE_KEYWORDS = ("petite", "cropped", "crop", "ankle", "sneaker length")
@@ -1548,6 +1605,8 @@ def apply_petite_inseam_rule(rows: List[List[str]]) -> None:
                 _set(r, "Inseam", "")
 
 
+# Old Style Name rules, replaced by the naming section below. Kept only because
+# backfill_ramybrook_style_info.py still calls it.
 def apply_style_name_rules(rows: List[List[str]]) -> None:
     """Rule 1: unify single-word style names by first product word + leg opening.
     Rule 2: one-word → look for sibling or append Jean Style prefix."""
@@ -1753,17 +1812,566 @@ def apply_color_inference(rows: List[List[str]]) -> None:
                 _set(r, "Color - Simplified", best_simp)
 
 # ---------------------------------------------------------------------------
+# Naming: Product Title Alt, Style Name, Variant Title
+# ---------------------------------------------------------------------------
+# Implements RAMY_BROOK_NAME_GENERATION.md (built from the Ramy Brook naming
+# workbook's 'Keyword coding' and 'KEYWORD MAPPING' sheets). Ramy Brook has no
+# Product Line and no Pull-on category. Every name is rebuilt from its parts
+# (NameParts) whenever a part changes, never edited in place.
+
+# Splits the incoming title ("Helena High Rise Flare Jean - Dark Rinse") into
+# name and colour, at the FIRST occurrence only.
+TITLE_SPLIT_SEPARATOR = " - "
+# Joins the segments we compose. Same characters for Ramy Brook, kept separate.
+NAME_SEGMENT_JOINER = " - "
+
+# Keyword tables, in workbook order (labels are joined in this order).
+NAME_ADJECTIVES: List[str] = [
+    "Slim", "Standard", "Extreme", "Relaxed", "Curve", "Kick", "Mini", "True",
+    "Micro", "Oversized", "Low Slung", "Wide",
+]
+NAME_JEAN_STYLE: List[Tuple[str, str]] = [
+    ("Palazzo", "Palazzo"), ("Bootcut", "Bootcut"), ("Cigarette", "Cigarette"),
+    ("Straight Leg", "Straight Leg"), ("Straight", "Straight Leg"),
+    ("Wide Leg", "Wide Leg"), ("Wide", "Wide Leg"),
+    ("Flares", "Flare"), ("Barrel", "Barrel"), ("Baggy", "Baggy"),
+    ("Boot Cut", "Bootcut"), ("Skinny", "Skinny"), ("Boyfriend", "Boyfriend"),
+    ("Loose", "Loose"), ("Parachute", "Parachute"), ("Flare", "Flare"),
+    ("Tapered", "Tapered"), ("Taper", "Tapered"),
+    # Last, so a leftover "Leg" joins after the style word: "Flare Leg"
+    # (Emory High Rise Flare Leg Jean). Inside "Wide Leg"/"Straight Leg" it is
+    # part of the longer match and dropped.
+    ("Leg", "Leg"),
+]
+NAME_INSEAM_LABEL: List[Tuple[str, str]] = [
+    ("Demi Petite", "Petite"), ("Demi", "Petite"), ("Petite", "Petite"), ("Long", "Long"),
+    ("X27 S", "Petite"), ("Petite X27 S", "Petite"), ("Long Inseam", "Long"),
+    ("Regular", "Regular"), ("Extended", "Long"),
+]
+NAME_RISE: List[Tuple[str, str]] = [
+    ("Super High Waist", "Ultra High Rise"), ("Super High-Waist", "Ultra High Rise"),
+    ("Ultra High Waist", "Ultra High Rise"), ("Ultra High-Waist", "Ultra High Rise"),
+    ("Super High Rise", "Ultra High Rise"), ("Super High-Rise", "Ultra High Rise"),
+    ("Super Low Waist", "Ultra Low Rise"), ("Super Low-Waist", "Ultra Low Rise"),
+    ("Ultra High Rise", "Ultra High Rise"), ("Ultra High-Rise", "Ultra High Rise"),
+    ("Ultra Low Waist", "Ultra Low Rise"), ("Ultra Low-Waist", "Ultra Low Rise"),
+    ("Super Low Rise", "Ultra Low Rise"), ("Super Low-Rise", "Ultra Low Rise"),
+    ("Ultra Low Rise", "Ultra Low Rise"), ("Ultra Low-Rise", "Ultra Low Rise"),
+    ("Stacked Waist", "High Rise"), ("High Waisted", "High Rise"),
+    ("High-Waisted", "High Rise"), ("Low Waisted", "Low Rise"), ("Low-Waisted", "Low Rise"),
+    ("Mid Waisted", "Mid Rise"), ("V-High Rise", "High Rise"), ("High Waist", "High Rise"),
+    ("High-Waist", "High Rise"), ("Low Waised", "Low Rise"), ("Super High", "Ultra High Rise"),
+    ("Super Low", "Ultra Low Rise"), ("High Rise", "High Rise"), ("Highrise", "High Rise"),
+    ("High-Rise", "High Rise"), ("Low Waist", "Low Rise"), ("Low-Waist", "Low Rise"),
+    ("Low Rise", "Low Rise"), ("Low-Rise", "Low Rise"), ("Mid Rise", "Mid Rise"),
+    ("Mid-Rise", "Mid Rise"), ("High", "High Rise"), ("Low", "Low Rise"), ("Mid", "Mid Rise"),
+]
+NAME_FABRIC: List[Tuple[str, str]] = [
+    ("Lightweight", "Light Weight"), ("Light Weight", "Light Weight"),
+    ("Heavyweight", "Heavy Weight"), ("Heavy Weight", "Heavy Weight"),
+    ("Middleweight", "Middle Weight"), ("Middle Weight", "Middle Weight"),
+    ("Vapor", "Vapor"), ("Vegan", "Vegan"), ("Faux", "Faux"), ("Coated", "Coated"),
+    ("Wax", "Wax"), ("Selvedge", "Selvage"), ("Selvage", "Selvage"), ("Striped", "Striped"),
+    ("Checkered", "Checkered"), ("Plaid", "Plaid"), ("Flag", "Flag"), ("Crushed", "Crushed"),
+    ("Krushed", "Krushed"), ("Floral Print", "Floral Print"), ("Leopard Print", "Leopard Print"),
+    ("Leopard", "Leopard"), ("Snake Print", "Snake Print"), ("Snake", "Snake"),
+    ("Printed", "Printed"), ("Print", "Print"), ("Flocked Denim", "Flocked Denim"),
+    ("Leather", "Leather"), ("Velvet Denim", "Velvet Denim"), ("Leatherette", "Leatherette"),
+    ("Canvas", "Canvas"), ("Chiffon", "Chiffon"), ("Corduroy", "Corduroy"),
+    ("Crochet", "Crochet"), ("Flannel", "Flannel"), ("Flocked", "Flocked"),
+    ("Lite Linen", "Lite Linen"), ("Linen", "Linen"), ("Linnen", "Linen"), ("Mesh", "Mesh"),
+    ("Wool", "Wool"), ("Ponte", "Ponte"), ("Poplin", "Poplin"), ("Velveteen", "Velveteen"),
+    ("Velvet", "Velvet"), ("Scuba", "Scuba"), ("Silk", "Silk"), ("Stone", "Stone"),
+    ("Lurex", "Lurex"), ("Suede", "Suede"), ("Terry", "Terry"), ("Twill", "Twill"),
+    ("Denim", "Denim"), ("Rinse", "Rinse"), ("Wash", "Wash"),
+]
+NAME_STYLING: List[Tuple[str, str]] = [
+    ("With", "With"), ("W/", "W"), ("W /", "W"), ("W", "W"), ("Stirrup", "Stirrup"),
+    ("Diamond Cut", "Diamond Cut"), ("W Deep V Yoke", "W Deep V Yoke"), ("V Waist", "V Waist"),
+    ("Deep V", "Deep V"), ("Cargo", "Cargo"), ("Embellished", "Embellished"),
+    ("Embroidered", "Embroidered"), ("Shine", "Shine"), ("Shiny", "Shiny"),
+    ("Paneled", "Paneled"), ("Panelled", "Paneled"), ("Panneled", "Paneled"),
+    ("Color Block", "Color Block"), ("Color Blocked", "Color Blocked"),
+    ("Colorblock", "Color Block"), ("Colorblocked", "Color Blocked"), ("Combo", "Combo"),
+    ("Contrast", "Contrast"), ("Panel", "Panel"), ("Smooth Matte", "Smooth Matte"),
+    ("Button Front", "Button Front"), ("Slit Front", "Slit Front"),
+    ("Side Seam Snaps", "Side Seam Snaps"), ("Twisted Outseam", "Twisted Outseam"),
+    ("Belted", "Belted"), ("Drawstring", "Drawstring"), ("Elastic Waist", "Elastic Waist"),
+    ("Pintucked", "Pintucked"), ("Vent", "Vent"), ("Pleated", "Pleated"), ("Darted", "Darted"),
+    ("Stitched", "Stitched"), ("Pleaty", "Pleaty"), ("Seamed", "Seamed"), ("Pressed", "Pressed"),
+    ("Seam", "Seam"), ("Seams", "Seams"), ("Inset", "Inset"), ("Side Zip", "Side Zip"),
+    ("Zip", "Zip"), ("Ripped", "Ripped"), ("Trashed", "Trashed"), ("Patchwork", "Patchwork"),
+    ("Splatter", "Splatter"), ("Reworked", "Reworked"), ("Distressed", "Distressed"),
+    ("Destroyed", "Destroyed"), ("W Knee Slits", "W Knee Slits"), ("W Knee Rips", "W Knee Rips"),
+    ("Exposed", "Exposed"), ("Repair", "Repair"), ("Cut-Out", "Cut Out"), ("Patch", "Patch"),
+    ("Knee", "Knee"), ("Slits", "Slits"), ("Rip", "Rip"), ("Rips", "Rips"),
+    ("Braided", "Braided"), ("Embroidered Floral", "Floral Embroidery"),
+    ("Floral Embroidery", "Floral Embroidery"), ("Floral", "Floral"), ("Lace", "Lace"),
+    ("Beaded", "Beaded"), ("Accent Hardware", "Accent Hardware"), ("Hardware", "Hardware"),
+    ("W/ Stud Detailing", "W/ Stud Detailing"), ("Studded", "Studded"), ("Sequin", "Sequin"),
+    ("Stoned", "Stoned"), ("Pearl", "Pearl"), ("Crystal Stars", "Crystal Stars"),
+    ("Crystal", "Crystal"), ("Krystal", "Krystal"), ("Sparkle", "Sparkle"),
+    ("Diamond", "Diamond"), ("Rhinestone", "Rhinestone"), ("Star", "Star"), ("Stars", "Stars"),
+    ("Fringe", "Fringe"), ("Stripes", "Stripes"), ("Stripe", "Stripe"),
+    ("Embroidery", "Embroidery"), ("Embellishment", "Embellishment"), ("Detail", "Detail"),
+    ("Trimmed", "Trimmed"), ("Trim", "Trim"), ("5-Pocket", "5 Pocket"), ("5 Pocket", "5 Pocket"),
+    ("W Darted Back Pocket", "W Darted Back Pocket"), ("W Darted Back Pkt", "W Darted Back Pkt"),
+    ("Split Pockets", "Split Pockets"), ("Patch Pocket", "Patch Pocket"),
+    ("Welt Pocket", "Welt Pocket"), ("Back Pocket", "Back Pocket"), ("Flap", "Flap"),
+    ("Pocket", "Pocket"), ("W Double Needle Trouser Hem", "W Double Needle Trouser Hem"),
+    ("Frayed Seams", "Frayed Seams"), ("Frayed Seam", "Frayed Seam"),
+    ("W Cuffed Hem", "W Cuffed Hem"), ("Trouser Hem", "Trouser Hem"), ("Chewed", "Chewed"),
+    ("Cutoff", "Cutoff"), ("Fray", "Fray"), ("Rolled Hem", "Rolled Hem"),
+    ("Hover Cuff", "Hover Cuff"), ("Raw Hem", "Raw Hem"), ("Raw", "Raw"), ("Rolled", "Rolled"),
+    ("Slice", "Slice"), ("Slit", "Slit"), ("Spliced", "Spliced"), ("Split", "Split"),
+    ("Step Fray", "Step Fray"), ("Slit Hem", "Slit Hem"), ("Wide Cuff", "Wide Cuff"),
+    ("Wide Hem", "Wide Hem"), ("Cuff", "Cuff"), ("Cuffed", "Cuffed"), ("Hem", "Hem"),
+]
+NAME_INSEAM_STYLE: List[Tuple[str, str]] = [
+    ("Cropped", "Cropped"), ("Ankle", "Ankle"), ("Crop", "Cropped"), ("Full", "Full"),
+    ("Sneaker", "Sneaker"), ("Length", "Length"),
+]
+NAME_TYPE: List[Tuple[str, str]] = [
+    ("Jeans", "Jeans"), ("Pants", "Pants"), ("Pant", "Pants"), ("Jean", "Jeans"),
+]
+# Removed from the name but never added back (MD open question 3).
+NAME_TYPE2: List[Tuple[str, str]] = [
+    ("Leggings", "Leggings"), ("Trousers", "Trousers"), ("Sweatpants", "Sweatpants"),
+    ("Trouser", "Trousers"),
+]
+
+# Length words in a handle, and in a size option ("23P"), for the length segment.
+HANDLE_LENGTH_WORDS = [("petite", "Petite"), ("short", "Petite"), ("long", "Long"),
+                       ("tall", "Long"), ("regular", "Regular")]
+SIZE_LENGTH_SUFFIX = re.compile(r"^\d+(?:\.\d+)?\s*([PTL])$", re.I)
+SIZE_SUFFIX_LENGTH = {"P": "Petite", "T": "Long", "L": "Long"}
+LENGTH_SEGMENT_LABELS = ("Petite", "Long", "Regular")
+OLD_MARKER = "OLD"
+
+
+def _compile_category(pairs: Iterable) -> List[Tuple[int, re.Pattern, str]]:
+    """[(workbook order, whole-word regex, label)]. Keywords and labels are
+    trimmed (several workbook entries carry a trailing space that stood in for
+    a word boundary), hyphens read as spaces (the title's hyphens become
+    spaces in cleaning), and a keyword listed twice is kept once."""
+    compiled: List[Tuple[int, re.Pattern, str]] = []
+    seen: Set[str] = set()
+    for order, pair in enumerate(pairs):
+        keyword, label = (pair, "") if isinstance(pair, str) else pair
+        key = re.sub(r"\s+", " ", keyword.replace("-", " ")).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        pattern = r"\s+".join(re.escape(w) for w in key.split(" "))
+        compiled.append((order, re.compile(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", re.I),
+                         re.sub(r"\s+", " ", label).strip()))
+    return compiled
+
+
+_NAME_CATEGORIES: Dict[str, List[Tuple[int, re.Pattern, str]]] = {
+    "adjective": _compile_category(NAME_ADJECTIVES),
+    "jean_style": _compile_category(NAME_JEAN_STYLE),
+    "inseam_label": _compile_category(NAME_INSEAM_LABEL),
+    "rise": _compile_category(NAME_RISE),
+    "inseam_style": _compile_category(NAME_INSEAM_STYLE),
+    "fabric": _compile_category(NAME_FABRIC),
+    "type": _compile_category(NAME_TYPE),
+    "type2": _compile_category(NAME_TYPE2),
+    "styling": _compile_category(NAME_STYLING),
+}
+
+
+def match_category(name: str, category: str) -> Tuple[str, List[str]]:
+    """(joined label, matched keyword texts) for one category.
+
+    Whole-word, case-insensitive. A match lying inside a longer match of the
+    same category is dropped ("Straight" inside "Straight Leg", "Demi" and
+    "Petite" inside "Demi Petite"). Remaining labels join in workbook keyword
+    order with duplicates removed.
+    """
+    found = []
+    for order, regex, label in _NAME_CATEGORIES[category]:
+        for m in regex.finditer(name):
+            found.append((m.start(), m.end(), order, label, m.group(0)))
+    kept = [f for f in found
+            if not any(o[0] <= f[0] and f[1] <= o[1] and (o[1] - o[0]) > (f[1] - f[0])
+                       for o in found)]
+    labels: List[str] = []
+    for _s, _e, _order, label, _text in sorted(kept, key=lambda f: f[2]):
+        if label and label.lower() not in (x.lower() for x in labels):
+            labels.append(label)
+    return " ".join(labels), [f[4] for f in kept]
+
+
+_MOJIBAKE_HINT = re.compile("[ÂÃâ][\u0080-¿‘-›]")
+
+
+def _repair_mojibake(text: str) -> str:
+    if not _MOJIBAKE_HINT.search(text):
+        return text
+    for codec in ("cp1252", "latin-1"):
+        try:
+            return text.encode(codec).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
+
+
+def _clean_name_part(part: str) -> str:
+    """Cleaning for one side of the split title (MD 0.3), after the split."""
+    import unicodedata
+    text = part.replace("–", " ").replace("—", " ")
+    text = text.replace("-", " ")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\bboot\s*cut\b", "Bootcut", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_and_clean_title(title: str) -> Optional[Tuple[str, str]]:
+    """(name part, colour) from the incoming title, or None when it has no
+    ' - ' to split on (the row is then flagged REVIEW and not named)."""
+    text = _repair_mojibake(title or "")
+    for bad in ("﻿", "​", "‌", "‍", "⁠"):
+        text = text.replace(bad, "")
+    text = text.replace(" ", " ")
+    text = (text.replace("“", '"').replace("”", '"')
+                .replace("‘", "'").replace("’", "'"))
+    # Split first, so the separator itself never turns into a space.
+    if TITLE_SPLIT_SEPARATOR not in text:
+        return None
+    name, colour = text.split(TITLE_SPLIT_SEPARATOR, 1)
+    return _clean_name_part(name), _clean_name_part(colour)
+
+
+_TITLE_CASE_WORD = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+
+def title_case(text: str) -> str:
+    """'HERITAGE BROWN' -> 'Heritage Brown'; digits and punctuation untouched."""
+    return _TITLE_CASE_WORD.sub(lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), text)
+
+
+class NameParts:
+    """Everything a row's names are built from. Rebuild, never edit in place."""
+
+    def __init__(self) -> None:
+        self.review = False
+        self.whats_left = ""
+        self.jean_style_label = ""    # from a title keyword ('' if none)
+        self.jean_style_slot = ""     # label, else the resolved Jean Style
+        self.rise = self.fabric = self.styling = self.inseam_style = self.type = ""
+        self.title_length = ""        # Inseam Label category label from the title
+        self.colour = ""
+        self.length = ""              # length segment: handle -> size option -> title
+        self.old = False
+
+    def copy(self) -> "NameParts":
+        other = NameParts()
+        other.__dict__.update(self.__dict__)
+        return other
+
+    def pre_title(self) -> str:
+        slots = (self.whats_left, self.jean_style_slot or self.jean_style_label, self.rise,
+                 self.fabric, self.styling, self.inseam_style, self.type)
+        return " ".join(s for s in slots if s)
+
+    def style_name(self) -> str:
+        return " ".join(s for s in (self.whats_left,
+                                    self.jean_style_slot or self.jean_style_label) if s)
+
+    def length_segment(self) -> str:
+        """The length slot; OLD (kept upper case, as a marker) goes here,
+        after the length when there is one, on its own when there isn't."""
+        length = title_case(self.length)
+        return f"{length} {OLD_MARKER}".strip() if self.old else length
+
+    def alt(self) -> str:
+        if self.review:
+            return "REVIEW"
+        segments = [title_case(self.pre_title()), title_case(self.colour), self.length_segment()]
+        return NAME_SEGMENT_JOINER.join(s for s in segments if s)
+
+
+def compute_name_parts(title: str) -> NameParts:
+    """MD section 1, steps 1-2 (and the slots of step 4) for one title."""
+    parts = NameParts()
+    split = split_and_clean_title(title)
+    if split is None:
+        parts.review = True
+        return parts
+    name, parts.colour = split
+    removed_words: Set[str] = set()
+    labels: Dict[str, str] = {}
+    for category in _NAME_CATEGORIES:
+        label, matched = match_category(name, category)
+        labels[category] = label
+        for text in matched:
+            removed_words.update(w.lower() for w in text.split())
+        removed_words.update(w.lower() for w in label.split())
+    parts.whats_left = " ".join(w for w in name.split() if w.lower() not in removed_words)
+    parts.jean_style_label = labels["jean_style"]
+    parts.rise = labels["rise"]
+    parts.fabric = labels["fabric"]
+    parts.styling = labels["styling"]
+    parts.inseam_style = labels["inseam_style"]
+    parts.type = labels["type"]
+    # The Inseam Label category never goes into the name: it is the length segment.
+    parts.title_length = labels["inseam_label"].split(" ")[0] if labels["inseam_label"] else ""
+    return parts
+
+
+def resolve_length_segment(handle: str, size: str, title_length: str) -> str:
+    """Length segment by priority: handle word -> size option -> title keyword."""
+    tokens = (handle or "").lower().split("-")
+    for word, label in HANDLE_LENGTH_WORDS:
+        if word in tokens:
+            return label
+    m = SIZE_LENGTH_SUFFIX.match((size or "").strip())
+    if m:
+        return SIZE_SUFFIX_LENGTH[m.group(1).upper()]
+    return title_length
+
+
+def write_names(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """Rebuild Product Title Alt, Variant Title and Style Name from the parts."""
+    for row in rows:
+        parts = parts_by_sku.get(_col(row, "SKU - Shopify"))
+        if parts is None:
+            continue
+        alt = parts.alt()
+        _set(row, "Product Title Alt", alt)
+        size = _col(row, "Size")
+        _set(row, "Variant Title", NAME_SEGMENT_JOINER.join(p for p in (alt, size) if p))
+        _set(row, "Style Name", "" if parts.review else title_case(parts.style_name()))
+
+
+def finalize_jean_style_slot(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """MD step 3 / 3.2: no Jean Style keyword in the title -> the row's
+    resolved Jean Style, the whole label. Run once the Jean Style ladder has
+    settled."""
+    for row in rows:
+        parts = parts_by_sku.get(_col(row, "SKU - Shopify"))
+        if parts is not None:
+            parts.jean_style_slot = parts.jean_style_label or _col(row, "Jean Style")
+    write_names(rows, parts_by_sku)
+
+
+def apply_jeans_pass(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """MD 3.1: a pre-title with no Type gains 'Jeans' only when that makes it
+    exactly match another row's pre-title (any colour or length)."""
+    pre_titles = {p.pre_title().lower() for p in parts_by_sku.values() if not p.review}
+    changed = 0
+    for parts in parts_by_sku.values():
+        if parts.review or parts.type:
+            continue
+        if f"{parts.pre_title()} Jeans".lower() in pre_titles:
+            parts.type = "Jeans"
+            changed += 1
+    if changed:
+        log("Naming: 'Jeans' added to %s variant(s) to match a sibling's name", changed)
+    write_names(rows, parts_by_sku)
+
+
+def unify_color_within_style(rows: List[List[str]]) -> None:
+    """One Color per Handle + Style Id (mirrors Good American): the most
+    common spelling wins; a tie keeps the first seen, to stay deterministic."""
+    groups: Dict[Tuple[str, str], List[List[str]]] = {}
+    for row in rows:
+        groups.setdefault((_col(row, "Handle"), _col(row, "Style Id")), []).append(row)
+    for members in groups.values():
+        values = [_col(r, "Color") for r in members if _col(r, "Color")]
+        if len(set(values)) < 2:
+            continue
+        counts: Dict[str, int] = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        winner = max(counts, key=lambda v: (counts[v], -values.index(v)))
+        for row in members:
+            _set(row, "Color", winner)
+
+
+def apply_inseam_label_multi(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """Inseam Label Multi, per ground rules section 3 (mirrors Good American).
+
+    Everything starts Single; two rules promote; nothing demotes.
+    1. Title collision: strip the length segment off every alt; a base showing
+       more than one distinct length (a missing one counts) is Multi.
+    2. For rows still Single that carry a length (Petite/Long), read the PDP's
+       length switcher (the product record's 'fit'): any listed sibling makes
+       the whole family Multi, including pages never checked.
+    Then every Multi row with no length gets 'Regular', and the family takes
+    the regular member's name and Style Name.
+    """
+    def sku(row: List[str]) -> str:
+        return _col(row, "SKU - Shopify")
+
+    for row in rows:
+        _set(row, "Inseam Label Multi", "Single")
+
+    by_base: Dict[str, Set[str]] = {}
+    for row in rows:
+        p = parts_by_sku.get(sku(row))
+        if p is None or p.review:
+            continue
+        base = f"{p.pre_title()}|{p.colour}".lower()
+        by_base.setdefault(base, set()).add(p.length)
+    for row in rows:
+        p = parts_by_sku.get(sku(row))
+        if p is not None and not p.review and len(by_base[f"{p.pre_title()}|{p.colour}".lower()]) > 1:
+            _set(row, "Inseam Label Multi", "Multi")
+
+    rows_by_handle: Dict[str, List[List[str]]] = {}
+    for row in rows:
+        rows_by_handle.setdefault(_col(row, "Handle"), []).append(row)
+    pending = sorted({_col(r, "Handle") for r in rows
+                      if _col(r, "Inseam Label Multi") == "Single"
+                      and parts_by_sku.get(sku(r)) is not None
+                      and parts_by_sku[sku(r)].length in ("Petite", "Long")})
+    families: List[List[str]] = []
+    unchecked: List[str] = []
+    for handle in pending:
+        if _col(rows_by_handle[handle][0], "Inseam Label Multi") == "Multi":
+            continue
+        fit = _PDP_FIT.get(handle)
+        if fit is None:
+            unchecked.append(handle)       # page not read: can only miss a Multi
+            continue
+        family = [h for h, _label in fit["siblings"]]
+        if not family:
+            continue                       # empty switcher: one length only
+        family.append(handle)
+        for member in family:
+            for row in rows_by_handle.get(member, []):
+                _set(row, "Inseam Label Multi", "Multi")
+        families.append(family)
+    if unchecked:
+        LOGGER.warning("Multi-inseam: length switcher not read for %s handle(s) (product page "
+                       "not read), so they stay Single: %s", len(unchecked), ", ".join(unchecked))
+
+    # Every multi-inseam style names its length explicitly: the regular member
+    # gets a 'Regular' segment rather than being the unmarked one.
+    for row in rows:
+        p = parts_by_sku.get(sku(row))
+        if p is not None and not p.review and _col(row, "Inseam Label Multi") == "Multi" \
+                and not p.length:
+            p.length = "Regular"
+
+    # The family reads under the regular member's name (its own colour kept).
+    for family in families:
+        regular: Optional[NameParts] = None
+        for member in family:
+            for row in rows_by_handle.get(member, []):
+                p = parts_by_sku.get(sku(row))
+                if p is not None and p.length == "Regular":
+                    regular = p
+                    break
+            if regular:
+                break
+        if regular is None:
+            continue
+        for member in family:
+            for row in rows_by_handle.get(member, []):
+                p = parts_by_sku.get(sku(row))
+                if p is None or p is regular:
+                    continue
+                for attr in ("whats_left", "jean_style_label", "jean_style_slot", "rise",
+                             "fabric", "styling", "inseam_style", "type"):
+                    setattr(p, attr, getattr(regular, attr))
+    write_names(rows, parts_by_sku)
+    log("Multi-inseam: %s of %s variants are Multi (%s families confirmed from product pages)",
+        sum(1 for r in rows if _col(r, "Inseam Label Multi") == "Multi"), len(rows),
+        len(families))
+
+
+def align_inseam_label_to_title(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """Where the alt title states a length, Inseam Label says the same (a stated
+    length beats a measured one), and Inseam Style is recomputed. Rows with no
+    length segment keep the label the four-step order produced."""
+    changed: Dict[Tuple[str, str], int] = {}
+    for row in rows:
+        p = parts_by_sku.get(_col(row, "SKU - Shopify"))
+        if p is None or not p.length:
+            continue
+        label = p.length.split()[0]       # first word, so 'Petite OLD' reads Petite
+        if label != _col(row, "Inseam Label"):
+            key = (_col(row, "Inseam Label") or "(blank)", label)
+            changed[key] = changed.get(key, 0) + 1
+            _set(row, "Inseam Label", label)
+            _set(row, "Inseam Style", derive_inseam_style(
+                _col(row, "Jean Style"), _col(row, "Inseam"), label))
+    for (old, new), count in sorted(changed.items(), key=lambda kv: -kv[1]):
+        log("Inseam Label %s -> %s from the title on %s rows", old, new, count)
+
+
+def apply_duplicate_old_marker(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """Mark the superseded style behind a duplicated Product (mirrors Good
+    American). When two Style Ids share a Product, a fully dead one (nothing
+    for sale, no inventory, product page 404) is marked; otherwise the oldest
+    Created At. OLD goes into Product (they are on sale together, so must stay
+    distinguishable) and into the length slot of the alt and variant titles."""
+    by_product: Dict[str, Dict[str, List[List[str]]]] = {}
+    for row in rows:
+        by_product.setdefault(_col(row, "Product"), {}).setdefault(
+            _col(row, "Style Id"), []).append(row)
+    for product, styles in by_product.items():
+        if len(styles) < 2:
+            continue
+        dead = []
+        for style_id, style_rows in styles.items():
+            for_sale = any(_col(r, "Available for Sale").upper() == "TRUE" for r in style_rows)
+            gone = _PDP_STATUS_CACHE.get(_col(style_rows[0], "Handle")) == 404
+            inventory = 0
+            for r in style_rows:
+                try:
+                    inventory += int(_col(r, "Quantity Available") or 0)
+                except ValueError:
+                    pass
+            if not for_sale and gone and inventory <= 0:
+                dead.append(style_id)
+
+        def created(style_id: str) -> str:
+            raw = _col(styles[style_id][0], "Created At")
+            try:
+                return datetime.strptime(raw, "%m/%d/%Y").isoformat()
+            except ValueError:
+                return raw
+        targets = dead or [min(styles, key=created)]
+        for style_id in targets:
+            for row in styles[style_id]:
+                _set(row, "Product", _insert_old_marker(_col(row, "Product")))
+                p = parts_by_sku.get(_col(row, "SKU - Shopify"))
+                if p is not None:
+                    p.old = True
+        log("OLD marker: %s style(s) share Product '%s'; marked %s", len(styles), product,
+            ", ".join(targets))
+    write_names(rows, parts_by_sku)
+
+
+def _insert_old_marker(product: str) -> str:
+    """'Helena High-Rise Flare Jean - DARK RINSE' -> '... Jean OLD - DARK RINSE'."""
+    if re.search(rf"\b{OLD_MARKER}\b", product):
+        return product
+    if TITLE_SPLIT_SEPARATOR in product:
+        name, rest = product.split(TITLE_SPLIT_SEPARATOR, 1)
+        return f"{name.strip()} {OLD_MARKER}{TITLE_SPLIT_SEPARATOR}{rest.strip()}"
+    return f"{product.strip()} {OLD_MARKER}"
+
+
+# ---------------------------------------------------------------------------
 # Main scraper
 # ---------------------------------------------------------------------------
 
 class RamyBrookScraper:
     def __init__(self, pdp_headers: str = "browser", pdp_browser: str = "auto",
-                 pdp_headless: bool = False) -> None:
+                 pdp_headless: bool = True) -> None:
         self.session = make_session()
         self.pdp_session = make_pdp_session(pdp_headers)
         self.pdp_browser = pdp_browser
         self.pdp_headless = pdp_headless
         self.pdp_problems: Dict[str, List[str]] = {}
+        # Naming parts per variant (SKU - Shopify); names are rebuilt from these.
+        self.name_parts: Dict[str, NameParts] = {}
 
     def build_rows(self) -> List[List[str]]:
         rows: List[List[str]] = []
@@ -1790,9 +2398,9 @@ class RamyBrookScraper:
 
         log("Building rows...")
         seen_skus: Set[str] = set()
-        algolia_qty_variants = 0   # Quantity Available filled from Algolia
-        missing_qty_variants = 0   # no quantity from GraphQL or Algolia
-        algolia_style_totals = 0   # Quantity of style summed from variant rows
+        name_cache: Dict[str, NameParts] = {}
+        graphql_qty_variants = 0   # no Algolia record: online-only GraphQL quantity used
+        missing_qty_variants = 0   # no quantity from Algolia or GraphQL
         for idx, product in enumerate(products, start=1):
             handle = product.get("handle") or ""
             if not handle:
@@ -1807,7 +2415,6 @@ class RamyBrookScraper:
             tags_str     = join_tags(tags)
             vendor       = product.get("vendor") or ""
             product_type = product.get("productType") or ""
-            total_inv    = product.get("totalInventory")
             image_url    = ((product.get("featuredImage") or {}).get("url") or "")
             online_url   = product.get("onlineStoreUrl") or f"{PDP_HOST}/products/{handle}"
             wishlist     = wishlist_map.get(product_id, "")
@@ -1833,7 +2440,6 @@ class RamyBrookScraper:
             jean_style = derive_jean_style(title, desc, leg_opening)
             rise_label = derive_rise_label(title, desc, tags_str)
 
-            product_row_start = len(rows)
             for v in variants:
                 v_id_full   = v.get("id") or ""
                 sku_shopify = v_id_full.replace("gid://shopify/ProductVariant/", "")
@@ -1849,8 +2455,6 @@ class RamyBrookScraper:
                 opts = v.get("selectedOptions") or []
                 color, size = extract_color_size(opts)
 
-                variant_title = (f"{title} / {color} / {size}"
-                                 if (color and size) else title)
 
                 price_obj = v.get("price") or {}
                 price = format_price(
@@ -1866,12 +2470,16 @@ class RamyBrookScraper:
                 alg_hit = (algolia_map.get(sku_shopify)
                            or algolia_map.get(v.get("sku") or "")
                            or {})
-                instore_qty, online_qty, incoming_qty = algolia_inventory(alg_hit)
-                if qty_avail is None:
-                    alg_total = algolia_total_quantity(alg_hit)
-                    if alg_total is not None:
-                        qty_str = str(alg_total)
-                        algolia_qty_variants += 1
+                alg_total = algolia_total_quantity(alg_hit)
+                if alg_total is not None:
+                    instore_qty, online_qty, incoming_qty = algolia_inventory(alg_hit)
+                    qty_str = str(alg_total)
+                else:
+                    # No location breakdown: leave the location columns blank
+                    # rather than writing 0s that look like real stock counts.
+                    instore_qty = online_qty = incoming_qty = ""
+                    if qty_avail is not None:
+                        graphql_qty_variants += 1
                     else:
                         missing_qty_variants += 1
                 roc = alg_hit.get("recently_ordered_count")
@@ -1903,15 +2511,22 @@ class RamyBrookScraper:
                 _set(row, "Updated At",          updated_at)
                 _title = title.replace("Boot Cut", "Bootcut")
                 if " | " in _title:
-                    _set(row, "Product", _title.replace(" | ", " - "))
+                    product_name = _title.replace(" | ", " - ")
                 else:
-                    _set(row, "Product", f"{_title} - {color}" if color else _title)
-                _set(row, "Style Name",          derive_style_name_base(title))
+                    product_name = f"{_title} - {color}" if color else _title
+                _set(row, "Product", product_name)
+                # Naming (RAMY_BROOK_NAME_GENERATION.md). The title-level parts
+                # are computed once per Product; the length is per variant.
+                if product_name not in name_cache:
+                    name_cache[product_name] = compute_name_parts(product_name)
+                parts = name_cache[product_name].copy()
+                parts.length = ("" if parts.review else
+                                resolve_length_segment(handle, size, parts.title_length))
+                self.name_parts[sku_shopify] = parts
                 _set(row, "Product Type",        product_type)
                 _set(row, "Tags",                tags_str)
                 _set(row, "Vendor",              vendor)
                 _set(row, "Description",         desc)
-                _set(row, "Variant Title",       variant_title)
                 _set(row, "Color",               color)
                 _set(row, "Size",                size)
                 _set(row, "Rise",                rise)
@@ -1924,8 +2539,6 @@ class RamyBrookScraper:
                 _set(row, "Quantity Available (Instore Inventory)",  instore_qty)
                 _set(row, "Quantity Available (Online Inventory)",   online_qty)
                 _set(row, "Quantity Available (Incoming Inventory)", incoming_qty)
-                _set(row, "Quantity of style",
-                     str(total_inv) if total_inv is not None else "")
                 _set(row, "Daily Purchases", ga_purchases)
                 alg_updated = alg_hit.get("updated_at") or ""
                 if alg_updated:
@@ -1951,16 +2564,6 @@ class RamyBrookScraper:
                 _set(row, "Color - Standardized", color_std)
                 rows.append(row)
 
-            # No GraphQL totalInventory → sum this style's Quantity Available
-            if total_inv is None:
-                product_rows = rows[product_row_start:]
-                qtys = [_col(r, "Quantity Available") for r in product_rows]
-                if product_rows and all(q != "" for q in qtys):
-                    style_total = str(sum(int(q) for q in qtys))
-                    for r in product_rows:
-                        _set(r, "Quantity of style", style_total)
-                    algolia_style_totals += 1
-
             # Backfill Algolia step-4 Jean Style if still blank after variants loop
             if algolia_cats:
                 for row in rows[-(len(variants)):]:
@@ -1973,13 +2576,14 @@ class RamyBrookScraper:
             if idx % 5 == 0 or idx == len(products):
                 log("Progress: %s/%s products (%s rows)", idx, len(products), len(rows))
 
-        if algolia_qty_variants:
-            LOGGER.warning("Quantity Available from Algolia (Instore+Online+Incoming) for "
-                           "%s/%s variants; Quantity of style summed for %s styles",
-                           algolia_qty_variants, len(rows), algolia_style_totals)
+        if graphql_qty_variants:
+            LOGGER.warning("No Algolia record for %s/%s variants: their Quantity Available "
+                           "is GraphQL's online-only figure and the location columns are blank",
+                           graphql_qty_variants, len(rows))
         if missing_qty_variants:
-            LOGGER.warning("No Quantity Available from GraphQL or Algolia for %s variants",
+            LOGGER.warning("No Quantity Available from Algolia or GraphQL for %s variants",
                            missing_qty_variants)
+        apply_quantity_of_style(rows)
         if not rows:
             raise ScrapeError("No rows generated")
 
@@ -1987,11 +2591,17 @@ class RamyBrookScraper:
         self.pdp_problems = fill_next_shipment(self.pdp_session, rows,
                                                self.pdp_browser, self.pdp_headless)
 
-        # Post-processing
+        # Post-processing. Order matters (RAMY_BROOK_NAME_GENERATION.md section 4):
+        # names first get a preliminary Style Name (WHATS_LEFT + the title's Jean
+        # Style keyword), which the sibling passes group by; the Jean Style slot
+        # is filled only after the Jean Style ladder has settled.
+        review = [p for p, parts in name_cache.items() if parts.review]
+        if review:
+            LOGGER.warning("Naming: %s title(s) have no ' - ' to split name from colour; "
+                           "flagged REVIEW and not named: %s", len(review), "; ".join(review))
+        write_names(rows, self.name_parts)
         log("Post-processing: petite inseam rule...")
         apply_petite_inseam_rule(rows)
-        log("Post-processing: style name rules...")
-        apply_style_name_rules(rows)
         log("Post-processing: Jean Style inference (siblings pass 1)...")
         apply_jean_style_inference(rows)
         log("Post-processing: Jean Style from Algolia tags...")
@@ -2000,10 +2610,19 @@ class RamyBrookScraper:
         apply_jean_style_inference(rows)
         log("Post-processing: Inseam Label/Style refresh...")
         apply_inseam_label_style_refresh(rows)
+        log("Naming: Jean Style slot, Style Name, Product Title Alt...")
+        finalize_jean_style_slot(rows, self.name_parts)
+        apply_jeans_pass(rows, self.name_parts)
+        log("Post-processing: colour unification...")
+        unify_color_within_style(rows)
+        log("Naming: multi-inseam detection...")
+        apply_inseam_label_multi(rows, self.name_parts)
+        align_inseam_label_to_title(rows, self.name_parts)
         log("Post-processing: Rise Label inference...")
         apply_rise_label_inference(rows)
         log("Post-processing: Color inference...")
         apply_color_inference(rows)
+        apply_duplicate_old_marker(rows, self.name_parts)
         return rows
 
     def write_csv(self, rows: List[List[str]]) -> Path:
@@ -2036,14 +2655,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pdp-headers", choices=sorted(PDP_HEADER_PROFILES),
                         default="browser",
                         help="headers sent to product pages (default browser); "
-                             "run ramybrook_pdp_probe.py to see which the site accepts")
+                             "(which one the site accepts depends on the machine)")
     parser.add_argument("--pdp-browser", choices=["auto", "always", "never"], default="auto",
                         help="auto (default): plain requests first, a real browser "
                              "(Playwright) for pages the site blocks; always: browser "
                              "only; never: plain requests only")
-    parser.add_argument("--pdp-headless", action="store_true",
-                        help="run the fallback browser without a visible window "
-                             "(Cloudflare blocks hidden browsers more often)")
+    parser.add_argument("--pdp-show-browser", action="store_true",
+                        help="show the fallback browser window (hidden by default); "
+                             "useful if Cloudflare asks for a 'Verify you are human' click")
     return parser.parse_args()
 
 
@@ -2052,9 +2671,11 @@ def main() -> None:
     _PACE["interval"] = _PACE["floor"] = max(0.0, args.pdp_interval)
     try:
         log("PDP headers: %s; browser fallback: %s%s; PDP interval floor: %.1fs",
-            args.pdp_headers, args.pdp_browser, " (headless)" if args.pdp_headless else "",
+            args.pdp_headers, args.pdp_browser,
+            " (visible window)" if args.pdp_show_browser else " (hidden)",
             _PACE["floor"])
-        RamyBrookScraper(args.pdp_headers, args.pdp_browser, args.pdp_headless).run()
+        RamyBrookScraper(args.pdp_headers, args.pdp_browser,
+                         pdp_headless=not args.pdp_show_browser).run()
     except ScrapeError as exc:
         LOGGER.error("Ramy Brook scrape FAILED — no CSV written: %s", exc)
         raise SystemExit(f"ERROR: Ramy Brook scrape failed, no CSV written: {exc}")
