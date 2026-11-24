@@ -2304,6 +2304,72 @@ def align_inseam_label_to_title(rows: List[List[str]], parts_by_sku: Dict[str, N
         log("Inseam Label %s -> %s from the title on %s rows", old, new, count)
 
 
+# Taper styles for the measured Inseam Style corrections below (Good
+# American's TAPER_STYLES, in Ramy Brook's spelling).
+MULTI_TAPER_STYLES = {"Tapered", "Skinny", "Barrel", "Straight from Knee"}
+
+
+def _multi_families(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> Dict[str, List[List[str]]]:
+    """Multi rows grouped by their alt title without the length segment."""
+    families: Dict[str, List[List[str]]] = {}
+    for row in rows:
+        if _col(row, "Inseam Label Multi") != "Multi":
+            continue
+        p = parts_by_sku.get(_col(row, "SKU - Shopify"))
+        if p is None or p.review:
+            continue
+        families.setdefault(f"{p.pre_title()}|{p.colour}".lower(), []).append(row)
+    return families
+
+
+def unify_multi_inseam_style(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """A multi-inseam style reads the same Inseam Style on every length
+    (mirrors Good American). The lengths are the same garment cut to different
+    inseams. Two measured taper cases are corrected first (a 32" long and a
+    29" regular both sit at Ankle), then the family takes its most common
+    value; a tie goes to the Regular length."""
+    for row in rows:
+        if _col(row, "Inseam Label Multi") != "Multi" or _col(row, "Jean Style") not in MULTI_TAPER_STYLES:
+            continue
+        p = parts_by_sku.get(_col(row, "SKU - Shopify"))
+        inseam = to_float(_col(row, "Inseam"))
+        if p is None or inseam is None:
+            continue
+        if inseam == 32 and p.length.startswith("Long"):
+            _set(row, "Inseam Style", "Ankle")
+        elif inseam == 29 and p.length.startswith("Regular"):
+            _set(row, "Inseam Style", "Ankle")
+    for members in _multi_families(rows, parts_by_sku).values():
+        values = [_col(r, "Inseam Style") for r in members if _col(r, "Inseam Style")]
+        if len(set(values)) < 2:
+            continue
+        counts: Dict[str, int] = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: -kv[1])
+        winner = top[0][0]
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            regular = next((_col(r, "Inseam Style") for r in members
+                            if parts_by_sku[_col(r, "SKU - Shopify")].length.startswith("Regular")
+                            and _col(r, "Inseam Style")), "")
+            winner = regular or winner
+        for row in members:
+            _set(row, "Inseam Style", winner)
+
+
+def fill_multi_rise_label(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
+    """A blank Rise Label on a multi-inseam style takes its family's most
+    common value (mirrors Good American)."""
+    for members in _multi_families(rows, parts_by_sku).values():
+        known = [_col(r, "Rise Label") for r in members if _col(r, "Rise Label")]
+        if not known:
+            continue
+        winner = max(set(known), key=known.count)
+        for row in members:
+            if not _col(row, "Rise Label"):
+                _set(row, "Rise Label", winner)
+
+
 def apply_duplicate_old_marker(rows: List[List[str]], parts_by_sku: Dict[str, NameParts]) -> None:
     """Mark the superseded style behind a duplicated Product (mirrors Good
     American). When two Style Ids share a Product, a fully dead one (nothing
@@ -2613,13 +2679,17 @@ class RamyBrookScraper:
         log("Naming: Jean Style slot, Style Name, Product Title Alt...")
         finalize_jean_style_slot(rows, self.name_parts)
         apply_jeans_pass(rows, self.name_parts)
-        log("Post-processing: colour unification...")
-        unify_color_within_style(rows)
-        log("Naming: multi-inseam detection...")
+        # Same order as Good American: detection, then label alignment (the last
+        # step that changes a length segment), colour, then the Multi passes.
+        log("Naming: Inseam Label Multi...")
         apply_inseam_label_multi(rows, self.name_parts)
         align_inseam_label_to_title(rows, self.name_parts)
+        log("Post-processing: colour unification...")
+        unify_color_within_style(rows)
+        unify_multi_inseam_style(rows, self.name_parts)
         log("Post-processing: Rise Label inference...")
         apply_rise_label_inference(rows)
+        fill_multi_rise_label(rows, self.name_parts)
         log("Post-processing: Color inference...")
         apply_color_inference(rows)
         apply_duplicate_old_marker(rows, self.name_parts)
